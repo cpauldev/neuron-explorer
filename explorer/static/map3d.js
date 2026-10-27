@@ -312,7 +312,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   const dataLayers = new Set();
   let unitsLayer = null;
 
-  // annotations: short HTML labels pinned to neurons, re-projected every frame (Claude points things out with these)
+  // annotations: short HTML labels pinned to neurons, re-projected every frame (the assistant points things out with these)
   let notes = [];
   function placeNotes() {
     const w = canvas.clientWidth, h = canvas.clientHeight;
@@ -505,13 +505,17 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     for (const m of fadeLines) m.opacity = m.userData.base * (1 - 0.9 * amt);
   }
 
+  let flight = 0;
+  controls.addEventListener("start", () => { flight++; });
   function flyTo(target, dist) {
+    const mine = ++flight, duration = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 450;
     const from = controls.target.clone(), to = target.clone();
     const dir = camera.position.clone().sub(controls.target), d0 = dir.length();
     dir.normalize();
     const t0 = performance.now();
     (function step(t) {
-      const k = Math.min(1, (t - t0) / 450), e = k * k * (3 - 2 * k);
+      if (mine !== flight) return;
+      const k = duration ? Math.min(1, (t - t0) / duration) : 1, e = k * k * (3 - 2 * k);
       controls.target.lerpVectors(from, to, e);
       camera.position.copy(controls.target).addScaledVector(dir, d0 + (dist - d0) * e);
       controls.update(); render();
@@ -522,12 +526,14 @@ export function createMap(canvas, labelsDiv, arch, cb) {
 
   // face a layer's neuron sheet head-on, close enough that the neighbours fade away
   function viewLayer(layer) {
+    const mine = ++flight, duration = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 600;
     const c = new THREE.Vector3(layerX(layer) + MLP_DX, SHEET_Y0 + SHEET / 2, 0);
     const dist = (SHEET / 2) / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.25;
     const from = controls.target.clone(), p0 = camera.position.clone();
     const p1 = c.clone().add(new THREE.Vector3(dist, 0.0001, 0)), t0 = performance.now();
     (function step(t) {
-      const k = Math.min(1, (t - t0) / 600), e = k * k * (3 - 2 * k);
+      if (mine !== flight) return;
+      const k = duration ? Math.min(1, (t - t0) / duration) : 1, e = k * k * (3 - 2 * k);
       controls.target.lerpVectors(from, c, e); camera.position.lerpVectors(p0, p1, e);
       controls.update(); render();
       if (k < 1) requestAnimationFrame(step);

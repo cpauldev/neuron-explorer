@@ -1,21 +1,41 @@
-"""Stdio MCP server that gives the explorer's Claude chat its tools: read any neuron data through the explorer's HTTP API,
+"""Stdio MCP server that gives the explorer's assistant chat its tools: read any neuron data through the explorer's HTTP API,
 run the live model (steered rollouts, activations) when it is loaded, and drive the map (select, highlight) in the browser that started the chat. Standard library only; started by
-`claude -p --mcp-config ...` from server.py with EXPLORER_URL and EXPLORER_CHAT set.
+the selected CLI from server.py with EXPLORER_URL and EXPLORER_CHAT set.
 """
 import json
 import os
 import sys
 import urllib.parse
 import urllib.request
+import urllib.error
 
 URL = os.environ.get("EXPLORER_URL", "http://127.0.0.1:8791")
 CHAT = os.environ.get("EXPLORER_CHAT", "")
+UI_TOOLS = {"get_ui_state": "state", "select_neuron": "select", "select_head": "head", "open_tab": "tab",
+            "set_chat_controls": "chat_controls", "fill_chat_prompt": "chat_prompt", "submit_chat_prompt": "chat_submit"}
+FILE_TOOLS = {"list_files": "list", "read_file": "read", "write_file": "write"}
 
-LN = {"layer": {"type": "integer", "description": "layer, 0-31"}, "n": {"type": "integer", "description": "neuron, 0-9215"}}
-HEAD = {"layer": {"type": "integer", "description": "layer, 0-31"}, "head": {"type": "integer", "description": "head: 0-15 on full-attention layers, 0-31 on linear-attention layers"}}
+LN = {"layer": {"type": "integer", "description": "zero-based layer; see overview for bounds"},
+      "n": {"type": "integer", "description": "zero-based neuron; see overview for bounds"}}
 TOOLS = [
+    {"name": "list_files", "description": "List a directory within the person's selected file scope (project by default; home only when enabled in the UI). Paths are relative to the project.",
+     "inputSchema": {"type": "object", "properties": {"path": {"type": "string", "default": "."}}}},
+    {"name": "read_file", "description": "Read UTF-8 text within the selected file scope; at most 256 KB. Use for research scripts and saved experimental data.",
+     "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "write_file", "description": "Write a UTF-8 research file within the selected file scope; at most 256 KB. Prefer explorer/cache/agent/work for scratch scripts. Ask before overwriting the person's files.",
+     "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"name": "run_shell", "description": "Request the person's approval to run a research command (PowerShell on Windows, bash/sh elsewhere). The UI shows the exact command and cwd. Every command requires approval and runs with the user's OS permissions; cwd is not a filesystem sandbox. Output is limited to 64 KB. Stop cancels the command.",
+     "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}, "cwd": {"type": "string", "default": "."}, "timeout": {"type": "integer", "minimum": 1, "maximum": 300, "default": 120}}, "required": ["command"]}},
     {"name": "overview", "description": "Model architecture and which layers have sweep runs (rollouts and rankings).",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get_ui_state", "description": "Read the connected browser's actual selected neuron, open tab, Chat dose, mode, direction, visible prompt, history length, and generation status. No cached/queued confirmation. Defaults to this assistant's browser, or the single connected browser. Supply browser_id if multiple browsers are connected.",
+     "inputSchema": {"type": "object", "properties": {"browser_id": {"type": "string"}}, "additionalProperties": False}},
+    {"name": "set_chat_controls", "description": "Set any Chat controls on the selected real neuron, using the same handlers as manual clicks/typing. dose is finite and may be negative or zero; mode is add or mul; direction is writes or reads you. Validates all fields before applying; preserves history and prompt. Rejects while generation or selection is running. Returns applied UI state.",
+     "inputSchema": {"type": "object", "properties": {"dose": {"type": "number"}, "mode": {"type": "string", "enum": ["add", "mul"]}, "direction": {"type": "string", "enum": ["writes", "reads you"]}, "browser_id": {"type": "string"}}, "minProperties": 1, "additionalProperties": False}},
+    {"name": "fill_chat_prompt", "description": "Fill the selected neuron's visible Chat prompt without submitting it. Empty text is allowed to empty the field. Preserves Chat history and controls. Rejects during generation or selection. Returns applied UI state.",
+     "inputSchema": {"type": "object", "properties": {"prompt": {"type": "string"}, "browser_id": {"type": "string"}}, "required": ["prompt"], "additionalProperties": False}},
+    {"name": "submit_chat_prompt", "description": "Submit the visible, nonempty neuron Chat prompt through the normal UI handler. Requires a selected real neuron and the Chat tab open. Refuses if generation is already running (does not stop it). Waits for completion and returns actual UI state plus replies/reading result or error. Appends to existing history. On timeout/disconnect cancellation is requested; read UI state before retrying. This differs from steer, which runs an independent model experiment without using the Chat panel.",
+     "inputSchema": {"type": "object", "properties": {"timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 900, "default": 300}, "browser_id": {"type": "string"}}, "additionalProperties": False}},
     {"name": "neuron", "description": "Everything cached for one neuron: name, logit lens and steer lens (with KL) for "
      "both poles, activation range, sweep rank if any, and its 24 strongest direct-path links each way (writes_into, "
      "reads_from) with each linked neuron's steer lens, top words and name.",
@@ -71,8 +91,8 @@ TOOLS = [
      "it as a user turn). Compare against act_range from `neuron`. Optional `neurons` [{layer, n, dose?, mode?}] are "
      "pushed during the same pass (steering units), to test causally whether they drive this neuron: compare with the "
      "same call without them. {layer, all: true, dose: 0} zeroes that layer's whole MLP. Optional `heads` [{layer, "
-     "head, dose}] scale attention heads (dose 0 = ablate; head 'all' = every head; full-attention layers have 16 heads, "
-     "linear-attention layers 32 value heads; layer types are in `overview`). Only earlier layers can move it. Needs "
+     "head, dose}] scale attention heads (dose 0 = ablate; head 'all' = every head; full-attention layers use query heads, "
+     "linear-attention layers use value heads; layer types and counts are in `overview`). Only earlier layers can move it. Needs "
      "the live model; errors if it is off.",
      "inputSchema": {"type": "object", "properties": {**LN, "text": {"type": "string"},
                                                        "chat": {"type": "boolean", "default": False},
@@ -120,7 +140,7 @@ TOOLS = [
      "token (the first token containing `token`; omit it for the token with the strongest firing). Each neuron has its "
      "pole, score (activation over its usual extreme; 1 = as strong as its usual max), raw activation and steer lens. "
      "`layers` [lo, hi] restricts the layers. Doesn't change the person's screen; use show_text to show them.",
-     "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "at": {"type": "integer", "description": "token index into the returned tokens (negative counts from the end); overrides token"}, "token": {"type": "string"},
+     "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "at": {"type": "integer", "description": "Display token index; negative counts from the end"}, "token": {"type": "string"},
                                                        "limit": {"type": "integer", "default": 30},
                                                        "layers": {"type": "array", "items": {"type": "integer"}},
                                                        "chat": {"type": "boolean", "default": False}},
@@ -146,44 +166,79 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
     {"name": "open_tab", "description": "Switch the open neuron's panel to a tab: examples (sweep rollouts), chat (the "
      "person's own steered chat) or details (lenses and connections).",
-     "inputSchema": {"type": "object", "properties": {"tab": {"type": "string", "enum": ["examples", "chat", "details"]}},
+     "inputSchema": {"type": "object", "properties": {"tab": {"type": "string", "enum": ["examples", "chat", "details"]}, "browser_id": {"type": "string"}},
                      "required": ["tab"]}},
-    {"name": "select_neuron", "description": "Open a neuron in the explorer: its panel, and its connection web on the map.",
-     "inputSchema": {"type": "object", "properties": LN, "required": ["layer", "n"]}},
-    {"name": "head", "description": "One attention head from weights, by role. q / k / v: the earlier neurons whose "
-     "output feeds its query (what it looks for from the current token), its key (what makes an earlier token "
-     "findable) and its value (what it carries); o: the later neurons reading its output. Each role has its top neurons "
-     "(z, logit lens, name) and their steer-lens tokens pooled. `profile`: where it looks over 8 reference texts: dist is "
-     "the mean share of weight on self / previous token / 2-5 back / further / first token, neg the share of negative "
-     "weight (linear-attention heads are signed), src the tokens it reads most against chance, pairs its strongest "
-     "single reads (query <- source) with the text they come from.",
-     "inputSchema": {"type": "object", "properties": HEAD, "required": ["layer", "head"]}},
-    {"name": "neuron_heads", "description": "The attention heads a neuron meets, from weights, by role: q / k / v are "
-     "later heads whose query, key or value reads its output (it shapes what they look for from its token, makes its "
-     "token findable, or is what they carry on); o are heads at its layer or earlier whose output it reads. z per head "
-     "(share of the neuron's vector in that head's space, against a random direction, z-scored over heads); grouped "
-     "heads share one key or value space.",
-     "inputSchema": {"type": "object", "properties": LN, "required": ["layer", "n"]}},
-    {"name": "attention", "description": "Live: one head's attention on a text. At the query token (first containing "
-     "`token`, else the last) the weight on every earlier token, and the strongest single reads anywhere in the text. "
-     "Full attention: softmax weights. Linear attention (Gated DeltaNet): the exact effective weights, signed, absolute "
-     "values summing to 1. first_token_weight is the mean weight on token 0 (the attention sink).",
-     "inputSchema": {"type": "object", "properties": {**HEAD, "text": {"type": "string"}, "at": {"type": "integer", "description": "token index into the returned tokens (negative counts from the end); overrides token"}, "token": {"type": "string"},
-                                                       "chat": {"type": "boolean", "default": False}},
-                     "required": ["layer", "head", "text"]}},
-    {"name": "attn_drive", "description": "Live: which attention heads drive a neuron at one token of a text (first "
-     "containing `token`, else where it fires hardest), and which earlier tokens each top head read that from. The "
-     "activation silu(gate)*up is linearised at that token; each head's contribution is its output there read by that "
-     "linearisation, `share` its fraction of linearised_total (the whole residual's drive, about 2x the activation), "
-     "attention_sum all heads together and rest everything else (MLPs, embedding). `from` splits a head's contribution "
-     "exactly over source tokens.",
-     "inputSchema": {"type": "object", "properties": {**LN, "text": {"type": "string"}, "at": {"type": "integer", "description": "token index into the returned tokens (negative counts from the end); overrides token"}, "token": {"type": "string"},
-                                                       "chat": {"type": "boolean", "default": False},
-                                                       "top": {"type": "integer", "default": 8}},
-                     "required": ["layer", "n", "text"]}},
-    {"name": "select_head", "description": "Open an attention head in the explorer: its q / k / v / o panel, and its "
-     "links on the map.",
-     "inputSchema": {"type": "object", "properties": HEAD, "required": ["layer", "head"]}},
+    {"name": "select_neuron", "description": "Open a neuron in the explorer: its panel and connection web. Waits for browser acknowledgement and returns actual UI state. Preserves each neuron's Chat history. Refuses during generation. Optional browser_id chooses a connected browser.",
+     "inputSchema": {"type": "object", "properties": {**LN, "browser_id": {"type": "string"}}, "required": ["layer", "n"]}},
+    {'name': 'head',
+     'description': 'One attention head from weights, by role. q / k / v: the earlier neurons whose output feeds its '
+                    'query (what it looks for from the current token), its key (what makes an earlier token findable) '
+                    'and its value (what it carries); o: the later neurons reading its output. Each role has its top '
+                    'neurons (z, logit lens, name) and their steer-lens tokens pooled. `profile`: where it looks over '
+                    '8 reference texts: dist is the mean share of weight on self / previous token / 2-5 back / '
+                    'further / first token, neg the share of negative weight (linear-attention heads are signed), src '
+                    'the tokens it reads most against chance, pairs its strongest single reads (query <- source) with '
+                    'the text they come from.',
+     'inputSchema': {'type': 'object',
+                     'properties': {'layer': {'type': 'integer', 'description': 'layer, 0-31'},
+                                    'head': {'type': 'integer',
+                                             'description': 'head: 0-15 on full-attention layers, 0-31 on '
+                                                            'linear-attention layers'}},
+                     'required': ['layer', 'head']}},
+    {'name': 'neuron_heads',
+     'description': 'The attention heads a neuron meets, from weights, by role: q / k / v are later heads whose '
+                    'query, key or value reads its output (it shapes what they look for from its token, makes its '
+                    'token findable, or is what they carry on); o are heads at its layer or earlier whose output it '
+                    "reads. z per head (share of the neuron's vector in that head's space, against a random "
+                    'direction, z-scored over heads); grouped heads share one key or value space.',
+     'inputSchema': {'type': 'object',
+                     'properties': {'layer': {'type': 'integer', 'description': 'layer, 0-31'},
+                                    'n': {'type': 'integer', 'description': 'neuron, 0-9215'}},
+                     'required': ['layer', 'n']}},
+    {'name': 'attention',
+     'description': "Live: one head's attention on a text. At the query token (first containing `token`, else the "
+                    'last) the weight on every earlier token, and the strongest single reads anywhere in the text. '
+                    'Full attention: softmax weights. Linear attention (Gated DeltaNet): the exact effective weights, '
+                    'signed, absolute values summing to 1. first_token_weight is the mean weight on token 0 (the '
+                    'attention sink).',
+     'inputSchema': {'type': 'object',
+                     'properties': {'layer': {'type': 'integer', 'description': 'layer, 0-31'},
+                                    'head': {'type': 'integer',
+                                             'description': 'head: 0-15 on full-attention layers, 0-31 on '
+                                                            'linear-attention layers'},
+                                    'text': {'type': 'string'},
+                                    'at': {'type': 'integer',
+                                           'description': 'token index into the returned tokens (negative counts from '
+                                                          'the end); overrides token'},
+                                    'token': {'type': 'string'},
+                                    'chat': {'type': 'boolean', 'default': False}},
+                     'required': ['layer', 'head', 'text']}},
+    {'name': 'attn_drive',
+     'description': 'Live: which attention heads drive a neuron at one token of a text (first containing `token`, '
+                    'else where it fires hardest), and which earlier tokens each top head read that from. The '
+                    "activation silu(gate)*up is linearised at that token; each head's contribution is its output "
+                    "there read by that linearisation, `share` its fraction of linearised_total (the whole residual's "
+                    'drive, about 2x the activation), attention_sum all heads together and rest everything else '
+                    "(MLPs, embedding). `from` splits a head's contribution exactly over source tokens.",
+     'inputSchema': {'type': 'object',
+                     'properties': {'layer': {'type': 'integer', 'description': 'layer, 0-31'},
+                                    'n': {'type': 'integer', 'description': 'neuron, 0-9215'},
+                                    'text': {'type': 'string'},
+                                    'at': {'type': 'integer',
+                                           'description': 'token index into the returned tokens (negative counts from '
+                                                          'the end); overrides token'},
+                                    'token': {'type': 'string'},
+                                    'chat': {'type': 'boolean', 'default': False},
+                                    'top': {'type': 'integer', 'default': 8}},
+                     'required': ['layer', 'n', 'text']}},
+    {'name': 'select_head',
+     'description': 'Open an attention head with q/k/v/o roles and map links. Waits for browser acknowledgement and returns applied UI state. Optional browser_id selects a connected browser.',
+     'inputSchema': {'type': 'object',
+                     'properties': {'layer': {'type': 'integer', 'description': 'layer, 0-31'},
+                                    'head': {'type': 'integer',
+                                             'description': 'head: 0-15 on full-attention layers, 0-31 on '
+                                                            'linear-attention layers'}, 'browser_id': {'type': 'string'}},
+                     'required': ['layer', 'head'], 'additionalProperties': False}},
     {"name": "highlight_neurons", "description": "Mark a set of neurons on the 3D map (replaces the previous marks; an "
      "empty list clears them). sign '-' draws a neuron in the negative-pole colour.",
      "inputSchema": {"type": "object", "properties": {"neurons": {"type": "array", "items": {
@@ -199,11 +254,26 @@ def get(path, **q):
 
 def post(path, body, timeout=60):
     req = urllib.request.Request(f"{URL}{path}", json.dumps(body).encode(), {"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except ValueError:
+            raise ValueError(f"explorer API returned HTTP {e.code}") from e
 
 
 def call(name, a):
+    if name in UI_TOOLS:
+        timeout = a.get("timeout_seconds", 300) if name == "submit_chat_prompt" else 120 if name == "select_head" else 20
+        if type(timeout) is not int or not 1 <= timeout <= 900:
+            raise ValueError("timeout_seconds must be an integer from 1 to 900")
+        return post("/api/agent/ui", {**a, "chat": CHAT, "action": UI_TOOLS[name]}, timeout=timeout + 10)
+    if name in FILE_TOOLS:
+        return post("/api/agent/files", {**a, "operation": FILE_TOOLS[name], "chat": CHAT})
+    if name == "run_shell":
+        return post("/api/agent/shell", {**a, "chat": CHAT}, timeout=930)
     if name == "overview":
         return get("/api/agent/overview")
     if name == "neuron":
@@ -262,8 +332,6 @@ def call(name, a):
         return post("/api/agent/attention", a, timeout=900)
     if name == "attn_drive":
         return post("/api/agent/attn_drive", a, timeout=900)
-    if name == "select_head":
-        return post("/api/agent/ui", {"chat": CHAT, "action": "head", "layer": a["layer"], "head": a["head"]})
     if name == "steer":
         return post("/api/agent/steer", a, timeout=900)  # the first call may wait for the model to load
     if name == "top_firing":
@@ -274,11 +342,9 @@ def call(name, a):
         return post("/api/agent/compare", a, timeout=900)
     if name == "activations":
         return post("/api/agent/activations", a, timeout=900)
-    ui = {"camera": "camera", "annotate_neurons": "annotate", "show_text": "text", "show_search": "search", "open_tab": "tab"}
+    ui = {"camera": "camera", "annotate_neurons": "annotate", "show_text": "text", "show_search": "search"}
     if name in ui:
         return post("/api/agent/ui", {"chat": CHAT, "action": ui[name], **a})
-    if name == "select_neuron":
-        return post("/api/agent/ui", {"chat": CHAT, "action": "select", "layer": a["layer"], "n": a["n"]})
     if name == "highlight_neurons":
         return post("/api/agent/ui", {"chat": CHAT, "action": "highlight", "neurons": a["neurons"]})
     raise ValueError(f"unknown tool {name}")
@@ -291,26 +357,47 @@ def reply(id_, result=None, error=None):
     sys.stdout.flush()
 
 
-for line in sys.stdin:
-    if not line.strip():
-        continue
-    m = json.loads(line)
-    method, id_ = m.get("method"), m.get("id")
-    if id_ is None:
-        continue  # notifications
-    if method == "initialize":
-        reply(id_, {"protocolVersion": m["params"].get("protocolVersion", "2025-06-18"),
-                    "capabilities": {"tools": {}}, "serverInfo": {"name": "explorer", "version": "0.1"}})
-    elif method == "tools/list":
-        reply(id_, {"tools": TOOLS})
-    elif method == "tools/call":
-        p = m["params"]
+def main():
+    for line in sys.stdin:
+        if not line.strip():
+            continue
         try:
-            out = call(p["name"], p.get("arguments") or {})
-            reply(id_, {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}]})
-        except Exception as e:  # tool errors go back to the model, not the protocol
-            reply(id_, {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True})
-    elif method == "ping":
-        reply(id_, {})
-    else:
-        reply(id_, error={"code": -32601, "message": f"method not found: {method}"})
+            m = json.loads(line)
+        except ValueError:
+            reply(None, error={"code": -32700, "message": "invalid JSON"})
+            continue
+        if not isinstance(m, dict):
+            reply(None, error={"code": -32600, "message": "request must be an object"})
+            continue
+        method, id_ = m.get("method"), m.get("id")
+        if id_ is None:
+            continue  # notifications
+        params = m.get("params", {})
+        if not isinstance(params, dict):
+            reply(id_, error={"code": -32602, "message": "params must be an object"})
+            continue
+        if method == "initialize":
+            reply(id_, {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                        "capabilities": {"tools": {}}, "serverInfo": {"name": "explorer", "version": "0.1"}})
+        elif method == "tools/list":
+            reply(id_, {"tools": TOOLS})
+        elif method in ("resources/list", "resources/templates/list"):
+            reply(id_, {"resources" if method == "resources/list" else "resourceTemplates": []})
+        elif method == "tools/call":
+            p = params
+            try:
+                if not isinstance(p.get("arguments", {}), dict):
+                    raise ValueError("tool arguments must be an object")
+                out = call(p["name"], p.get("arguments") or {})
+                reply(id_, {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}],
+                            "isError": bool(isinstance(out, dict) and out.get("error"))})
+            except Exception as e:  # tool errors go back to the model, not the protocol
+                reply(id_, {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True})
+        elif method == "ping":
+            reply(id_, {})
+        else:
+            reply(id_, error={"code": -32601, "message": f"method not found: {method}"})
+
+
+if __name__ == "__main__":
+    main()

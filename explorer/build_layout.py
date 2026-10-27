@@ -1,60 +1,49 @@
-"""Seriated sheet layouts: places each layer's neurons on its 96x96 grid so that neurons with similar weights sit
+"""Seriated sheet layouts: places each layer's neurons on a padded square grid so that neurons with similar weights sit
 together. Embeds each neuron by its down_proj column ("writes": the direction it adds to the residual stream) or its
 gate and up rows ("reads"), cosine-normalised, PCA to 50 dims, UMAP to 2D, then snaps to the grid: sort by y into
-rows of 96, then by x within each row.
+rows of ceil(sqrt(N)), then by x within each row.
 
     uv run python explorer/build_layout.py --kind writes
 
-Writes explorer/cache/layout_<kind>.npz: cell[L, N] (int16, row * 96 + col for neuron n of layer L).
+Writes model-specific layout_<kind>.npz: cell[L, N] (int16, row * ceil(sqrt(N)) + col).
+Use cache_job.py for checkpoints and background execution.
 """
 import argparse
 import json
-import os
 
 import numpy as np
-import umap
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
+from model_config import ROOT, DEFAULT_MODEL, Weights, data_paths, snapshot, validate_config
+from cache_builders import layout_cells
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
-ap.add_argument("--kind", default="writes", choices=["writes", "reads"])
-ap.add_argument("--pca", type=int, default=50)
-ap.add_argument("--neighbors", type=int, default=30)
-a = ap.parse_args()
-
-root = snapshot_download(a.model, allow_patterns=["*.safetensors", "*.json"])
-index = json.load(open(os.path.join(root, "model.safetensors.index.json")))["weight_map"]
-cfg = json.load(open(os.path.join(root, "config.json")))["text_config"]
-L, N = cfg["num_hidden_layers"], cfg["intermediate_size"]
-side = int(round(N ** 0.5))
-assert side * side == N
+from cache_storage import atomic_npz, job_lock
 
 
-def tensor(name):
-    with safe_open(os.path.join(root, index[name]), "pt") as f:
-        return f.get_tensor(name).float().numpy()
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    ap.add_argument("--revision")
+    ap.add_argument("--kind", default="writes", choices=["writes", "reads"])
+    ap.add_argument("--pca", type=int, default=50)
+    ap.add_argument("--neighbors", type=int, default=30)
+    a = ap.parse_args()
+    if a.pca <= 0 or a.neighbors < 2:
+        ap.error("--pca must be positive and --neighbors must be at least 2")
+    with job_lock(ROOT / "explorer/cache/.device.lock"):
+        root = snapshot(a.model, a.revision)
+        weights = Weights(root)
+        cfg = validate_config(json.load(open(root / "config.json")))
+        L = cfg["num_hidden_layers"]
+
+        cells = []
+        for layer in range(L):
+            cells.append(layout_cells(weights, layer, a.kind, a.pca, a.neighbors))
+            print(f"L{layer} done", flush=True)
+
+        revision = None if a.model == DEFAULT_MODEL and a.revision is None else root.name
+        out = data_paths(a.model, revision)["cache"] / f"layout_{a.kind}.npz"
+        atomic_npz(out, cell=np.stack(cells))
+        print("->", out)
 
 
-cells = np.zeros((L, N), np.int16)
-for l in range(L):
-    pre = f"model.language_model.layers.{l}.mlp."
-    if a.kind == "writes":
-        X = tensor(pre + "down_proj.weight").T  # [N, hidden]
-    else:
-        X = np.concatenate([tensor(pre + "gate_proj.weight"), tensor(pre + "up_proj.weight")], 1)  # [N, 2*hidden]
-    X = X / np.linalg.norm(X, axis=1, keepdims=True)
-    X = X - X.mean(0)
-    U, S, _ = np.linalg.svd(X, full_matrices=False)
-    Z = U[:, : a.pca] * S[: a.pca]
-    xy = umap.UMAP(n_neighbors=a.neighbors, min_dist=0.05, metric="cosine", random_state=0).fit_transform(Z)
-    by_y = np.argsort(xy[:, 1], kind="stable")
-    for r in range(side):
-        band = by_y[r * side:(r + 1) * side]
-        band = band[np.argsort(xy[band, 0], kind="stable")]
-        cells[l, band] = r * side + np.arange(side)
-    print(f"L{l} done", flush=True)
-
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", f"layout_{a.kind}.npz")
-np.savez(out, cell=cells)
-print("->", out)
+if __name__ == "__main__":
+    main()

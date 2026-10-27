@@ -2,12 +2,17 @@
 __pycache__/
 .DS_Store
 
+# Local credentials and environment settings
+.env
+.env.*
+!.env.example
+
 # sweep data and derived files
 runs/
 stats/
 captures/
 logs/
-explorer/cache/connections.sqlite
+explorer/cache/connections.sqlite*
 
 # third-party material
 source/
@@ -22,8 +27,12 @@ explorer/*.local.md
 # per-machine pod settings
 sweep/pod_template.json
 
-# rebuilt on first use
+# rebuilt attention-head reference profiles
 explorer/cache/head_profiles.json
+explorer/cache/head_profiles.json.tmp
+explorer/cache/*.tmp-*
 
-# experiment scripts
-scripts/
+# Model-specific derived data and resumable job checkpoints
+explorer/cache/models/
+cache-jobs/
+explorer/cache/.device.lock

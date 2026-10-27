@@ -5,14 +5,18 @@
 import asyncio
 import builtins
 import glob
+from functools import wraps
 import json
 import os
+from pathlib import Path
 import sys
 import threading
+import time
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Request
+from anyio import CancelScope
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from transformers import AutoConfig
@@ -22,11 +26,21 @@ sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
 from runtime import CACHE, NO_MODEL, Runtime  # noqa: E402
+from model_config import MODEL, REVISION, DEFAULT_MODEL, data_paths, model_key, validate_config
+from agent_history import Journal
+from agent_common import AgentError, AgentPool  # noqa: E402
+from agent_attachments import UploadTooLarge, store_upload, attachment_input as read_attachment  # noqa: E402
+from codex_agent import CodexClient  # noqa: E402
+from claude_agent import ClaudeClient, legacy_session  # noqa: E402
+from research_tools import SCOPES, file_operation, scoped_path, run_shell  # noqa: E402
+from ui_bridge import UiBridge, UI_COMMAND_FIELDS, validate_ui_command, validate_head  # noqa: E402
 
-RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
-NAMES = os.path.join(ROOT, "explorer", "names.json")
+_paths = data_paths()
+RUNS, STATS, NAMES = (str(_paths[key]) for key in ("runs", "stats", "names"))
 PORT = int(os.environ.get("PORT", 8791))
-_cfg = AutoConfig.from_pretrained("Qwen/Qwen3.5-4B").get_text_config()
+_model_config = AutoConfig.from_pretrained(MODEL, revision=REVISION)
+validate_config(_model_config.to_dict())
+_cfg = _model_config.get_text_config()
 ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
         "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
         "kv_heads": _cfg.num_key_value_heads, "linear_k_heads": _cfg.linear_num_key_heads,
@@ -36,8 +50,7 @@ app = FastAPI()
 
 
 # only this machine's own pages and tools: a page on another site (or a DNS name rebound to 127.0.0.1) can't reach
-# the API, which runs the model and a Claude agent with a shell. Links from elsewhere still open pages (a top-level GET
-# navigation, whose response the linking site can't read).
+# the API, which runs the model and a research assistant
 LOCAL_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}", f"[::1]:{PORT}"}
 
 
@@ -47,8 +60,7 @@ async def local_only(request, call_next):
     origin = request.headers.get("origin")
     if (request.headers.get("host") not in LOCAL_HOSTS
             or (origin and urlparse(origin).netloc not in LOCAL_HOSTS)
-            or (request.headers.get("sec-fetch-site") in ("cross-site", "same-site")
-                and not (request.method == "GET" and request.headers.get("sec-fetch-mode") == "navigate"))):
+            or request.headers.get("sec-fetch-site") in ("cross-site", "same-site")):
         return PlainTextResponse("forbidden", status_code=403)
     return await call_next(request)
 
@@ -147,7 +159,8 @@ def names():
 @app.get("/api/index")
 def index():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH,
+    return {"model": MODEL, "revision": REVISION, "arch": ARCH,
+            "cache_key": "" if MODEL == DEFAULT_MODEL and REVISION is None else model_key(MODEL, REVISION),
             "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
 
 
@@ -281,7 +294,7 @@ async def steer(req: Request):
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-LENS_INDEX = os.path.join(ROOT, "explorer", "cache", "lens_index.npz")
+LENS_INDEX = os.path.join(CACHE, "lens_index.npz")
 _lens = {}
 
 
@@ -329,7 +342,7 @@ async def search(q: str, limit: int = 300):
     return {"ready": True, "results": res, "tokens": int(len(match)), "total": len(out)}
 
 
-ACT_SCALE = os.path.join(ROOT, "explorer", "cache", "act_scale.npz")
+ACT_SCALE = os.path.join(CACHE, "act_scale.npz")
 MAX_INFER_TOKENS = 1024  # [32, T, 9216] float32 activations plus scores: about 2.4 GB at this length
 
 
@@ -366,8 +379,7 @@ _infer = {}
 
 async def score_text(text, chat=False, heads=False):
     """Every neuron's activation at every token of `text` ([L, T, N]) and its signed score: the positive side as a
-    multiple of the neuron's typical max, the negative side of its typical min (act_scale.npz). With heads, the
-    attention heads' patterns and write sizes are kept too (rt.heads)."""
+    multiple of the neuron's typical max, the negative side of its typical min (act_scale.npz)."""
     ids = rt.chat_ids(text) if chat else rt.tok(text).input_ids
     ids = ids[:MAX_INFER_TOKENS]
     acts = await asyncio.to_thread(rt.full_activations, ids, heads)  # [L, T, N]
@@ -440,6 +452,38 @@ async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 9
     return {"results": res, "total": int(keep.sum()), "map": blob, "shape": list(view.shape)}
 
 
+def model_transaction(fn):
+    """Keep a capture and its consumers on the same text under the reentrant model lock."""
+    @wraps(fn)
+    def locked(*args, **kwargs):
+        with rt.lock:
+            return fn(*args, **kwargs)
+    return locked
+
+
+def require_head(layer, head):
+    try:
+        validate_head(ARCH, layer, head)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+def require_neuron(layer, n):
+    try:
+        validate_ui_command({"action": "select", "layer": layer, "n": n}, ARCH)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+def query_unit(body, units):
+    index = body.get("at")
+    if index is None:
+        return _find_unit(units, body.get("token"))
+    if isinstance(index, bool) or not isinstance(index, int) or not -len(units) <= index < len(units):
+        raise HTTPException(400, "at is outside the returned token list")
+    return index % len(units)
+
+
 def _heads_for_infer():
     """The head captures of the last inferred text (re-captured if another text ran since)."""
     ids = _infer.get("ids")
@@ -451,6 +495,7 @@ def _heads_for_infer():
 
 
 @app.get("/api/infer/heads")
+@model_transaction
 def infer_heads(pos: int = -1):
     """Every attention head's write size at token `pos` of the last inferred text, per layer, as a share of the
     largest write any head of that layer makes at any token past the first (position 0 is the attention sink)."""
@@ -466,15 +511,17 @@ def infer_heads(pos: int = -1):
 
 
 @app.get("/api/head/row")
+@model_transaction
 def head_row(layer: int, head: int, pos: int):
     """One head's attention row at token `pos` of the last inferred text, summed per display unit (the chips in the
     run tab); units after pos are null. Full attention: softmax weights. Linear attention: signed effective weights,
     absolute values summing to 1."""
+    require_head(layer, head)
     h = _heads_for_infer() if pos >= 0 else None
     if not h or pos >= h["T"] or layer not in h["q"]:
         return {"units": None}
     row = rt.head_row(layer, head, pos)
-    return {"units": [round(sum(row[i] for i in idx), 4) if idx[0] <= pos else None for _, idx in _infer["units"]]}
+    return {"units": [round(sum(row[i] for i in idx if i <= pos), 4) if idx[0] <= pos else None for _, idx in _infer["units"]]}
 
 
 def _lens_base():
@@ -496,6 +543,9 @@ def _lens_base():
 async def neuron_heads(layer: int, n: int):
     """The attention heads linked to a neuron by weights: z per head, per layer (runtime.neuron_heads), and the top
     heads per role, q / k / v / o (runtime.neuron_head_roles)."""
+    require_neuron(layer, n)
+    if off := _live_off():
+        return off
     return {"layers": await asyncio.to_thread(rt.neuron_heads, layer, n),
             "roles": await asyncio.to_thread(rt.neuron_head_roles, layer, n)}
 
@@ -508,15 +558,13 @@ async def head_pattern(req: Request):
     """One head's attention pattern on {text} (the run text, else a sample sentence), per display unit: rows are
     queries (a unit's last token), columns sum the weight over each earlier unit's tokens."""
     b = await req.json()
-    layer, head = int(b["layer"]), int(b["head"])
-    text = b.get("text") or HEAD_SAMPLE
-    ids = (rt.chat_ids(text) if b.get("chat") else rt.tok(text).input_ids)[:MAX_INFER_TOKENS] if rt.tok else None
-    if ids is None:
-        return {"error": "model loading"}
-    if not rt.heads or rt.heads.get("ids") != ids:
-        await asyncio.to_thread(rt.full_activations, ids, True)
-    A = await asyncio.to_thread(rt.head_pattern, layer, head)
-    units = rt.token_units(ids)
+    layer, head = b.get("layer"), b.get("head")
+    require_head(layer, head)
+    if off := _live_off():
+        return off
+    text = b.get("text", HEAD_SAMPLE)
+    ids, _, caps, units = await asyncio.to_thread(_capture_text, text, b.get("chat", False))
+    A = (await asyncio.to_thread(rt.layer_patterns, layer, caps))[head]
     cols = np.stack([A[:, idx].sum(1) for _, idx in units], 1)  # [T, U]
     rows = [[round(float(x), 4) for x in cols[idx[-1], :u + 1]] for u, (_, idx) in enumerate(units)]
     return {"text": text, "tokens": [t for t, _ in units], "rows": rows,
@@ -536,19 +584,22 @@ HEAD_TEXTS = [
 _hprof = {}
 
 
+@model_transaction
 def _head_profiles():
     """Where every head looks over HEAD_TEXTS, per display unit, for queries from the 4th unit on:
     dist: mean share of |weight| on self / the previous unit / units 2-5 back / further back / the first unit;
     neg: mean share of negative weight; src: per unit string, the |weight| it receives against a uniform pattern's;
     pairs: the strongest single reads more than one unit back (past the first unit)."""
     path = os.path.join(CACHE, "head_profiles.json")
-    key = json.dumps(HEAD_TEXTS)
+    key = json.dumps([MODEL, REVISION, ARCH, HEAD_TEXTS], sort_keys=True)
     if _hprof.get("key") == key:
         return _hprof["data"]
     if os.path.exists(path):
-        with open(path) as f:
-            d = json.load(f)
-        if d.get("key") == key:
+        try:
+            d = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (ValueError, UnicodeError):
+            d = None  # interrupted cache writes are safe to rebuild
+        if isinstance(d, dict) and d.get("key") == key:
             _hprof.update(key=key, data=d)
             return d
     acc = {}
@@ -602,8 +653,9 @@ def _head_profiles():
                   "src": [[s, round(l, 1)] for s, l, _, _ in src], "pairs": pairs}
     d = {"key": key, "texts": HEAD_TEXTS,
          "tokens": [[s for s, _ in rt.token_units(rt.tok(x).input_ids)] for x in HEAD_TEXTS], "heads": out}
-    with open(path, "w") as f:
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(d, f)
+    os.replace(path + ".tmp", path)
     _hprof.update(key=key, data=d)
     return d
 
@@ -612,8 +664,9 @@ def _head_profiles():
 async def head_profile(layer: int, head: int):
     """One head's profile over the reference texts (_head_profiles), with each pair's query and key unit text and
     the text it comes from. The first call computes every head's profile."""
-    if rt.tok is None:
-        return {"error": "model loading"}
+    require_head(layer, head)
+    if off := _live_off():
+        return off
     d = await asyncio.to_thread(_head_profiles)
     p = d["heads"].get(f"{layer}/{head}")
     if p is None:
@@ -628,6 +681,11 @@ def head_info(layer: int, head: int, top: int = 24):
     """What one attention head reads and writes, from weights: its linked neurons (runtime.head_links) and their
     positive-pole lens tokens pooled the way the web summary pools a cone (weighted by z, ranked by lift over each
     layer's base rate)."""
+    require_head(layer, head)
+    if not 1 <= top <= 100:
+        raise HTTPException(400, "top must be between 1 and 100")
+    if off := _live_off():
+        return off
     links = rt.head_links(layer, head)
     lens, v, base, src = _lens_base()
 
@@ -693,7 +751,9 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
 def layout(kind: str = "writes"):
     """Seriated grid layout: cell index (row * side + col) for every neuron, base64 int16, layer-major."""
     import base64
-    path = os.path.join(ROOT, "explorer", "cache", f"layout_{kind}.npz")
+    if kind not in ("writes", "reads"):
+        raise HTTPException(400, "layout kind must be writes or reads")
+    path = os.path.join(CACHE, f"layout_{kind}.npz")
     if not os.path.exists(path):
         return {"available": False}
     cell = np.load(path)["cell"].astype(np.int16)
@@ -749,17 +809,16 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
     Downstream gives
     `toward` (the driven pole) and `away` (the opposite pole); upstream gives `fed_by` (the pole that excites it) and
     `held_by` (the pole that inhibits it)."""
-    if src == "steer":
-        lens, v, base, key_src = _lens_base()
-    else:
-        lens, v = rt.lens_index(), rt.vocab_strings()
-        key_src = "logit"
-        if _idf.get("src") != key_src:
-            L, N = lens["up"].shape[:2]
-            df = np.stack([np.bincount(np.concatenate([lens["up"][l, :, :8].ravel(), lens["down"][l, :, :8].ravel()]),
-                                       minlength=len(v)) for l in range(L)])
-            _idf.update(src=key_src, base=((df + 1) / (2 * N)).astype(np.float32))
-        base = _idf["base"]
+    st = rt.steer_index() if src == "steer" else None
+    lens = st if st is not None else rt.lens_index()
+    v = rt.vocab_strings()
+    key_src = "steer" if st is not None else "logit"
+    if _idf.get("src") != key_src:
+        L, N = lens["up"].shape[:2]
+        df = np.stack([np.bincount(np.concatenate([lens["up"][l, :, :8].ravel(), lens["down"][l, :, :8].ravel()]),
+                                   minlength=len(v)) for l in range(L)])
+        _idf.update(src=key_src, base=((df + 1) / (2 * N)).astype(np.float32))  # [layer, token]
+    base = _idf["base"]
     sign, zmax = {(layer, n): 1}, 1.0
     links = cone_links(layer, n, k, 15, 20000, first, hops or None)
     for sl, sn, dl, dn, z, hop in links:
@@ -795,17 +854,19 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
 
     down = [(key, val) for key, val in reach.items() if val[0] > 0]
     up = [(key, val) for key, val in reach.items() if val[0] < 0]
-    return {"src": key_src, "links": len(links),
+    return {"src": "steer" if st is not None else "logit", "links": len(links),
             "down": {"neurons": len(down), "toward": pool(down, 1), "away": pool(down, -1)},
             "up": {"neurons": len(up), "fed_by": pool(up, 1), "held_by": pool(up, -1)}}
 
 
-# ---------- Claude: autointerp and chat ----------
-# Each chat is a `claude -p` session resumed turn by turn. Its tools come from agent_mcp.py, which reads through the
+# ---------- Assistants: autointerp and chat ----------
+# Each chat belongs to its selected CLI and resumes turn by turn. Its tools come from agent_mcp.py through the
 # endpoints below and sends map actions back through /api/agent/ui into the chat's event stream.
 AGENT_PROMPT = os.path.join(ROOT, "explorer", "agent_prompt.md")
-AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # claude's cwd, so no project settings or CLAUDE.md apply
+AGENT_DIR = os.path.join(CACHE, "agent")  # conversations and research results belong to this model
 _chats = {}
+agent_pool = AgentPool()
+agent_reaper = None
 _act = {}
 
 
@@ -822,7 +883,7 @@ def act_range(layer, n):
 @app.get("/api/agent/overview")
 def agent_overview():
     runs = layer_runs()
-    return {"model": "Qwen/Qwen3.5-4B", "arch": ARCH, "layers_with_sweeps": sorted(runs),
+    return {"model": MODEL, "revision": REVISION, "arch": ARCH, "layers_with_sweeps": sorted(runs),
             "named_neurons": len(names()), "live_model": not NO_MODEL}
 
 
@@ -880,7 +941,7 @@ def _live_off():
 
 @app.post("/api/agent/steer")
 async def agent_steer(req: Request):
-    """Steered rollouts for Claude: one prompt, greedy, pushed up / unsteered / pushed down; whole texts at once."""
+    """Steered rollouts for the assistant: one prompt, greedy, pushed up / unsteered / pushed down; whole texts at once."""
     b = await req.json()
     if off := _live_off():
         return off
@@ -901,7 +962,7 @@ async def agent_steer(req: Request):
 
 @app.post("/api/agent/activations")
 async def agent_activations(req: Request):
-    """The neuron's activation on each token of a text, for Claude; compact [token, activation] pairs. With `neurons`
+    """The neuron's activation on each token of a text, for the assistant; compact [token, activation] pairs. With `neurons`
     ([{layer, n, dose?, mode?}]) those are pushed during the same pass (steering units)."""
     b = await req.json()
     if off := _live_off():
@@ -938,9 +999,16 @@ def _interventions(b):
     return pushes, hs, None
 
 
+@model_transaction
 def _capture_text(text, chat):
     """Runs a text with head capture: (ids, activations [L, T, N], captures, display units)."""
+    if not isinstance(text, str) or not text.strip() or len(text) > 100_000:
+        raise HTTPException(400, "text must contain 1 to 100,000 characters")
+    if not isinstance(chat, bool):
+        raise HTTPException(400, "chat must be true or false")
     ids = (rt.chat_ids(text) if chat else rt.tok(text).input_ids)[:MAX_INFER_TOKENS]
+    if not ids:
+        raise HTTPException(400, "text contains no tokens")
     acts = rt.full_activations(ids, True)
     return ids, acts, rt.heads, rt.token_units(ids)
 
@@ -964,12 +1032,11 @@ async def agent_attention(req: Request):
     b = await req.json()
     if off := _live_off():
         return off
-    layer, head = int(b["layer"]), int(b["head"])
-    if not 0 <= head < rt.n_heads(layer):
-        return {"error": f"layer {layer} has {rt.n_heads(layer)} heads ({ARCH['layer_types'][layer]})"}
+    layer, head = b.get("layer"), b.get("head")
+    require_head(layer, head)
     ids, _, caps, units = await asyncio.to_thread(_capture_text, b["text"], b.get("chat", False))
     toks = [u for u, _ in units]
-    qu = int(b["at"]) % len(units) if b.get("at") is not None else _find_unit(units, b.get("token"))
+    qu = query_unit(b, units)
     qu = len(units) - 1 if qu is None else qu
     A = await asyncio.to_thread(rt.layer_patterns, layer, caps)
     A = A[head]
@@ -993,13 +1060,16 @@ async def agent_attn_drive(req: Request):
     b = await req.json()
     if off := _live_off():
         return off
-    layer, n, top = int(b["layer"]), int(b["n"]), int(b.get("top", 8))
+    layer, n, top = b.get("layer"), b.get("n"), b.get("top", 8)
+    require_neuron(layer, n)
+    if isinstance(top, bool) or not isinstance(top, int) or not 1 <= top <= 32:
+        raise HTTPException(400, "top must be between 1 and 32")
     ids, acts, caps, units = await asyncio.to_thread(_capture_text, b["text"], b.get("chat", False))
     toks = [u for u, _ in units]
     unit_of = {i: k for k, (_, idx) in enumerate(units) for i in idx}
-    k = int(b["at"]) % len(units) if b.get("at") is not None else _find_unit(units, b.get("token"))
+    k = query_unit(b, units)
     if k is None:
-        pos = int(np.abs(acts[layer, 1:, n]).argmax()) + 1
+        pos = int(np.abs(acts[layer, 1:, n]).argmax()) + 1 if len(ids) > 1 else 0
         k = unit_of[pos]
     pos = units[k][1][-1]
     d = await asyncio.to_thread(rt.attn_drive, layer, n, pos, caps, top)
@@ -1021,7 +1091,7 @@ async def agent_attn_drive(req: Request):
 
 @app.post("/api/agent/logprobs")
 async def agent_logprobs(req: Request):
-    """For Claude: the next token's distribution after a text. Body {text, chat?, prefix?, k?, targets?: [str],
+    """For the assistant: the next token's distribution after a text. Body {text, chat?, prefix?, k?, targets?: [str],
     neurons?, heads?} (neurons / heads as in /api/agent/activations). Without an intervention: {top, targets}. With
     one: baseline and intervened {top, targets}, kl (nats, baseline to intervened) and the tokens that gained and lost
     the most probability over the whole vocabulary."""
@@ -1060,7 +1130,7 @@ async def agent_logprobs(req: Request):
 
 @app.post("/api/agent/compare")
 async def agent_compare(req: Request):
-    """For Claude: many neurons read across several texts, one forward pass per text. Body {neurons: [{layer, n}],
+    """For the assistant: many neurons read across several texts, one forward pass per text. Body {neurons: [{layer, n}],
     texts: [text | {label, text}], chat?}. Per neuron and text: the strongest positive and negative activation with
     its token, and the peak score (activation over the neuron's usual extreme; position 0, the sink, left out)."""
     b = await req.json()
@@ -1095,7 +1165,7 @@ async def agent_fires(req: Request):
     b = await req.json()
     if off := _live_off():
         return off
-    ids, acts, score = await score_text(b["text"], b.get("chat", False))
+    ids, acts, score = await score_text(b["text"], b.get("chat", False), heads=True)
     toks = [rt.tok.decode([i]) for i in ids]
     want = b.get("token")
     pos = int(b["at"]) % len(toks) if b.get("at") is not None else next((i for i, t in enumerate(toks) if want and want in t), None)
@@ -1120,58 +1190,150 @@ async def agent_fires(req: Request):
             "neurons": res}
 
 
+
+
+ui_bridge = UiBridge()
+
+
+@app.get("/api/agent/ui/events")
+async def agent_ui_events(browser: str):
+    # A dedicated connection also works when no assistant generation is active.
+    try:
+        client = ui_bridge.connect(browser)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    async def events():
+        try:
+            yield 'data: {"connected": true}\n\n'
+            while True:
+                try:
+                    command = await asyncio.wait_for(client["queue"].get(), 10)
+                    yield f"data: {json.dumps(command)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ': heartbeat\n\n'
+        finally:
+            ui_bridge.disconnect(browser, client)
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/agent/ui/result")
+async def agent_ui_result(req: Request):
+    b = await req.json()
+    if not isinstance(b, dict):
+        return JSONResponse({"error": "UI result must be an object"}, status_code=400)
+    try:
+        if not ui_bridge.complete(b.get("browser"), b.get("id"), b.get("result")):
+            return JSONResponse({"error": "UI command is no longer pending"}, status_code=410)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True}
+
+
 @app.post("/api/agent/ui")
 async def agent_ui(req: Request):
     b = await req.json()
+    if not isinstance(b, dict) or not isinstance(b.get("action"), str):
+        return JSONResponse({"error": "UI command requires an action string"}, status_code=400)
+    if b.get("action") in UI_COMMAND_FIELDS:
+        try:
+            command = validate_ui_command(b, ARCH)
+            c = _chats.get(b.get("chat"))
+            browser = b.get("browser_id") or (c.get("browser") if c else None)
+            return await ui_bridge.command(command, browser, command.get("timeout_seconds", 120 if command['action'] == 'head' else 20))
+        except ValueError as e:
+            return {"error": str(e)}
     c = _chats.get(b.pop("chat", ""))
-    if c is None:
+    if c is None or "queue" not in c:
         return {"ok": False, "error": "no such chat"}
-    _emit(c, {"t": "ui", **b})
+    c["queue"].put_nowait(("ui", b))
     return {"ok": True, "note": "shown in the explorer"}
 
 
+def active_research_chat(body):
+    c = _chats.get(body.get("chat"))
+    if not c or "queue" not in c or c["cancel"].is_set():
+        raise ValueError("research tools require an active explorer conversation")
+    return c
+
+
+@app.post("/api/agent/files")
+async def agent_files(req: Request):
+    body = await req.json()
+    try:
+        c = active_research_chat(body)
+        return await asyncio.to_thread(file_operation, ROOT, c["access"], body["operation"],
+                                       body.get("path", "."), body.get("content"))
+    except (ValueError, KeyError, OSError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.post("/api/agent/shell")
+async def agent_shell(req: Request):
+    import uuid
+    body = await req.json()
+    try:
+        c = active_research_chat(body)
+        command = body["command"]
+        if not isinstance(command, str) or not command.strip() or len(command) > 32_000:
+            raise ValueError("provide a shell command up to 32,000 characters")
+        cwd = scoped_path(ROOT, c["access"], body.get("cwd", "."))
+        if not cwd.is_dir():
+            raise ValueError("shell starting directory must exist")
+        timeout = body.get("timeout", 120)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= timeout <= 300:
+            raise ValueError("shell timeout must be between 1 and 300 seconds")
+    except (ValueError, KeyError, OSError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    aid = uuid.uuid4().hex
+    approval = asyncio.get_running_loop().create_future()
+    approvals, cancel = c["approvals"], c["cancel"]
+    approvals[aid] = approval
+    c["queue"].put_nowait(("event", {"t": "approval", "id": aid, "command": command, "cwd": str(cwd)}))
+    try:
+        try:
+            allowed = await asyncio.wait_for(approval, 600)
+        except asyncio.TimeoutError:
+            return {"error": "shell approval expired; no command was run"}
+        if not allowed or cancel.is_set():
+            return {"error": "shell command declined or conversation stopped; no command was run"}
+        return await run_shell(command, cwd, timeout, os.path.join(AGENT_DIR, "work"), cancel)
+    except (ValueError, OSError) as e:
+        return {"error": str(e)}
+    finally:
+        approvals.pop(aid, None)
+
+
+@app.post("/api/agent/approval")
+async def agent_approval(req: Request):
+    body = await req.json()
+    c = _chats.get(body.get("chat"))
+    pending = c.get("approvals", {}).get(body.get("id")) if c else None
+    if pending is None or pending.done() or "queue" not in c:
+        return JSONResponse({"error": "this approval is no longer active"}, status_code=409)
+    if not isinstance(body.get("allow"), bool):
+        return JSONResponse({"error": "approval must be true or false"}, status_code=400)
+    pending.set_result(body["allow"])
+    return {"ok": True}
+
+
 UPLOADS = os.path.join(AGENT_DIR, "uploads")
-FILE_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit", "Bash"]
 
 
 @app.post("/api/agent/upload")
 async def agent_upload(req: Request):
-    """A file for the chat, sent as base64 JSON {name, type, data}; kept under explorer/cache/agent/uploads."""
-    import base64
-    import uuid
-    b = await req.json()
-    raw = base64.b64decode(b["data"])
-    if len(raw) > 25 << 20:
-        return JSONResponse({"error": "file over 25 MB"}, status_code=413)
-    os.makedirs(UPLOADS, exist_ok=True)
-    fid = uuid.uuid4().hex[:12]
-    name = os.path.basename(b.get("name") or "file")
-    with open(os.path.join(UPLOADS, f"{fid}-{name}"), "wb") as f:
-        f.write(raw)
-    with open(os.path.join(UPLOADS, f"{fid}.json"), "w") as f:
-        json.dump({"name": name, "type": b.get("type") or "", "size": len(raw)}, f)
-    return {"id": fid, "name": name, "size": len(raw)}
+    """Store an explicit attachment; malformed uploads return a useful client error."""
+    try:
+        return await asyncio.to_thread(store_upload, UPLOADS, await req.json())
+    except UploadTooLarge as e:
+        return JSONResponse({"error": str(e)}, status_code=413)
+    except (ValueError, TypeError, OSError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
-def attachment_block(fid):
-    """An uploaded file as a message content block: images and PDFs as themselves, anything else as text."""
-    import base64
-    fid = os.path.basename(str(fid))
-    meta_path = os.path.join(UPLOADS, f"{fid}.json")
-    if not os.path.exists(meta_path):
-        return None
-    meta = json.load(open(meta_path))
-    raw = open(os.path.join(UPLOADS, f"{fid}-{meta['name']}"), "rb").read()
-    kind = meta["type"]
-    if kind in ("image/png", "image/jpeg", "image/gif", "image/webp"):
-        return {"type": "image", "source": {"type": "base64", "media_type": kind, "data": base64.b64encode(raw).decode()}}
-    if kind == "application/pdf" or meta["name"].lower().endswith(".pdf"):
-        return {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                               "data": base64.b64encode(raw).decode()}, "title": meta["name"]}
-    text = raw.decode("utf-8", errors="replace")
-    cut = 200_000
-    more = f"\n[... {len(text) - cut} more characters cut]" if len(text) > cut else ""
-    return {"type": "text", "text": f'<file name="{meta["name"]}">\n{text[:cut]}{more}\n</file>'}
+def attachment_input(fid, provider="codex"):
+    return read_attachment(UPLOADS, fid, provider)
 
 
 AGENT_METHOD = os.path.join(ROOT, "explorer", "agent_methodology.md")
@@ -1181,609 +1343,416 @@ AGENT_LOCAL = os.path.join(ROOT, "explorer", "agent_prompt.local.md")  # this ma
 def agent_prompt_file():
     """agent_prompt.md, then agent_methodology.md and agent_prompt.local.md when present, with {ROOT} filled in as
     this checkout's path, written beside the chat's working files."""
-    text = open(AGENT_PROMPT).read()
+    text = Path(AGENT_PROMPT).read_text(encoding="utf-8")
     for extra in (AGENT_METHOD, AGENT_LOCAL):
         if os.path.exists(extra):
-            text = text.rstrip() + "\n\n" + open(extra).read()
-    text = text.replace("{ROOT}", ROOT)
+            text = text.rstrip() + "\n\n" + Path(extra).read_text(encoding="utf-8")
+    text = text.replace("{ROOT}", ROOT).replace("{PYTHON}", sys.executable)
+    text += (f"\n\nActive model: {MODEL}; revision: {REVISION or 'default'}. "
+             "Use overview for actual architecture dimensions. Methodology examples describe Qwen3.5-4B; "
+             "neuron identities and observations do not transfer between models.\n")
+    text = text.replace("http://127.0.0.1:8791", f"http://127.0.0.1:{PORT}")
     out = os.path.join(AGENT_DIR, "system_prompt.md")
-    if not os.path.exists(out) or open(out).read() != text:
-        if os.path.exists(out):
-            os.chmod(out, 0o644)
-        with open(out, "w") as f:
-            f.write(text)
-        os.chmod(out, 0o444)  # generated: edits belong in the source files above
+    if not os.path.exists(out) or Path(out).read_text(encoding="utf-8") != text:
+        Path(out).write_text(text, encoding="utf-8")
     return out
 
 
-async def _stop_turn(proc):
-    import signal
-    if proc is None or proc.returncode is not None:
-        return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            return
-        try:
-            await asyncio.wait_for(proc.wait(), 5)
-            return
-        except asyncio.TimeoutError:
-            pass
+def agent_session(cid):
+    """Only explorer-owned IDs may resume threads; never accept arbitrary CLI session IDs."""
+    import uuid
+    if not isinstance(cid, str) or str(uuid.UUID(cid)) != cid:
+        raise ValueError("invalid explorer chat id; start a new conversation")
+    folder = os.path.join(AGENT_DIR, "sessions")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{cid}.json")
+    return path, json.loads(Path(path).read_text(encoding="utf-8")) if os.path.exists(path) else {}
 
 
-def _session_file(sid):
-    hits = glob.glob(os.path.join(os.path.expanduser("~/.claude/projects"), "*", f"{os.path.basename(sid)}.jsonl"))
-    return hits[0] if hits else None
+def save_agent_session(path, session):
+    with open(path + ".tmp", "w") as f:
+        json.dump(session, f)
+    os.replace(path + ".tmp", path)
 
 
-def _user_text(m):
-    """The text of a message the person sent (None for tool results and CLI-injected notes)."""
-    if m.get("type") != "user" or m.get("isMeta"):
-        return None
-    c = (m.get("message") or {}).get("content")
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list) and not any(isinstance(x, dict) and x.get("type") == "tool_result" for x in c):
-        # the first text block is what they typed; attached text files follow as blocks of their own
-        return next((x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text"), "")
-    return None
+def agent_provider(body, session):
+    provider = body.get("provider", "claude")
+    if provider not in ("codex", "claude"):
+        raise ValueError("choose Codex or Claude")
+    if session and session.get("provider", "codex") != provider:
+        raise ValueError("this conversation belongs to a different assistant; switch providers or start a new chat")
+    return provider
 
 
-def _tool_results(m):
-    """The tool_result events in a session's user message, outputs cut to 1500 characters."""
-    out = []
-    for blk in (m.get("message") or {}).get("content") or []:
-        if isinstance(blk, dict) and blk.get("type") == "tool_result":
-            o = blk.get("content")
-            if isinstance(o, list):
-                o = "\n".join(x.get("text", "") for x in o if isinstance(x, dict))
-            o = str(o or "")
-            out.append({"t": "tool_result", "id": blk.get("tool_use_id"), "error": bool(blk.get("is_error")),
-                        "output": o[:1500] + (f" … ({len(o)} chars)" if len(o) > 1500 else "")})
-    return out
+def selected_agent_session(body, cid):
+    path, session = agent_session(cid)
+    if body.get("chat") and body.get("provider") == "claude" and not session:
+        session = legacy_session(cid, AGENT_DIR) or {}
+        if session:
+            save_agent_session(path, session)
+    return path, session, agent_provider(body, session)
 
 
-def _refusal(m):
-    """A reply the API's safety classifier stopped: {id, text} naming the classifier, else None."""
-    msg = m.get("message") if isinstance(m.get("message"), dict) else {}
-    if m.get("type") != "assistant" or msg.get("stop_reason") != "refusal":
-        return None
-    cat = (msg.get("stop_details") or {}).get("category")
-    return {"id": msg.get("id"), "text": f"stopped by the {cat} safety classifier" if cat else "stopped by a safety classifier"}
+def agent_client(provider, queue):
+    return (ClaudeClient if provider == "claude" else CodexClient)(AGENT_DIR, queue)
 
 
-def _shown_text(t):
-    """What the person typed, without the note about what they had open."""
-    import re
-    return re.sub(r"^\[The person has [^\]]*\]\n\n", "", t)
+async def stop_agent_turn(c):
+    task = c.get("stop_task")
+    if task is None or task.done():
+        c["stopping"] = True
+        targets = {c.get(key) for key in ("job", "active_task")}
 
-
-AGENT_SESSIONS = os.path.join(os.path.expanduser("~/.claude/projects"), AGENT_DIR.replace("/", "-").replace(".", "-"))
-_chat_list = {}  # path -> (mtime, summary)
-
-
-@app.get("/api/agent/chats")
-def agent_chats(limit: int = 60):
-    """Past chats, newest first: {chat, t (unix time of the last change), title (the first message), turns}."""
-    out = []
-    for path in glob.glob(os.path.join(AGENT_SESSIONS, "*.jsonl")):
-        mt = os.path.getmtime(path)
-        hit = _chat_list.get(path)
-        if not hit or hit[0] != mt:
-            title, turns = None, 0
-            with open(path) as f:
-                for line in f:
-                    try:
-                        t = _user_text(json.loads(line))
-                    except ValueError:
-                        continue
-                    if t is not None:
-                        turns += 1
-                        title = title or _shown_text(t).strip()[:120]
-            hit = _chat_list[path] = (mt, {"chat": os.path.basename(path)[:-6], "t": int(mt), "title": title, "turns": turns, "agent": "claude"})
-        if hit[1]["turns"]:
-            out.append(hit[1])
-    for cid, m in _meta().items():
-        path = os.path.join(CODEX_LOGS, f"{os.path.basename(cid)}.jsonl")
-        if m.get("agent") != "codex" or not os.path.exists(path):
-            continue
-        users = [e for e in map(json.loads, open(path)) if e.get("t") == "user"]
-        if users:
-            out.append({"chat": cid, "t": int(os.path.getmtime(path)), "title": users[0]["text"].strip()[:120], "turns": len(users), "agent": "codex"})
-    return sorted(out, key=lambda c: -c["t"])[:limit]
-
-
-@app.get("/api/agent/history")
-def agent_history(chat: str):
-    """A past chat as the events a live turn streams (text, tool, tool_result), with a user event per message."""
-    if _meta().get(chat, {}).get("agent") == "codex":
-        path = os.path.join(CODEX_LOGS, f"{os.path.basename(chat)}.jsonl")
-        ev = [e for e in map(json.loads, open(path)) if e.get("t") in ("user", "text", "tool", "tool_result")] if os.path.exists(path) else []
-        return {"chat": chat, "agent": "codex", "events": ev}
-    path = _session_file(chat)
-    if not path:
-        return {"events": []}
-    ev, seen_refusals = [], set()
-    with open(path) as f:
-        for line in f:
+        async def stop():
             try:
-                m = json.loads(line)
-            except ValueError:
-                continue
-            if m.get("isSidechain") or m.get("isMeta"):
-                continue
-            t = _user_text(m)
-            if t is not None:
-                ev.append({"t": "user", "text": _shown_text(t)})
-            elif m.get("type") == "assistant":
-                if (r := _refusal(m)) and r["id"] not in seen_refusals:
-                    seen_refusals.add(r["id"])
-                    ev.append({"t": "error", "error": r["text"]})
-                for blk in (m.get("message") or {}).get("content", []):
-                    if blk.get("type") == "text" and blk.get("text"):
-                        ev.append({"t": "text", "text": blk["text"]})
-                    elif blk.get("type") == "tool_use":
-                        ev.append({"t": "tool", "id": blk.get("id"), "input": blk.get("input"),
-                                   "name": blk["name"].removeprefix("mcp__explorer__")})
-            elif m.get("type") == "user":
-                ev += _tool_results(m)
-    return {"chat": chat, "events": ev}
+                for target in targets:
+                    if target and not target.done():
+                        target.cancel()
+                        await asyncio.gather(target, return_exceptions=True)
+                if c.get("client_key"):
+                    await agent_pool.discard(c["client_key"])
+            finally:
+                c.pop("stopping", None)
+                c.pop("stop_task", None)
+
+        c["stop_task"] = task = asyncio.create_task(stop())
+    # Repeated Stop requests share cleanup; disconnecting its caller must not
+    # cancel process termination or leave a half-closed reusable client.
+    await asyncio.shield(task)
 
 
 @app.post("/api/agent/rewind")
 async def agent_rewind(req: Request):
-    """Cut a chat's claude session back to just before the last message the person sent that ends with `text`
-    (everything after it goes too: the reply, a refusal, CLI notes). The cut session is backed up beside it first.
-    No match (already cut) is not an error."""
-    import shutil
-    import time
+    """Rewind only the selected provider's latest explorer-owned turn."""
     b = await req.json()
-    sid, text = b["chat"], (b.get("text") or "").strip()
-    meta = _meta().get(sid, {})
-    if meta.get("agent") == "codex":  # drop the last turn from the thread and the replay log
-        c = _chat(sid)
-        turns = meta.get("turns") or []
-        if turns:
-            try:
-                await _ensure_proc(c)
-                await _rpc(c, "thread/revert", {"threadId": c["thread"], "beforeTurnId": turns[-1]})
-            finally:
-                await _end_chat(c)
-            _meta_set(sid, turns=turns[:-1])
-        path = os.path.join(CODEX_LOGS, f"{os.path.basename(sid)}.jsonl")
-        if os.path.exists(path):
-            ev = [json.loads(x) for x in open(path)]
-            last = max((i for i, e in enumerate(ev) if e.get("t") == "user"), default=None)
-            if last is not None:
-                with open(path, "w") as f:
-                    f.writelines(json.dumps(e, ensure_ascii=False) + "\n" for e in ev[:last])
-        return {"ok": True, "cut": bool(turns)}
-    if sid in _chats:  # a live process holds the conversation in memory; the next message resumes from the cut file
-        await _end_chat(_chats[sid])
-    path = _session_file(sid)
-    if not path:
-        return {"ok": True, "cut": False}
-    lines = open(path).read().splitlines(True)
-    at = None
-    for i in range(len(lines) - 1, -1, -1):
+    try:
+        path, session, provider = selected_agent_session(b, b["chat"])
+    except (ValueError, KeyError, TypeError) as e:
+        return JSONResponse({"error": str(e) or "invalid explorer chat id"}, status_code=400)
+    c = _chats.setdefault(b["chat"], {"lock": asyncio.Lock()})
+    await stop_agent_turn(c)
+    async with c["lock"]:
+        _, session = agent_session(b["chat"])
+        if not session.get("last_turn"):
+            return {"ok": True, "cut": False}
+        if (b.get("text") or "").strip() != session.get("last_message", "").strip():
+            return JSONResponse({"error": "latest turn changed; reload the conversation"}, status_code=409)
+        client = agent_client(provider, asyncio.Queue())
         try:
-            t = _user_text(json.loads(lines[i]))
-        except ValueError:
-            continue
-        if t is not None and (not text or t.strip() == text or t.strip().endswith("\n\n" + text) or t.split("\n\n", 1)[-1].strip() == text):
-            at = i
-            break
-    if at is None:
-        return {"ok": True, "cut": False}
-    shutil.copy(path, f"{path}.bak-{int(time.time())}")
-    keep = lines[:at]
-    if not any(_user_text(json.loads(x)) is not None for x in keep if x.strip()):
-        os.remove(path)  # nothing the person said is left: the next turn starts the session afresh
-    else:
-        with open(path, "w") as f:
-            f.writelines(keep)
+            await client.start()
+            await client.open_thread(ROOT, b["chat"], PORT, Path(agent_prompt_file()).read_text(encoding="utf-8"), session["thread"])
+            if provider == "claude":
+                await client.rewind(session["last_message"])
+            else:
+                await client.call("thread/revert", {"threadId": session["thread"], "beforeTurnId": session["last_turn"]})
+            session.pop("last_turn", None)
+            session.pop("last_message", None)
+            save_agent_session(path, session)
+            chat_journal(b["chat"], c).rewind()
+        except (AgentError, OSError) as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+        finally:
+            await client.close()
     return {"ok": True, "cut": True}
 
 
-# One claude process per chat, its input left open: messages written mid-turn reach Claude between tool calls,
-# interrupt stops the reply without ending the process (its background commands keep running and report back in a
-# turn of their own), and every event goes to the chat's listeners. Events since the last turn ended are kept, so a
-# browser that reconnects mid-turn sees the whole turn.
-CHAT_IDLE = 30 * 60  # seconds without listeners or turns before a chat's input is closed (it exits once its work is done)
-
-
-def _claude_cmd(cid):
-    mcp = {"mcpServers": {"explorer": {"command": sys.executable, "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")],
-                                       "env": {"EXPLORER_URL": f"http://127.0.0.1:{PORT}", "EXPLORER_CHAT": cid}}}}
-    cmd = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-           "--system-prompt-file", agent_prompt_file(), "--mcp-config", json.dumps(mcp), "--strict-mcp-config",
-           # file tools and a shell, so it can run scripts against this server (e.g. score a file it shouldn't read)
-           "--tools", *FILE_TOOLS, "--allowedTools", "mcp__explorer", *FILE_TOOLS,
-           "--add-dir", os.path.expanduser("~"), "--setting-sources", "project"]
-    if os.environ.get("EXPLORER_CLAUDE_MODEL"):
-        cmd += ["--model", os.environ["EXPLORER_CLAUDE_MODEL"]]
-    # resume once the session exists on disk (any earlier turn creates it)
-    return cmd + (["--resume", cid] if _session_file(cid) else ["--session-id", cid])
-
-
-CHAT_META = os.path.join(AGENT_DIR, "chats.json")  # per chat: agent ("claude" / "codex"), codex thread id and turn ids
-CODEX_LOGS = os.path.join(AGENT_DIR, "codex_logs")  # per codex chat: its events, for past-chat replay
-
-
-def _meta():
-    try:
-        return json.load(open(CHAT_META))
-    except (OSError, ValueError):
-        return {}
-
-
-def _meta_set(cid, **kw):
-    m = _meta()
-    m.setdefault(cid, {}).update(kw)
-    os.makedirs(AGENT_DIR, exist_ok=True)
-    with open(CHAT_META, "w") as f:
-        json.dump(m, f)
-
-
-def _chat(cid, agent=None):
-    c = _chats.get(cid)
-    # a chat that hasn't run yet (an event stream can open before its first message) takes the agent it's sent with
-    if c is not None and agent in ("claude", "codex") and c["proc"] is None and not _meta().get(cid, {}).get("agent") \
-            and not _session_file(cid) and c["agent"] != agent:
-        del _chats[cid]
-        c2 = _chat(cid, agent)
-        c2["listeners"] = c["listeners"]
-        return c2
-    if cid not in _chats:
-        known = _meta().get(cid, {}).get("agent")
-        kind = known or (agent if agent in ("claude", "codex") else "claude")
-        if not known and kind == "codex":
-            _meta_set(cid, agent="codex")
-        _chats[cid] = {"session": cid, "agent": kind, "proc": None, "listeners": set(), "turn": [], "busy": False, "last": 0.0}
-    return _chats[cid]
-
-
-def _codex_log(cid, ev):
-    os.makedirs(CODEX_LOGS, exist_ok=True)
-    with open(os.path.join(CODEX_LOGS, f"{os.path.basename(cid)}.jsonl"), "a") as f:
-        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-
-
-def _emit(c, ev):
-    import time
-    c["last"] = time.time()
-    if ev.get("t") != "ui":
-        c["turn"].append(ev)
-        if c["agent"] == "codex" and ev.get("t") in ("text", "tool", "tool_result", "error", "done"):
-            _codex_log(c["session"], ev)
-    for q in list(c["listeners"]):
-        q.put_nowait(ev)
-
-
-async def _pump(c, proc):
-    """Turns the process's stream-json output into chat events until it exits."""
-    async for line in proc.stdout:
-        try:
-            m = json.loads(line)
-        except ValueError:
-            continue
-        if m.get("type") == "stream_event":
-            e = m["event"]
-            if e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta":
-                c["busy"] = True
-                _emit(c, {"t": "text", "text": e["delta"]["text"]})
-        elif m.get("type") == "assistant":
-            for blk in m["message"].get("content", []):
-                if blk.get("type") == "tool_use":
-                    c["busy"] = True
-                    _emit(c, {"t": "tool", "id": blk.get("id"), "input": blk.get("input"),
-                              "name": blk["name"].removeprefix("mcp__explorer__")})
-            if (r := _refusal(m)) and r["id"] not in c.setdefault("refused", set()):
-                c["refused"].add(r["id"])
-                _emit(c, {"t": "error", "error": r["text"]})
-        elif m.get("type") == "user":
-            for ev in _tool_results(m):
-                _emit(c, ev)
-        elif m.get("type") == "result":
-            if m.get("is_error") and m.get("subtype") != "error_during_execution":
-                _emit(c, {"t": "error", "error": str(m.get("result"))[:600]})
-            c["busy"] = False
-            _emit(c, {"t": "done", "cost": m.get("total_cost_usd")})
-            c["turn"] = []
-    err = (await proc.stderr.read()).decode(errors="replace")
-    code = await proc.wait()
-    if c.get("proc") is proc:
-        c["proc"] = None
-        if c["busy"] or code not in (0, None):
-            _emit(c, {"t": "error", "error": err.strip()[-600:] or f"claude exited {code}"})
-        if c["busy"]:
-            c["busy"] = False
-            _emit(c, {"t": "done"})
-        c["turn"] = []
-
-
-CODEX_HOME = os.path.join(AGENT_DIR, "codex-home")
-
-
-def _codex_home():
-    """Codex's own home for the explorer agent: the person's login, their model and effort, and nothing else (no
-    plugins, apps, memories or global instructions), so its tools are the explorer's and its shell."""
-    import tomllib
-    os.makedirs(CODEX_HOME, exist_ok=True)
-    auth, src = os.path.join(CODEX_HOME, "auth.json"), os.path.expanduser("~/.codex/auth.json")
-    if not os.path.lexists(auth) and os.path.exists(src):
-        os.symlink(src, auth)
-    try:
-        user = tomllib.load(open(os.path.expanduser("~/.codex/config.toml"), "rb"))
-    except (OSError, ValueError):
-        user = {}
-    lines = [f'{k} = {json.dumps(user[k])}' for k in ("model", "model_reasoning_effort") if isinstance(user.get(k), str)]
-    lines += ["", "[features]", "apps = false", "memories = false"]
-    with open(os.path.join(CODEX_HOME, "config.toml"), "w") as f:
-        f.write("\n".join(lines) + "\n")
-    return CODEX_HOME
-
-
-CODEX_NOTE = """
-
-## This session
-
-You are running as Codex. Your shell and file editing are Codex's own: where these instructions name Read, Glob,
-Grep, Write, Edit or Bash, use your shell and apply_patch. Start anything that runs longer than about a minute
-detached (`nohup {ROOT}/.venv/bin/python script.py > script.log 2>&1 &`), say where the log is, and end your reply;
-read the log in a later turn."""
-
-
-async def _rpc(c, method, params, timeout=120):
-    rpc = c["rpc"]
-    rpc["next"] += 1
-    fut = asyncio.get_running_loop().create_future()
-    rpc["pending"][rpc["next"]] = fut
-    await _write(c["proc"], {"jsonrpc": "2.0", "id": rpc["next"], "method": method, "params": params})
-    r = await asyncio.wait_for(fut, timeout)
-    if "error" in r:
-        raise RuntimeError(f"codex {method}: {r['error'].get('message', r['error'])}")
-    return r.get("result") or {}
-
-
-def _codex_text(item):
-    """A tool item's input and output as the events show them: (name, input, output, failed)."""
-    k = item.get("type")
-    if k == "mcpToolCall":
-        res = item.get("result") or {}
-        out = "\n".join(x.get("text", "") for x in res.get("content") or [] if isinstance(x, dict)) or str(item.get("error") or "")
-        return item.get("tool", "tool"), item.get("arguments") or {}, out, item.get("status") == "failed"
-    if k == "commandExecution":
-        return "Bash", {"command": item.get("command")}, item.get("aggregatedOutput") or "", item.get("status") in ("failed", "declined")
-    if k == "fileChange":
-        ch = item.get("changes") or []
-        return "Edit", {"file_path": ", ".join(str(x.get("path", "")) for x in ch if isinstance(x, dict))}, item.get("status", ""), item.get("status") == "failed"
-    if k == "webSearch":
-        return "WebSearch", {"query": item.get("query")}, "", False
-    return None
-
-
-async def _codex_pump(c, proc):
-    rpc = c["rpc"]
-    async for line in proc.stdout:
-        try:
-            m = json.loads(line)
-        except ValueError:
-            continue
-        if "id" in m and ("result" in m or "error" in m) and "method" not in m:
-            fut = rpc["pending"].pop(m["id"], None)
-            if fut and not fut.done():
-                fut.set_result(m)
-            continue
-        meth, prm = m.get("method"), m.get("params") or {}
-        if "id" in m and meth:  # a request from codex (approvals): the thread runs without them; decline anything else
-            await _write(proc, {"jsonrpc": "2.0", "id": m["id"], "result": {"decision": "decline"}})
-            continue
-        if meth == "turn/started":
-            c["turn_id"], c["busy"] = prm["turn"]["id"], True
-        elif meth == "item/agentMessage/delta":
-            c["busy"] = True
-            if c.get("msg_item") != prm.get("itemId"):
-                if c.get("msg_item"):
-                    _emit(c, {"t": "text", "text": "\n\n"})
-                c["msg_item"] = prm.get("itemId")
-            _emit(c, {"t": "text", "text": prm.get("delta", "")})
-        elif meth in ("item/started", "item/completed"):
-            t = _codex_text(prm.get("item") or {})
-            if t:
-                name, inp, out, failed = t
-                iid = prm["item"].get("id")
-                if meth == "item/started":
-                    c["msg_item"] = None
-                    _emit(c, {"t": "tool", "id": iid, "name": name, "input": inp})
-                else:
-                    _emit(c, {"t": "tool_result", "id": iid, "error": failed,
-                              "output": out[:1500] + (f" … ({len(out)} chars)" if len(out) > 1500 else "")})
-        elif meth == "turn/completed":
-            turn = prm.get("turn") or {}
-            if turn.get("status") == "failed" and turn.get("error"):
-                _emit(c, {"t": "error", "error": str(turn["error"].get("message", turn["error"]))[:600]})
-            c["busy"], c["turn_id"], c["msg_item"] = False, None, None
-            _emit(c, {"t": "done"})
-            c["turn"] = []
-        elif meth == "error":
-            _emit(c, {"t": "error", "error": str(prm.get("error", {}).get("message", prm))[:600]})
-    await proc.wait()
-    if c.get("proc") is proc:
-        c["proc"] = None
-        if c["busy"]:
-            c["busy"] = False
-            _emit(c, {"t": "error", "error": "codex exited"})
-            _emit(c, {"t": "done"})
-        c["turn"] = []
-
-
-async def _ensure_codex(c):
-    proc = c.get("proc")
-    if proc is not None and proc.returncode is None:
-        return proc
-    os.makedirs(AGENT_DIR, exist_ok=True)
-    env = {**os.environ, "CODEX_HOME": _codex_home()}
-    proc = c["proc"] = await asyncio.create_subprocess_exec("codex", "app-server", cwd=AGENT_DIR, env=env, stdin=asyncio.subprocess.PIPE,
-                                                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                                                            limit=1 << 24, start_new_session=True)
-    c["rpc"] = {"next": 0, "pending": {}}
-    c["pump"] = asyncio.create_task(_codex_pump(c, proc))
-    await _rpc(c, "initialize", {"clientInfo": {"name": "neuron-explorer", "version": "0.1"}})
-    mcp = {"explorer": {"command": sys.executable, "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")],
-                        "env": {"EXPLORER_URL": f"http://127.0.0.1:{PORT}", "EXPLORER_CHAT": c["session"]}}}
-    opts = {"cwd": AGENT_DIR, "approvalPolicy": "never", "sandbox": "danger-full-access", "config": {"mcp_servers": mcp},
-            "developerInstructions": open(agent_prompt_file()).read() + CODEX_NOTE.replace("{ROOT}", ROOT)}
-    thread = _meta().get(c["session"], {}).get("thread")
-    r = await _rpc(c, "thread/resume", {"threadId": thread, **opts}) if thread else await _rpc(c, "thread/start", opts)
-    c["thread"] = r["thread"]["id"]
-    if not thread:
-        _meta_set(c["session"], thread=c["thread"])
-    return proc
-
-
-async def _ensure_proc(c):
-    if c["agent"] == "codex":
-        return await _ensure_codex(c)
-    proc = c.get("proc")
-    if proc is not None and proc.returncode is None:
-        return proc
-    os.makedirs(AGENT_DIR, exist_ok=True)
-    # its own process group, so ending a chat also ends what it started (MCP server, shell scripts)
-    proc = c["proc"] = await asyncio.create_subprocess_exec(*_claude_cmd(c["session"]), cwd=AGENT_DIR, stdin=asyncio.subprocess.PIPE,
-                                                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                                                            limit=1 << 24, start_new_session=True)
-    c["pump"] = asyncio.create_task(_pump(c, proc))
-    return proc
-
-
-async def _write(proc, obj):
-    proc.stdin.write((json.dumps(obj) + "\n").encode())
-    await proc.stdin.drain()
+@app.post("/api/agent/chat")
+async def agent_chat(req: Request):
+    return await prepare_agent_turn(req)
 
 
 @app.post("/api/agent/send")
 async def agent_send(req: Request):
-    """A message into a chat: {chat, message, layer?, n? or head?, attachments?: [upload ids]}. Starts (or resumes) the
-    chat's claude process if needed. Mid-turn, the message reaches Claude between tool calls. Events arrive on
-    /api/agent/events."""
-    import time
-    b = await req.json()
-    c = _chat(b["chat"], b.get("agent"))
-    msg = b["message"]
-    shown = msg
-    if b.get("layer") is not None and b.get("head") is not None:
-        msg = f"[The person has attention head L{int(b['layer'])} h{int(b['head'])} open in the explorer.]\n\n{msg}"
-    elif b.get("layer") is not None:
-        msg = f"[The person has L{int(b['layer'])} N{int(b['n'])} open in the explorer.]\n\n{msg}"
-    if c["agent"] == "codex":
-        try:
-            await _ensure_proc(c)
-        except Exception as e:
-            return {"error": f"codex: {e}"}
-        _codex_log(c["session"], {"t": "user", "text": shown})
-        items = [{"type": "text", "text": msg, "text_elements": []}] + [x for a in b.get("attachments") or [] if (x := _codex_input(a))]
-        c["busy"], c["last"] = True, time.time()
-        _emit(c, {"t": "sent"})
-        if c.get("turn_id"):  # mid-turn: the message joins the running turn
+    return await prepare_agent_turn(req, background=True)
+
+
+async def prepare_agent_turn(req, background=False):
+    """Stream the selected assistant's text, tools, and explorer UI actions as NDJSON."""
+    import uuid
+    try:
+        b = await req.json()
+        if not isinstance(b, dict):
+            raise ValueError("assistant request must be an object")
+        cid = b.get("chat") or str(uuid.uuid4())
+        path, session, provider = selected_agent_session(b, cid)
+        if b.get("chat") and not session:
+            raise ValueError("saved chat not found; start a new conversation")
+        original = b["message"]
+        if not isinstance(original, str) or not original.strip() or len(original) > 200_000:
+            raise ValueError("provide a message up to 200,000 characters")
+        if not isinstance(b.get("shown", original), str):
+            raise ValueError("shown message must be text")
+        for key in ("attachments", "attachment_names"):
+            value = b.get(key) or []
+            if not isinstance(value, list) or len(value) > 50 or any(not isinstance(x, str) for x in value):
+                raise ValueError(f"{key} must contain up to 50 strings")
+        access = b.get("access", "project")
+        if access not in SCOPES:
+            raise ValueError("choose project or home file access")
+        content = [{"type": "text", "text": original}]
+        if b.get("layer") is not None:
+            if b.get("head") is not None:
+                validate_head(ARCH, b["layer"], b["head"])
+                selected = f"L{b['layer']} h{b['head']}"
+            else:
+                validate_ui_command({"action": "select", "layer": b["layer"], "n": b["n"]}, ARCH)
+                selected = f"L{b['layer']} N{b['n']}"
+            content[0]["text"] = f"[The person has {selected} open in the explorer.]\n\n{original}"
+        content += [await asyncio.to_thread(attachment_input, fid, provider) for fid in b.get("attachments") or []]
+    except (ValueError, KeyError, TypeError, OSError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    c = _chats.setdefault(cid, {"lock": asyncio.Lock()})
+    if busy_chat(c) or c.get("recovering"):
+        return JSONResponse({"error": "this conversation is already running or restoring; stop it or wait"}, status_code=409)
+
+    async def events():
+        async with c["lock"]:
+            c["active_task"] = asyncio.current_task()
+            c["queue"] = q = asyncio.Queue()
+            c.update(access=access, cancel=asyncio.Event(), approvals={}, browser=b.get("browser"))
+            client, reusable = None, False
             try:
-                await _rpc(c, "turn/steer", {"threadId": c["thread"], "expectedTurnId": c["turn_id"], "input": items})
-                return {"ok": True}
-            except Exception:
-                pass  # the turn ended meanwhile: start a new one
-        r = await _rpc(c, "turn/start", {"threadId": c["thread"], "input": items})
-        c["turn_id"] = r["turn"]["id"]
-        _meta_set(c["session"], turns=_meta().get(c["session"], {}).get("turns", []) + [c["turn_id"]])
+                _, saved = agent_session(cid)
+                instructions = Path(agent_prompt_file()).read_text(encoding="utf-8")
+                instructions += f"\n\nCurrent file-tool scope: {access}. Use list_files, read_file, write_file and run_shell for research scripts. Native shell/file tools are disabled in both providers. File tools are restricted to the project{' and your home folder' if access == 'home' else ''}. Every run_shell command requires the person's approval and runs with their user account, not inside a filesystem sandbox. Never suggest that a shell starting directory restricts what a command can access. Keep scratch work under {AGENT_DIR}/work."
+                async def connect(client):
+                    await client.start()
+                    return await client.open_thread(ROOT, cid, PORT, instructions, saved.get("thread"))
+
+                if background:
+                    c["client_key"] = cid
+                    policy = (provider, access, instructions, os.environ.get(f"EXPLORER_{provider.upper()}_MODEL"),
+                              os.environ.get(f"EXPLORER_{provider.upper()}_BIN"))
+                    lease = await agent_pool.acquire(cid, policy, lambda: agent_client(provider, q), connect)
+                    client, thread = lease["client"], lease["thread"]
+                    c["queue"] = q = client.queue
+                else:
+                    client = agent_client(provider, q)
+                    thread = await connect(client)
+                saved.update(thread=thread, provider=provider, access=access)
+                save_agent_session(path, saved)
+                yield json.dumps({"t": "chat", "chat": cid, "provider": provider}) + "\n"
+                result = await client.call("turn/start", {"threadId": thread, "input": content})
+                client.turn = result["turn"]["id"]
+                saved.update(last_turn=client.turn, last_message=original)
+                save_agent_session(path, saved)
+                while True:
+                    kind, item = await q.get()
+                    if kind == "ui":
+                        yield json.dumps({"t": "ui", **item}) + "\n"
+                    elif kind == "closed":
+                        raise AgentError(f"{provider.title()} stopped unexpectedly. Check its CLI installation and login.")
+                    elif kind == "event":
+                        if item["t"] == "done":
+                            client.turn = None
+                            reusable = not item.get("error") and item.get("status") not in ("failed", "interrupted", "cancelled")
+                            if item.get("error"):
+                                yield json.dumps({"t": "error", "error": item["error"]}) + "\n"
+                            yield json.dumps(item) + "\n"
+                            break
+                        yield json.dumps(item) + "\n"
+            except (AgentError, OSError) as e:
+                yield json.dumps({"t": "error", "error": str(e)}) + "\n"
+            finally:
+                c["cancel"].set()
+                for pending in c["approvals"].values():
+                    if not pending.done():
+                        pending.set_result(False)
+                # Starlette cancels the stream's AnyIO scope on disconnect. Finish
+                # interrupt/shutdown before another request takes this chat's lock.
+                try:
+                    with CancelScope(shield=True):
+                        if client is not None:
+                            if background:
+                                await agent_pool.release(cid, client, reusable)
+                            else:
+                                await client.close()
+                finally:
+                    c.pop("active_task", None)
+                    c.pop("queue", None)
+
+    if not background:
+        return StreamingResponse(events(), media_type="application/x-ndjson")
+    journal = chat_journal(cid, c)
+    start = journal.cursor
+    session.update(provider=provider, access=access, title=session.get("title") or original[:100], updated=time.time())
+    save_agent_session(path, session)
+    journal.append({"t": "user", "text": original, "shown": b.get("shown", original),
+                    "attachments": [{"id": fid, "name": (b.get("attachment_names") or [])[i] if i < len(b.get("attachment_names") or []) else "attachment"}
+                                    for i, fid in enumerate(b.get("attachments") or [])]})
+
+    async def run():
+        completed = None
+        try:
+            async for line in events():
+                event = json.loads(line)
+                if event["t"] == "done":
+                    completed = event
+                else:
+                    journal.append(event)
+        except asyncio.CancelledError:
+            completed = None
+            journal.append({"t": "stopped"})
+            raise
+        except Exception:
+            journal.append({"t": "error", "error": "The assistant failed unexpectedly. Check the server log."})
+            import traceback
+            traceback.print_exc()
+        finally:
+            _, saved = agent_session(cid)
+            saved["updated"] = time.time()
+            save_agent_session(path, saved)
+            # Publish completion only after provider/process cleanup. Reconnecting
+            # readers can then finish and send their next turn immediately.
+            journal.append(completed or {"t": "done", "status": "interrupted"})
+
+    c["job"] = asyncio.create_task(run())
+    return {"chat": cid, "provider": provider, "cursor": start}
+
+
+def busy_chat(c):
+    return bool(c.get("stopping")) or any(c.get(key) and not c[key].done() for key in ("job", "active_task"))
+
+
+def chat_journal(cid, c):
+    if "journal" not in c:
+        c["journal"] = Journal(AGENT_DIR, cid)
+        events = c["journal"].events
+        if events and events[-1]["t"] != "done":
+            c["journal"].append({"t": "error", "error": "Server restarted before this reply completed."})
+            c["journal"].append({"t": "done", "status": "interrupted"})
+    return c["journal"]
+
+
+def owned_chat(cid):
+    _, session = agent_session(cid)
+    if not session:
+        raise ValueError("saved explorer conversation not found")
+    c = _chats.setdefault(cid, {"lock": asyncio.Lock()})
+    return session, c, chat_journal(cid, c)
+
+
+@app.get("/api/agent/chats")
+async def agent_chats():
+    result = []
+    for path in Path(AGENT_DIR, "sessions").glob("*.json"):
+        try:
+            _, session = agent_session(path.stem)
+            result.append({"chat": path.stem, "provider": session.get("provider", "codex"),
+                           "title": session.get("title") or session.get("last_message") or "Conversation",
+                           "updated": session.get("updated", path.stat().st_mtime),
+                           "running": busy_chat(_chats.get(path.stem, {}))})
+        except (ValueError, OSError, TypeError):
+            continue
+    return {"chats": sorted(result, key=lambda c: c["updated"], reverse=True)}
+
+
+@app.get("/api/agent/history")
+async def agent_history(chat: str):
+    try:
+        session, c, journal = owned_chat(chat)
+        history_error = None
+        if not journal.cursor and session.get("thread") and not busy_chat(c):
+            async with c["lock"]:
+                if not journal.cursor and not busy_chat(c):
+                    c["recovering"] = True
+                    client = agent_client(session.get("provider", "codex"), asyncio.Queue())
+                    try:
+                        await client.start()
+                        for event in await client.history(session["thread"]):
+                            journal.append(event)
+                    except (AgentError, OSError) as e:
+                        history_error = str(e)
+                    finally:
+                        with CancelScope(shield=True):
+                            await client.close()
+                        c.pop("recovering", None)
+        pending = [aid for aid, future in c.get("approvals", {}).items() if not future.done()]
+        return {"chat": chat, "provider": session.get("provider", "codex"), "access": session.get("access", "project"),
+                "events": journal.events, "cursor": journal.cursor, "running": busy_chat(c), "approvals": pending,
+                "history_error": history_error}
+    except (ValueError, OSError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.post("/api/agent/history/import")
+async def agent_import_history(req: Request):
+    """Migrate old browser-only display history as text; never import HTML or CLI session IDs."""
+    try:
+        b = await req.json()
+        _, c, journal = owned_chat(b["chat"])
+        if busy_chat(c) or journal.cursor:
+            return JSONResponse({"error": "conversation already has server history"}, status_code=409)
+        records = b["messages"]
+        if not isinstance(records, list) or len(json.dumps(records)) > 2_000_000:
+            raise ValueError("history must be a list up to 2 MB")
+        for record in records:
+            if not isinstance(record, dict) or record.get("t") not in ("user", "text") or not isinstance(record.get("text"), str):
+                raise ValueError("history requires user or text records")
+        for record in records:
+            journal.append({"t": record["t"], "text": record["text"]})
+        if records:
+            journal.append({"t": "done", "status": "completed"})
         return {"ok": True}
-    content = [{"type": "text", "text": msg}] + [blk for a in b.get("attachments") or [] if (blk := attachment_block(a))]
-    proc = await _ensure_proc(c)
-    c["busy"], c["last"] = True, time.time()
-    _emit(c, {"t": "sent"})
-    await _write(proc, {"type": "user", "message": {"role": "user", "content": content}})
-    return {"ok": True}
+    except (KeyError, ValueError, TypeError, OSError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
-def _codex_input(fid):
-    """An uploaded file as codex input: images by path, anything else as text (as attachment_block gives it)."""
-    fid = os.path.basename(str(fid))
-    mp = os.path.join(UPLOADS, f"{fid}.json")
-    if not os.path.exists(mp):
-        return None
-    meta = json.load(open(mp))
-    if meta["type"].startswith("image/"):
-        return {"type": "localImage", "path": os.path.join(UPLOADS, f"{fid}-{meta['name']}")}
-    blk = attachment_block(fid)
-    return {"type": "text", "text": blk["text"], "text_elements": []} if blk and blk.get("type") == "text" else None
+@app.get("/api/agent/events")
+async def agent_events(chat: str, after: int = 0):
+    try:
+        _, c, journal = owned_chat(chat)
+        if not 0 <= after <= journal.cursor:
+            raise ValueError("event cursor is out of range; reload conversation history")
+    except (ValueError, OSError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    async def follow():
+        cursor = after
+        while True:
+            batch = journal.events[cursor:]
+            for event in batch:
+                yield json.dumps(event) + "\n"
+                cursor = event["seq"]
+            if not busy_chat(c):
+                break
+            if not batch:
+                yield "\n"  # heartbeat; disconnecting a listener does not cancel the job
+            await asyncio.sleep(0.25)
+
+    return StreamingResponse(follow(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/agent/interrupt")
 async def agent_interrupt(req: Request):
-    """Stops the chat's current reply; the process and its background commands keep running."""
-    import uuid
-    b = await req.json()
-    c = _chats.get(b.get("chat", ""))
-    proc = c and c.get("proc")
-    if not proc or proc.returncode is not None or not c["busy"]:
-        return {"ok": True, "running": False}
-    if c["agent"] == "codex":
-        if not c.get("turn_id"):
-            return {"ok": True, "running": False}
-        await _rpc(c, "turn/interrupt", {"threadId": c["thread"], "turnId": c["turn_id"]})
-        return {"ok": True, "running": True}
-    await _write(proc, {"type": "control_request", "request_id": str(uuid.uuid4()), "request": {"subtype": "interrupt"}})
-    return {"ok": True, "running": True}
-
-
-@app.get("/api/agent/events")
-async def agent_events(chat: str):
-    """The chat's events as NDJSON, starting with {t: "state", busy} and the current turn's events so far: text, tool,
-    tool_result, ui, error, done (a turn ended), sent (a message went in)."""
-    c = _chat(chat)
-    q = asyncio.Queue()
-    c["listeners"].add(q)
-
-    async def gen():
-        try:
-            yield json.dumps({"t": "state", "busy": c["busy"], "running": bool(c.get("proc") and c["proc"].returncode is None)}) + "\n"
-            for ev in list(c["turn"]):
-                yield json.dumps(ev) + "\n"
-            while True:
-                try:
-                    ev = await asyncio.wait_for(q.get(), 20)
-                except asyncio.TimeoutError:
-                    yield json.dumps({"t": "ping"}) + "\n"
-                    continue
-                yield json.dumps(ev) + "\n"
-        finally:
-            c["listeners"].discard(q)
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
-
-
-async def _end_chat(c):
-    """Ends a chat's process now (and its background commands)."""
-    proc = c.get("proc")
-    c["proc"] = None
-    await _stop_turn(proc)
-
-
-async def _reap_chats():
-    """Closes the input of chats idle past CHAT_IDLE with no one listening; claude exits once its own work is done."""
-    import time
-    while True:
-        await asyncio.sleep(60)
-        for c in list(_chats.values()):
-            proc = c.get("proc")
-            if proc and proc.returncode is None and not c["busy"] and not c["listeners"] and time.time() - c["last"] > CHAT_IDLE:
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
+    try:
+        b = await req.json()
+        _, c, _ = owned_chat(b["chat"])
+        await stop_agent_turn(c)
+        return {"ok": True}
+    except (KeyError, ValueError, TypeError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 @app.on_event("startup")
-async def _start_reaper():
-    asyncio.create_task(_reap_chats())
+async def start_agent_reaper():
+    global agent_reaper
+
+    async def reap():
+        while True:
+            await asyncio.sleep(30)
+            await agent_pool.reap()
+
+    agent_reaper = asyncio.create_task(reap())
+
+
+@app.on_event("shutdown")
+async def stop_agent_jobs():
+    if agent_reaper:
+        agent_reaper.cancel()
+        await asyncio.gather(agent_reaper, return_exceptions=True)
+    await asyncio.gather(*(stop_agent_turn(c) for c in _chats.values()))
+    await agent_pool.close()
 
 
 @app.get("/api/status")
@@ -1801,11 +1770,12 @@ def preload():
             rt.vocab_strings()
             return
         rt.ensure_loaded()
-        if not os.path.exists(LENS_INDEX):
+        legacy = MODEL == DEFAULT_MODEL and REVISION is None
+        if legacy and not os.path.exists(LENS_INDEX):
             os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
             rt.build_lens_index(LENS_INDEX)
         rt.vocab_strings()
-        if not os.path.exists(ACT_SCALE):
+        if legacy and not os.path.exists(ACT_SCALE):
             rt.build_act_scale(ACT_SCALE)
     threading.Thread(target=go, daemon=True).start()
 

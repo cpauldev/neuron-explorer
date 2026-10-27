@@ -1,23 +1,31 @@
-import { createMap } from "./map3d.js?v=78";
-import { createScatter } from "./scatter.js?v=39";
+import { followAssistant } from "./assistant_stream.js?v=1";
+import { createMap } from "./map3d.js?v=79";
+import { createScatter } from "./scatter.js?v=40";
+import { parseDose, createChatUiController, connectUiBridge } from "./chat_ui.js?v=3";
 
 const $ = s => document.querySelector(s);
-const api = async (p, body) => {
-  const r = await fetch(p, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+function setPressed(button, on) { button.classList.toggle("on", on); button.setAttribute("aria-pressed", String(on)); }
+const api = async (p, body, options = {}) => {
+  const r = await fetch(p, { ...(body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}), ...options });
   if (!r.ok) throw new Error(`${p.split("?")[0]} ${r.status}: ${(await r.text()).slice(0, 160)}`);
-  return r.json();
+  const data = await r.json();
+  if (data.error) throw new Error(String(data.error));
+  return data;
 };
 addEventListener("unhandledrejection", e => { const el = document.querySelector("#status"); if (el) el.textContent = String(e.reason?.message || e.reason); });
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmtDose = d => (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d);
 
-let agentSelecting = false, agentMarked = false;  // Claude's selections and marks (see agentUi); declared early, openNeuron reads them on load
+let agentSelecting = false, agentMarked = false;  // The assistant's selections and marks (see agentUi); declared early, openNeuron reads them on load
 const state = { layer: null, units: {}, unitMap: {}, focus: null, view: "map", chat: { mode: "add", dir: "writes", dose: { add: 0.8, mul: 2 } } };
+const browserId = crypto.randomUUID();
 const ADD_STEPS = [...Array.from({ length: 30 }, (_, i) => +((i + 1) * 0.05).toFixed(2)), 1.75, 2, 2.5, 3, 4, 5];
 const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12, 16];
 
 const index = await api("/api/index");
 const arch = index.arch;
+// Retain default-model browser history; isolate selections and assistant chats for other weights.
+const modelKey = key => index.cache_key ? `${key}.${index.cache_key}` : key;
 const tip = $("#tip");
 
 // ---------- map ----------
@@ -116,12 +124,12 @@ const layouts = {};
 let wantLayout = null;
 async function setLayout(kind) {
   wantLayout = kind;
-  document.querySelectorAll("#layout-mode button").forEach(b => b.classList.toggle("on", b.dataset.k === kind));
+  document.querySelectorAll("#layout-mode button").forEach(b => setPressed(b, b.dataset.k === kind));
   if (kind === "index") { map.setLayout(null); return; }
   if (!layouts[kind]) {
     const r = await api(`/api/layout?kind=${kind}`);
     if (wantLayout !== kind) return;
-    if (!r.available) { document.querySelectorAll("#layout-mode button").forEach(b => b.classList.toggle("on", b.dataset.k === "index")); map.setLayout(null); return; }
+    if (!r.available) { document.querySelectorAll("#layout-mode button").forEach(b => setPressed(b, b.dataset.k === "index")); map.setLayout(null); return; }
     const bin = atob(r.cell), a = new Int16Array(bin.length / 2);
     for (let i = 0; i < a.length; i++) a[i] = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
     layouts[kind] = a;
@@ -134,7 +142,7 @@ setLayout("writes");
 // connection web of the focused neuron: downstream cone forward, upstream cone backward
 let webOn = true, webKey = null;
 async function refreshWeb() {
-  document.querySelectorAll("#web-mode button").forEach(b => b.classList.toggle("on", (b.dataset.w === "on") === webOn));
+  document.querySelectorAll("#web-mode button").forEach(b => setPressed(b, (b.dataset.w === "on") === webOn));
   const f = state.focus, first = Math.max(1, Math.min(24, Math.round(Number($("#web-z").value) || 5)));
   const k = Number(new URLSearchParams(location.search).get("webk")) || 2;
   const hops = Number(new URLSearchParams(location.search).get("webhops")) || 0;  // hops out each way; 0 = all the way
@@ -145,7 +153,9 @@ async function refreshWeb() {
   const r = await fetch(`/api/web?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}`);
   if (!r.ok || webKey !== key) return;
   $("#web-z").title = `web: the open neuron's top links each way (later hops follow ${k}) · ${r.headers.get("X-Web-Total")} links`;
-  map.setWeb(new Int16Array(await r.arrayBuffer()));
+  const links = new Int16Array(await r.arrayBuffer());
+  if (webKey !== key) return;
+  map.setWeb(links);
   const sum = await api(`/api/web/summary?layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}&top=24`);
   if (webKey !== key) return;
   state.webSum = { ...sum, layer: f.layer, n: f.n, links: r.headers.get("X-Web-Total") };
@@ -172,31 +182,45 @@ const scatter = createScatter($("#scatter"), {
 let scatterHover = null;
 const rolloutCache = new Map();
 document.querySelectorAll("#color-by button").forEach(b => b.onclick = () => {
-  document.querySelectorAll("#color-by button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll("#color-by button").forEach(x => setPressed(x, x === b));
   scatter.setColorBy(b.dataset.c);
 });
 
 // ---------- views / layer ----------
 document.querySelectorAll("#views button").forEach(b => b.onclick = () => setView(b.dataset.view));
+$("#views").addEventListener("keydown", e => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+  const tabs = [...document.querySelectorAll("#views button[data-view]")], at = tabs.indexOf(e.target);
+  if (at < 0) return;
+  e.preventDefault();
+  const next = e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : (at + (e.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  setView(tabs[next].dataset.view); tabs[next].focus();
+});
 function setView(v) {
   state.view = v;
-  document.querySelectorAll("#views button").forEach(x => x.classList.toggle("on", x.dataset.view === v));
+  document.querySelectorAll("#views button").forEach(x => {
+    const on = x.dataset.view === v;
+    x.classList.toggle("on", on); x.setAttribute("aria-selected", String(on)); x.tabIndex = on ? 0 : -1;
+  });
   $("#map-view").classList.toggle("on", v === "map");
   $("#embed-view").classList.toggle("on", v === "embed");
+  hideTip();
   if (v === "embed") loadEmbeddings();
 }
 const layerSel = $("#layer");
 for (let l = 0; l < arch.n_layers; l++) {
   const o = document.createElement("option"); o.value = l;
-  o.textContent = `L${l}${index.layers[l] ? "" : " ·"}`;
+  o.textContent = `L${l}${index.layers[l] ? " — saved examples" : ""}`;
   layerSel.appendChild(o);
 }
+layerSel.title = "Select a layer. ‘Saved examples’ means this layer has precomputed steering experiments; all layers support live inspection.";
+$("#inf-hi").value = arch.n_layers - 1;
 layerSel.onchange = () => { setLayer(+layerSel.value); map.enterLayer(+layerSel.value); };
 
 async function setLayer(l) {
   state.layer = l; layerSel.value = l;
   if (scatter.data && scatter.data.layer !== l) { scatter.setData(null); hideTip(); }
-  try { localStorage.setItem("ne.layer", l); } catch {}
+  try { localStorage.setItem(modelKey("ne.layer"), l); } catch {}
   if (!state.units[l]) {
     if (!lensResults) $("#rows").innerHTML = `<li class="head">…</li>`;
     const us = index.layers[l] ? await api(`/api/units?layer=${l}`) : [];
@@ -213,7 +237,7 @@ async function loadEmbeddings() {
   $("#embed-empty").textContent = "…";
   const d = index.layers[l] ? await api(`/api/embeddings?layer=${l}`) : {};
   if (state.layer !== l) return;
-  $("#embed-empty").textContent = d.x ? "" : "—";
+  $("#embed-empty").textContent = d.x ? "" : `No saved embeddings for L${l}. Choose a layer with saved examples.`;
   scatter.setData(d.x ? { ...d, layer: l } : null);
   scatter.select(state.layer, state.focus?.layer === state.layer ? state.focus.n : null);
 }
@@ -224,12 +248,12 @@ document.querySelectorAll("#ltabs button[data-lt]").forEach(b => b.onclick = () 
 function showLeft(t) {
   if (t === leftTab) return;
   leftTab = t;
-  document.querySelectorAll("#ltabs button[data-lt]").forEach(b => b.classList.toggle("on", b.dataset.lt === t));
+  document.querySelectorAll("#ltabs button[data-lt]").forEach(b => setPressed(b, b.dataset.lt === t));
   $("#lt-net").classList.toggle("on", t === "net"); $("#lt-run").classList.toggle("on", t === "run");
   $(`#ltabs button[data-lt="${t}"]`).classList.remove("fresh");
   syncLeftMap();
 }
-// a tab whose contents changed while hidden (Claude ran text, or searched) gets a dot until opened
+// a tab whose contents changed while hidden (the assistant ran text, or searched) gets a dot until opened
 function markLeftFresh(t) { if (t !== leftTab) $(`#ltabs button[data-lt="${t}"]`).classList.add("fresh"); }
 // the map shows what the open tab shows: lens hits and the open neuron's web on net, what fired on run
 function syncLeftMap() {
@@ -249,7 +273,7 @@ $("#lens-q").addEventListener("input", e => {
 state.qMode = "lens";
 document.querySelectorAll("#q-mode button").forEach(b => b.onclick = e => {
   state.qMode = b.dataset.q;
-  document.querySelectorAll("#q-mode button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll("#q-mode button").forEach(x => setPressed(x, x === b));
   $("#lens-q").placeholder = state.qMode === "fires" ? "text: golden gate bridge" : "search lens";
   if (e.isTrusted) {
     showLeft(state.qMode === "fires" ? "run" : "net");
@@ -340,7 +364,7 @@ $("#inf-toks").addEventListener("click", e => {
 });
 document.querySelectorAll("#inf-sign button").forEach(b => b.onclick = () => {
   state.inf.sign = b.dataset.s;
-  document.querySelectorAll("#inf-sign button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll("#inf-sign button").forEach(x => setPressed(x, x === b));
   inferView();
 });
 let infTimer;
@@ -398,7 +422,7 @@ $("#show-random").onchange = renderList;
 function webSummaryHTML() {
   const w = state.webSum, f = state.focus;
   if (!w || !f || f.kind !== "neuron" || w.layer !== f.layer || w.n !== f.n) return "";
-  const chips = list => list.length ? list.map(t => `<span class="chip" data-q="${esc(t.tok)}" title="${t.n} neurons · score ${t.w}">${esc(t.tok)}<i>${t.n}</i></span>`).join("")
+  const chips = list => list.length ? list.map(t => `<button class="chip" data-q="${esc(t.tok)}" title="Search ${esc(t.tok)} · ${t.n} neurons · score ${t.w}">${esc(t.tok)}<i>${t.n}</i></button>`).join("")
     : `<span class="faint">nothing above chance</span>`;
   return `<div class="head">web of L${w.layer} N${w.n} · ${w.links} links · ${w.src} lens, ranked by lift over each layer</div>
     <div class="wsum"><div class="lab"><span class="sw up"></span>fed by · ${w.up.neurons} upstream neurons</div><div class="chips">${chips(w.up.fed_by)}</div></div>
@@ -412,14 +436,14 @@ function nheadsHTML() {
   if (!H?.roles || !f || f.kind !== "neuron" || H.layer !== f.layer || H.n !== f.n) return "";
   const name = x => `L${x.layer} h${x.heads.length > 1 ? `${x.heads[0]}–${x.heads.at(-1)}` : x.head}`;
   const row = r => `<div class="lrow"><span class="sgn">${r}</span><div class="chips">${(H.roles[r] || []).filter(x => x.z >= 2).map(x =>
-    `<span class="chip" data-l="${x.layer}" data-h="${x.head}">${name(x)}<i>${x.z}</i></span>`).join("")}</div></div>`;
+    `<button class="chip" data-l="${x.layer}" data-h="${x.head}">${name(x)}<i>${x.z}</i></button>`).join("")}</div></div>`;
   return `<div class="wsum"><div class="lab">heads</div>${["q", "k", "v", "o"].map(row).join("")}</div>`;
 }
 // the open neuron's own lenses (what it writes), above its web (what its cone does)
 function lensHTML() {
   const L = state.lens, f = state.focus;
   if (!L || !f || f.kind !== "neuron" || L.layer !== f.layer || L.n !== f.n) return "";
-  const chips = ts => ts.slice(0, 12).map(t => `<span class="chip" data-q="${esc(t.trim() || t)}">${esc(t)}</span>`).join("");
+  const chips = ts => ts.slice(0, 12).map(t => `<button class="chip" data-q="${esc(t.trim() || t)}" title="Search this token">${esc(t)}</button>`).join("");
   const pair = (up, down) => `<div class="lrow"><span class="sgn up">+</span><div class="chips">${chips(up)}</div></div>
     <div class="lrow"><span class="sgn down">−</span><div class="chips">${chips(down)}</div></div>`;
   return (L.steer_up ? `<div class="wsum"><div class="lab">steer lens · KL ${L.kl_up} / ${L.kl_down}</div>${pair(L.steer_up, L.steer_down)}</div>` : "")
@@ -427,36 +451,47 @@ function lensHTML() {
 }
 // a head's strongest neurons in each role, as map links
 const ROLE_COL = { q: "#73ff8c", k: "#b399ff", v: "#66d9ff", o: "#66d9ff" };
+const ROLE_LABEL = { q: "query", k: "key", v: "value", o: "output" };
 const headRoleLinks = h => [["q", h.q], ["k", h.k], ["v", h.reads], ["o", h.writes]]
   .flatMap(([role, list]) => (list || []).slice(0, 5).map(c => ({ ...c, role, side: role === "o" ? "down" : "up" })));
+function headSummaryHTML() {
+  const h = state.headInfo, f = state.focus;
+  if (!h || f?.kind !== "head" || h.layer !== f.layer || h.head !== f.n) return "";
+  return `<div class="head">Weight-based role summaries · ${h.src} lens</div>`
+    + [["q", h.q_toks], ["k", h.k_toks], ["v", h.read_toks], ["o", h.write_toks]].map(([role, tokens]) =>
+      `<div class="wsum"><div class="lab"><span class="sw" style="background:${ROLE_COL[role]}"></span>${role} · ${ROLE_LABEL[role]}</div><div class="chips">`
+      + tokens.slice(0, 12).map(t => `<button class="chip" data-q="${esc(t.tok)}" title="Search ${esc(t.tok)} · ${t.n} neurons · score ${t.w}">${esc(t.tok)}<i>${t.n}</i></button>`).join("")
+      + `</div></div>`).join("")
+    + `<p class="dim">Details lists linked neurons. Activations shows this head's reads on your text.</p>`;
+}
 // the open head by role: the neurons feeding its query, key and value (earlier) and reading its output (later), each
 // with its own lens tokens
 function headHTML() {
   const H = state.headInfo, f = state.focus;
   if (!H || !f || f.kind !== "head" || H.layer !== f.layer || H.head !== f.n) return "";
   const line = c => { const nm = state.unitMap[c.layer]?.get(c.n)?.name;
-    return `<div class="nline" data-nl="${c.layer}" data-nn="${c.n}"><span class="id">L${c.layer} N${c.n}</span>`
-      + `<span class="w">${nm ? `<b>${esc(nm)}</b> ` : ""}${esc((c.lens || []).slice(0, 4).map(t => t.trim() || t).join("  "))}</span><span class="z">${c.z.toFixed(0)}</span></div>`; };
-  const role = (r, list) => `<div class="wsum"><div class="lab"><span class="sw" style="background:${ROLE_COL[r]}"></span>${r}</div>${(list || []).slice(0, 10).map(line).join("")}</div>`;
+    return `<button class="nline" data-nl="${c.layer}" data-nn="${c.n}"><span class="id">L${c.layer} N${c.n}</span>`
+      + `<span class="w">${nm ? `<b>${esc(nm)}</b> ` : ""}${esc((c.lens || []).slice(0, 4).map(t => t.trim() || t).join("  "))}</span><span class="z">${c.z.toFixed(0)}</span></button>`; };
+  const role = (r, list) => `<div class="wsum"><div class="lab"><span class="sw" style="background:${ROLE_COL[r]}"></span>${r} · ${ROLE_LABEL[r]}</div>${(list || []).slice(0, 10).map(line).join("")}</div>`;
   return role("q", H.q) + role("k", H.k) + role("v", H.reads) + role("o", H.writes);
 }
 function renderList() {
-  $("#net").innerHTML = headHTML() || lensHTML() + webSummaryHTML() + nheadsHTML();
+  $("#net").innerHTML = headSummaryHTML() || lensHTML() + webSummaryHTML() + nheadsHTML();
   if (lensResults) return renderResults(lensResults, $("#rows"));
   const q = $("#filter").value.trim().toLowerCase(), showR = $("#show-random").checked;
   const units = (state.units[state.layer] || []).filter(u => (showR || u.kind === "neuron") &&
-    (!q || u.words.some(w => w.includes(q)) || u.name.toLowerCase().includes(q) || String(u.n) === q));
+    (!q || u.words.some(w => w.toLowerCase().includes(q)) || u.name.toLowerCase().includes(q) || String(u.n) === q));
   const rnd = (state.units[state.layer] || []).filter(u => u.kind === "random").map(u => u.z);
   const floor = rnd.length ? Math.max(...rnd) : -Infinity;
   const ol = $("#rows");
-  ol.innerHTML = units.slice(0, 600).map(u => `<li data-n="${u.n}" data-kind="${u.kind}" class="${u.kind}${u.z <= floor ? " below" : ""}${state.focus && state.focus.n === u.n && state.focus.layer === state.layer && u.kind === "neuron" ? " sel" : ""}">
+  ol.innerHTML = units.slice(0, 600).map(u => `<li data-n="${u.n}" data-kind="${u.kind}" tabindex="0" role="button" aria-label="Open L${state.layer} ${u.kind === "random" ? "random control" : "N"}${u.n}" class="${u.kind}${u.z <= floor ? " below" : ""}${state.focus && state.focus.n === u.n && state.focus.layer === state.layer && u.kind === "neuron" ? " sel" : ""}">
     <span class="n">${u.kind === "random" ? "r" : "N"}${u.n}</span><span class="z">${u.z.toFixed(1)}</span>
-    <span class="w">${u.name ? `<b>${esc(u.name)}</b> ` : ""}${esc(u.words.join(" "))}</span></li>`).join("");
+    <span class="w">${u.name ? `<b>${esc(u.name)}</b> ` : ""}${esc(u.words.join(" "))}</span></li>`).join("") || `<li class="head">${q ? "No neurons match this filter." : "No saved examples for this layer. Search the lens or select a neuron on the map to inspect it live."}</li>`;
 }
 // lens hits (net tab) or what fired (run tab)
 function renderResults(r, ol) {
   if (!r.ready) { ol.innerHTML = `<li class="head">${esc(state.statusText || "indexing lens")}</li>`; return; }
-  const rows = (r.results || []).map(x => `<li class="res${x.swept === false ? " unswept" : ""}" data-l="${x.layer}" data-n="${x.n}" data-kind="neuron">
+  const rows = (r.results || []).map(x => `<li class="res${x.swept === false ? " unswept" : ""}" tabindex="0" role="button" aria-label="Open L${x.layer} N${x.n}" data-l="${x.layer}" data-n="${x.n}" data-kind="neuron">
     <span class="n">L${x.layer} N${x.n}</span><span class="sg ${x.sign === "+" ? "up" : "down"}">${r.fires ? `${x.sign === "+" ? "" : "−"}${x.score.toFixed(1)}×` : `${x.sign === "+" ? "+" : "−"}${x.rank + 1}`}</span>
     <span class="w">${r.fires ? `<span class="tk">"${esc(x.token)}"</span>` : ""}${x.name ? `<b>${esc(x.name)}</b> ` : ""}${esc(x.lens.join(" "))}</span></li>`).join("");
   const head = r.fires ? `${r.total ?? 0} neurons pass · score = activation ÷ its typical extreme` : `${r.total ?? 0} neurons · ${r.tokens ?? 0} tokens`;
@@ -475,6 +510,9 @@ $("#net").addEventListener("click", e => {
   $("#lens-q").value = chip.dataset.q; $("#lens-q").dispatchEvent(new Event("input"));
 });
 for (const ol of [$("#rows"), $("#run-rows")]) {
+  ol.addEventListener("keydown", e => {
+    if ((e.key === "Enter" || e.key === " ") && e.target.matches("li[data-n]")) { e.preventDefault(); e.target.click(); }
+  });
   ol.addEventListener("click", e => {
     const li = e.target.closest("li"); if (!li || !li.dataset.n) return;
     goToNeuron(li.dataset.l ? +li.dataset.l : state.layer, +li.dataset.n, li.dataset.kind);
@@ -487,36 +525,45 @@ for (const ol of [$("#rows"), $("#run-rows")]) {
 
 // ---------- jump / routing ----------
 $("#jump").addEventListener("keydown", e => {
-  if (e.key !== "Enter") return;
-  const m = e.target.value.match(/L?\s*(\d+)\D+N?\s*(\d+)/i);
-  if (m) openNeuron(+m[1], +m[2]);
+  if (e.key !== "Enter" || e.isComposing) return;
+  const m = e.target.value.trim().match(/^L?\s*(\d+)[\s,\/]+N?\s*(\d+)$/i);
+  if (!m || !validNeuron(+m[1], +m[2])) {
+    e.target.setCustomValidity(`Enter L0–L${arch.n_layers - 1} and N0–N${arch.inter - 1}, for example L7 N1870.`);
+    e.target.reportValidity(); return;
+  }
+  e.target.setCustomValidity(""); openNeuron(+m[1], +m[2]);
 });
+$("#jump").addEventListener("input", e => e.target.setCustomValidity(""));
+function validNeuron(layer, n) { return Number.isInteger(layer) && Number.isInteger(n) && layer >= 0 && layer < arch.n_layers && n >= 0 && n < arch.inter; }
+function validHead(layer, head) { return Number.isInteger(layer) && layer >= 0 && layer < arch.n_layers && Number.isInteger(head) && head >= 0 && head < (arch.layer_types[layer] === "full_attention" ? arch.attn_heads : arch.linear_v_heads); }
 addEventListener("hashchange", fromHash);
-// what's open is kept in this browser (a reload reopens it) and never in the address bar, where every neuron would
-// become a browser-history entry; a link with #L19/N7176 (a neuron) or #L19/h2 (an attention head) opens that
+// Restore the last selection and preserve shareable neuron/head links without creating history entries per click.
 function saveFocus() {
   const f = state.focus;
-  try { localStorage.setItem("explorer.focus", JSON.stringify(f && (f.kind === "neuron" || f.kind === "head") ? f : null)); } catch {}
+  try { localStorage.setItem(modelKey("explorer.focus"), JSON.stringify(f && (f.kind === "neuron" || f.kind === "head") ? f : null)); } catch {}
 }
 function restoreFocus() {
-  let f = null; try { f = JSON.parse(localStorage.getItem("explorer.focus") || "null"); } catch {}
+  let f = null; try { f = JSON.parse(localStorage.getItem(modelKey("explorer.focus")) || "null"); } catch {}
   if (!f) return;
-  if (f.kind === "head") openHead(f.layer, f.n); else openNeuron(f.layer, f.n, "neuron", false);
+  if (f.kind === "head" && validHead(f.layer, f.n)) openHead(f.layer, f.n);
+  else if (f.kind === "neuron" && validNeuron(f.layer, f.n)) openNeuron(f.layer, f.n, "neuron", false);
 }
 function fromHash() {
-  const m = location.hash.match(/^#L(\d+)\/(N|h)(\d+)/);
+  const m = location.hash.match(/^#L(\d+)\/(N|h)(\d+)$/);
   if (!m) return;
-  const kind = m[2] === "h" ? "head" : "neuron";
-  history.replaceState(null, "", location.pathname + location.search);  // the link is used up; later picks are remembered
-  if (isFocus(+m[1], +m[3], kind)) return;
-  if (kind === "head") openHead(+m[1], +m[3]); else openNeuron(+m[1], +m[3], "neuron", true);
+  const layer = +m[1], n = +m[3], kind = m[2] === "h" ? "head" : "neuron";
+  if (isFocus(layer, n, kind)) return;
+  if (kind === "head" && validHead(layer, n)) openHead(layer, n);
+  else if (kind === "neuron" && validNeuron(layer, n)) openNeuron(layer, n, "neuron", false);
 }
 
 // ---------- panel collapse ----------
 function updateInsets() {
   const listShown = !$("#list").classList.contains("hidden");
   const focusShown = focusEl.classList.contains("on") && !focusEl.classList.contains("collapsed");
-  map.setInsets(listShown ? $("#list").getBoundingClientRect().width + 24 : 0, focusShown ? focusEl.getBoundingClientRect().width + 24 : 0);
+  const left = listShown ? $("#list").getBoundingClientRect().width + 24 : 0;
+  const right = focusShown ? focusEl.getBoundingClientRect().width + 24 : 0;
+  map.setInsets(left, right); scatter.setInsets(left, right);
 }
 $("#layer-back").onclick = () => map.exitLayer();
 // panel widths follow the window (vw-based), so window resizes and browser zoom must re-measure them
@@ -529,123 +576,163 @@ function setFocusCollapsed(c) {
   focusEl.classList.toggle("collapsed", c);
   syncEdge(); updateInsets();
 }
-// the right edge handle: brings back a collapsed panel, or opens Claude when no panel is up
+// the right edge handle: brings back a collapsed panel, or opens Assistant when no panel is up
 function syncEdge() {
   const on = focusEl.classList.contains("on"), col = focusEl.classList.contains("collapsed"), f = state.focus;
   const t = $("#focus-tab");
   t.classList.toggle("on", !on || col);
-  t.textContent = on && col && f && f.kind !== "head" ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ claude";
+  t.textContent = on && col && f && curTab() !== "agent" ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ assistant";
+  t.setAttribute("aria-label", on && col ? "Show inspector" : "Open assistant");
 }
 $("#list-hide").onclick = () => setListHidden(true);
 $("#list-tab").onclick = () => setListHidden(false);
 $("#f-collapse").onclick = () => setFocusCollapsed(true);
-$("#focus-tab").onclick = () => focusEl.classList.contains("on") ? setFocusCollapsed(false) : openClaude();
+$("#focus-tab").onclick = () => focusEl.classList.contains("on") ? setFocusCollapsed(false) : openAgent();
 
 // ---------- focus panel ----------
 const focusEl = $("#focus");
-// closing the neuron keeps the panel up when Claude is the open tab
-$("#f-close").onclick = () => { flushName(); if (running) running.abort(); state.focus = null; $("#list").classList.remove("has-focus");
-  map.selectHead(null); state.headInfo = null; state.nheads = null; $("#f-name").style.display = ""; lightHeads(state.inf.pos);
-  if (curTab() === "claude") syncTabs(); else focusEl.classList.remove("on");
-  setFocusCollapsed(false); map.select(null); refreshWeb(); renderAgentActions(); scatter.select(null, null); saveFocus(); renderList(); };
-document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => setTab(b.dataset.tab));
+// closing the neuron keeps the panel up when Assistant is the open tab
+$("#f-close").onclick = () => { saveCurrentChatSession(); flushName(); cancelChat(); ++selectionEpoch; selectionPending = false; state.focus = null; $("#list").classList.remove("has-focus");
+  map.selectHead(null); map.setNeuronHeads([]); state.headInfo = null; state.nheads = null; $("#f-name").style.display = ""; saveFocus(); lightHeads(state.inf.pos);
+  const wasAgent = curTab() === "agent"; syncTabs(); if (!wasAgent) focusEl.classList.remove("on");
+  setFocusCollapsed(false); map.select(null); refreshWeb(); renderAgentActions(); scatter.select(null, null); history.replaceState(null, "", " "); renderList(); };
+document.querySelectorAll("#tabs button[data-tab]").forEach(b => b.onclick = () => setTab(b.dataset.tab));
 const tabBtn = t => $(`#tabs button[data-tab="${t}"]`);
 const curTab = () => $("#tabs button.on")?.dataset.tab;
 function setTab(t) {
+  if (!tabBtn(t) || tabBtn(t).disabled) return;
   document.querySelectorAll("#tabs button[data-tab]").forEach(x => x.classList.toggle("on", x.dataset.tab === t));
   document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x.id === `tab-${t}`));
-  focusEl.classList.toggle("on-claude", t === "claude");
+  focusEl.classList.toggle("on-agent", t === "agent");
   tabBtn(t).classList.remove("fresh");
-  if (t === "claude") { const th = $("#a-thread"); th.scrollTop = th.scrollHeight; }
+  document.querySelectorAll("#tabs button[data-tab]").forEach(x => x.setAttribute("aria-pressed", String(x.dataset.tab === t)));
+  if (t === "agent") { const th = $("#a-thread"); th.scrollTop = th.scrollHeight; growInput(); }
 }
 // a tab that changed while another was showing gets a dot until opened
 function markFresh(t) { if (curTab() !== t) tabBtn(t).classList.add("fresh"); }
-// neuron tabs show while a neuron is open (Chat for real neurons only); Claude always
+// Keep navigation stable; unavailable tabs explain why they are disabled.
 function syncTabs() {
-  const f = state.focus?.kind === "head" ? null : state.focus;
-  for (const t of ["examples", "details"]) tabBtn(t).style.display = f ? "" : "none";
-  tabBtn("chat").style.display = f && f.kind === "neuron" ? "" : "none";
-  if (tabBtn(curTab()).style.display === "none") setTab(f ? "examples" : "claude");
+  const f = state.focus;
+  for (const t of ["examples", "details", "chat"]) {
+    const b = tabBtn(t); b.disabled = !f || (t !== "details" && f.kind === "head") || (t === "chat" && f.kind !== "neuron");
+    b.title = b.disabled ? (f ? "This tab requires a neuron selection." : "Select a neuron to use this tab.") : "";
+  }
+  if (!tabBtn(curTab()) || tabBtn(curTab()).disabled) setTab(f ? "details" : "agent");
 }
-function openClaude() {
-  focusEl.classList.add("on"); syncTabs(); setTab("claude"); setFocusCollapsed(false); $("#a-input").focus();
+function openAgent() {
+  focusEl.classList.add("on"); syncTabs(); setTab("agent"); setFocusCollapsed(false); $("#a-input").focus();
 }
 
+const chatSessions = new Map();
+let selectionEpoch = 0, selectionPending = false;
+function saveCurrentChatSession() {
+  if (state.focus) chatSessions.set(`${state.focus.kind}/${state.focus.layer}/${state.focus.n}`,
+    { thread: state.thread, prompt: $("#c-input").value, error: state.chat.last_error });
+}
 async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
-  if (!agentSelecting) clearAgentMarks();
-  flushName();
-  if (running) running.abort();
-  state.focus = { layer, n, kind };
-  map.selectHead(null); state.headInfo = null; state.nheads = null; $("#f-name").style.display = ""; lightHeads(state.inf.pos);
-  if (map.layerMode !== null && map.layerMode !== layer) map.enterLayer(layer);
-  if (push && kind === "neuron") saveFocus();
-  focusEl.classList.add("on"); $("#list").classList.add("has-focus");
-  setFocusCollapsed(false);
-  $("#f-id").textContent = kind === "random" ? `L${layer} random ${n}` : `L${layer} N${n}`;
-  $("#f-rank").textContent = "";
-  setNameField(state.unitMap[layer]?.get(n)?.name || "");
-  $("#f-name").disabled = kind !== "neuron";
-  $("#tab-examples").innerHTML = ""; $("#tab-details").innerHTML = "";
-  state.thread = []; renderThread(); $("#c-reads").innerHTML = ""; $("#c-lens").innerHTML = "";
-  syncTabs();
-  if (layer !== state.layer) await setLayer(layer);
-  if (!isFocus(layer, n, kind)) return;
-  setNameField(state.unitMap[layer]?.get(n)?.name || "");
-  renderList();
-  if (kind === "neuron") { map.select(layer, n, fly); scatter.select(layer, n); loadNeuronHeads(layer, n); }
-  refreshWeb(); renderAgentActions();
-  const u = await api(`/api/unit?layer=${layer}&n=${n}&kind=${kind}`);
-  if (!isFocus(layer, n, kind)) return;
-  setNameField(u.name || "");
-  if (u.stats) $("#f-rank").textContent = `#${u.rank ?? "—"}/${u.n_ranked}  mass ${(u.stats.mass ?? u.stats.z).toFixed(1)}  null ${(u.stats.null_pct * 100).toFixed(0)}%`;
-  renderExamples(u);
-  renderDetails(u);
-  const hasRollouts = !!(u.rollouts && u.rollouts.length);
-  document.querySelector('#tabs button[data-tab="examples"]').style.display = hasRollouts ? "" : "none";
-  if (!hasRollouts && document.querySelector("#tabs button.on")?.dataset.tab === "examples") setTab("details");
-  if (kind === "neuron") loadLive(layer, n);
+  if (!Number.isInteger(layer) || layer < 0 || layer >= arch.n_layers || !Number.isInteger(n) || n < 0 || (kind === "neuron" && !validNeuron(layer, n))) throw new Error("Neuron selection is out of range.");
+  const epoch = ++selectionEpoch;
+  const current = () => epoch === selectionEpoch && isFocus(layer, n, kind);
+  selectionPending = true;
+  try {
+    saveCurrentChatSession();
+    if (!agentSelecting) clearAgentMarks();
+    flushName();
+    cancelChat();
+    state.focus = { layer, n, kind };
+    map.selectHead(null); map.setNeuronHeads([]); state.headInfo = null; state.nheads = null; $("#f-name").style.display = ""; saveFocus(); lightHeads(state.inf.pos);
+    if (map.layerMode !== null && map.layerMode !== layer) map.enterLayer(layer);
+    if (push && kind === "neuron") history.replaceState(null, "", `#L${layer}/N${n}`);
+    focusEl.classList.add("on"); $("#list").classList.add("has-focus");
+    setFocusCollapsed(false);
+    $("#f-id").textContent = kind === "random" ? `L${layer} random ${n}` : `L${layer} N${n}`;
+    $("#f-rank").textContent = "";
+    setNameField(state.unitMap[layer]?.get(n)?.name || "");
+    $("#f-name").disabled = kind !== "neuron";
+    $("#tab-examples").innerHTML = `<div class="slot">Loading examples…</div>`; $("#tab-details").innerHTML = `<div class="slot">Loading neuron details…</div>`;
+    const savedChat = chatSessions.get(`${kind}/${layer}/${n}`);
+    state.thread = savedChat?.thread || [];
+    $("#c-input").value = savedChat?.prompt || "";
+    state.chat.last_error = savedChat?.error || null;
+    $("#c-error").textContent = state.chat.last_error || "";
+    renderThread(); $("#c-reads").innerHTML = ""; $("#c-lens").innerHTML = "";
+    syncTabs();
+    if (layer !== state.layer) await setLayer(layer);
+    if (!current()) return;
+    setNameField(state.unitMap[layer]?.get(n)?.name || "");
+    renderList();
+    if (kind === "neuron") { map.select(layer, n, fly); scatter.select(layer, n); }
+    refreshWeb(); renderAgentActions();
+    const u = await api(`/api/unit?layer=${layer}&n=${n}&kind=${kind}`);
+    if (!current()) return;
+    if (!pendingName || pendingName.layer !== layer || pendingName.n !== n) setNameField(u.name || "");
+    if (u.stats) $("#f-rank").textContent = `#${u.rank ?? "—"}/${u.n_ranked}  mass ${(u.stats.mass ?? u.stats.z).toFixed(1)}  null ${(u.stats.null_pct * 100).toFixed(0)}%`;
+    renderExamples(u);
+    renderDetails(u);
+    if (kind === "neuron") { loadLive(layer, n, epoch); loadNeuronHeads(layer, n, epoch).catch(err => { if (current()) $("#status").textContent = err.message; }); }
+  } catch (err) {
+    if (current()) {
+      $("#tab-details").textContent = `Could not load this neuron: ${err.message}`;
+      $("#tab-examples").textContent = `Could not load examples: ${err.message}`;
+    }
+    throw err;
+  } finally { if (epoch === selectionEpoch) selectionPending = false; }
 }
 // the heads linked to the open neuron light up on their slabs (see /api/neuron/heads)
-async function loadNeuronHeads(layer, n) {
+async function loadNeuronHeads(layer, n, epoch = selectionEpoch) {
+  const current = () => epoch === selectionEpoch && isFocus(layer, n, "neuron");
   state.nheads = null; lightHeads(tokHover ?? state.inf.pos);
   const r = await api(`/api/neuron/heads?layer=${layer}&n=${n}`);
-  if (!isFocus(layer, n, "neuron")) return;
+  if (!current()) return;
   state.nheads = { ...r, layer, n }; lightHeads(tokHover ?? state.inf.pos); renderList(); renderConnections();
   const want = Object.values(r.roles || {}).flat().filter(x => x.z >= 2 && !hoverCache.has(`h/${x.layer}/${x.head}`));
   await Promise.all(want.map(async x => hoverCache.set(`h/${x.layer}/${x.head}`, await api(`/api/head?layer=${x.layer}&head=${x.head}`))));
-  if (isFocus(layer, n, "neuron")) renderConnections();
-  map.setNeuronHeads(roleHeads(r).slice(0, 8));
+  if (current()) { renderConnections(); map.setNeuronHeads(roleHeads(r).slice(0, 8)); }
 }
 
 // a head opens in the list panel: its id up top, what it reads and writes in net, and on run the text shaded by
-// where it reads from; the neuron panel steps aside unless Claude is showing
+// where it reads from; the neuron panel steps aside unless the Assistant tab is showing
 async function openHead(layer, head) {
-  if (!agentSelecting) clearAgentMarks();
-  flushName();
-  if (running) running.abort();
-  state.focus = { layer, n: head, kind: "head" };
-  saveFocus();
-  map.select(null); scatter.select(null, null); map.selectHead(layer, head);
-  $("#list").classList.add("has-focus");
-  if ($("#list").classList.contains("hidden")) setListHidden(false);
-  $("#f-id").textContent = `L${layer} h${head}`; $("#f-rank").textContent = "";
-  $("#f-name").style.display = "none";
-  if (curTab() === "claude") syncTabs(); else { focusEl.classList.remove("on"); syncTabs(); }
-  syncEdge(); updateInsets();
-  refreshWeb(); renderAgentActions();
-  shadeTokens(tokHover ?? state.inf.pos);
-  lightHeads(tokHover ?? state.inf.pos);
-  const r = await api(`/api/head?layer=${layer}&head=${head}`);
-  if (!isFocus(layer, head, "head")) return;
-  state.headInfo = r; hoverCache.set(`h/${layer}/${head}`, r);
-  map.setHeadLinks(layer, head, headRoleLinks(r));
-  renderList();
+  if (!validHead(layer, head)) throw new Error("Attention head selection is out of range.");
+  const epoch = ++selectionEpoch;
+  selectionPending = true;
+  const current = () => epoch === selectionEpoch && isFocus(layer, head, "head");
+  try {
+    saveCurrentChatSession(); cancelChat();
+    if (!agentSelecting) clearAgentMarks();
+    flushName();
+    state.focus = { layer, n: head, kind: "head" };
+    if (layer !== state.layer) await setLayer(layer);
+    if (!current()) return;
+    history.replaceState(null, "", `#L${layer}/h${head}`);
+    saveFocus();
+    map.select(null); scatter.select(null, null); map.selectHead(layer, head);
+    $("#list").classList.add("has-focus");
+    if ($("#list").classList.contains("hidden")) setListHidden(false);
+    $("#f-id").textContent = `L${layer} h${head}`; $("#f-rank").textContent = "";
+    $("#f-name").style.display = "none";
+    focusEl.classList.add("on"); syncTabs(); setFocusCollapsed(false);
+    $("#tab-details").innerHTML = `<div class="slot">Loading attention head…</div>`;
+    syncEdge(); updateInsets();
+    refreshWeb(); renderAgentActions();
+    shadeTokens(tokHover ?? state.inf.pos);
+    lightHeads(tokHover ?? state.inf.pos);
+    const r = await api(`/api/head?layer=${layer}&head=${head}`);
+    if (!current()) return;
+    state.headInfo = r; hoverCache.set(`h/${layer}/${head}`, r);
+    map.setHeadLinks(layer, head, headRoleLinks(r));
+    renderList();
+    $("#tab-details").innerHTML = `<div class="lab">L${layer} h${head} · ${r.full ? "full" : "linear"} attention · q: query · k: key · v: value · o: output</div>` + headHTML();
+  } catch (error) {
+    if (current()) $("#tab-details").innerHTML = `<div class="err">${esc(error.message)}</div>`;
+    throw error;
+  } finally { if (epoch === selectionEpoch) selectionPending = false; }
 }
 
 const isFocus = (layer, n, kind) => state.focus && state.focus.layer === layer && state.focus.n === n && state.focus.kind === kind;
 
 function renderExamples(u) {
-  if (!u.rollouts || !u.rollouts.length) { $("#tab-examples").innerHTML = `<div class="slot">—</div>`; return; }
+  if (!u.rollouts || !u.rollouts.length) { $("#tab-examples").innerHTML = `<div class="slot">No saved steering examples for this neuron. Use Chat to compare its effects live.</div>`; return; }
   const prompts = Object.keys(u.prompts).filter(p => u.rollouts.some(r => r.prompt === p));
   const count = {};
   for (const r of u.rollouts) count[r.dose] = (count[r.dose] || 0) + 1;
@@ -668,8 +755,12 @@ function renderExamples(u) {
     } else h += doses.map(() => "<div></div>").join("");
   }
   $("#tab-examples").innerHTML = h + "</div>";
+  $("#tab-examples").querySelectorAll(".cell").forEach(c => {
+    c.tabIndex = 0; c.setAttribute("role", "button"); c.setAttribute("aria-expanded", "false"); c.title = "Expand or collapse this saved response";
+  });
 }
-$("#tab-examples").addEventListener("click", e => { const c = e.target.closest(".cell"); if (c) c.classList.toggle("open"); });
+$("#tab-examples").addEventListener("click", e => { const c = e.target.closest(".cell"); if (c) { c.classList.toggle("open"); c.setAttribute("aria-expanded", String(c.classList.contains("open"))); } });
+$("#tab-examples").addEventListener("keydown", e => { if ((e.key === "Enter" || e.key === " ") && e.target.matches(".cell")) { e.preventDefault(); e.target.click(); } });
 
 function renderDetails(u) {
   const s = u.stats;
@@ -684,18 +775,19 @@ function renderDetails(u) {
   $("#tab-details").innerHTML = h;
 }
 
-async function loadLive(layer, n) {
+async function loadLive(layer, n, epoch = selectionEpoch) {
+  const current = () => epoch === selectionEpoch && isFocus(layer, n, "neuron");
   $("#d-lens") && ($("#d-lens").textContent = "…");
   $("#d-con") && ($("#d-con").textContent = "…");
-  const conP = api(`/api/connections?layer=${layer}&n=${n}&k=24`);
+  // Attach both handlers immediately; a failed connections request must not sit unhandled while the lens loads.
+  api(`/api/connections?layer=${layer}&n=${n}&k=24`).then(con => {
+    if (!current()) return;
+    map.setConnections(con); state.con = con; renderConnections();
+  }, err => { if (current() && $("#d-con")) $("#d-con").textContent = err.message; });
   let lens;
   try { lens = await api(`/api/lens?layer=${layer}&n=${n}`); }
-  catch (err) { if (isFocus(layer, n, "neuron") && $("#d-lens")) $("#d-lens").textContent = err.message; }
-  if (!isFocus(layer, n, "neuron")) return;
-  conP.then(con => {
-    if (!isFocus(layer, n, "neuron")) return;
-    map.setConnections(con); state.con = con; renderConnections();
-  }, err => { if (isFocus(layer, n, "neuron") && $("#d-con")) $("#d-con").textContent = err.message; });
+  catch (err) { if (current()) { if ($("#d-lens")) $("#d-lens").textContent = err.message; $("#c-lens").textContent = `Could not load token associations: ${err.message}`; } }
+  if (!current()) return;
   if (!lens) return;
   state.lens = { ...lens, layer, n }; renderList();
   const tok = t => `<span class="tok">${esc(t)}</span>`;
@@ -703,8 +795,8 @@ async function loadLive(layer, n) {
   if ($("#d-lens")) $("#d-lens").outerHTML = `${steer}<div class="lens"><div class="up"><div class="lab">+</div>${lens.up.map(tok).join("")}</div><div class="down"><div class="lab">−</div>${lens.down.map(tok).join("")}</div></div>`;
   const words = state.unitMap[layer]?.get(n)?.words || [];
   $("#c-lens").innerHTML = (words.length ? `<div class="words">${esc(words.join("  "))}</div>` : "") +
-    (lens.steer_up ? `<div><span class="sgn up">+</span>${esc(lens.steer_up.slice(0, 10).join("  "))}</div><div><span class="sgn down">−</span>${esc(lens.steer_down.slice(0, 10).join("  "))}</div>` : "") +
-    `<div class="faintline"><span class="sgn up">+</span>${esc(lens.up.slice(0, 10).join("  "))}</div><div class="faintline"><span class="sgn down">−</span>${esc(lens.down.slice(0, 10).join("  "))}</div>`;
+    (lens.steer_up ? `<div class="lab">Steering effects · tokens promoted by each dose</div><div><span class="sgn up">+</span>${esc(lens.steer_up.slice(0, 10).join("  "))}</div><div><span class="sgn down">−</span>${esc(lens.steer_down.slice(0, 10).join("  "))}</div>` : "") +
+    `<div class="lab">Logit lens · weight-based token associations</div><div class="faintline"><span class="sgn up">+</span>${esc(lens.up.slice(0, 10).join("  "))}</div><div class="faintline"><span class="sgn down">−</span>${esc(lens.down.slice(0, 10).join("  "))}</div>`;
 }
 
 // sign = sign(g * u): the sign of the reading neuron's activation that the writing neuron's direction produces on its
@@ -718,7 +810,7 @@ function renderConnections() {
     const sweep = c.name || (c.words || []).join(" ");
     return `<tr data-l="${c.layer}" data-n="${c.n}" class="con"><td class="pole ${pole > 0 ? "up" : "down"}">${pole > 0 ? "↑" : "↓"}</td>
       <td>${toks.slice(0, 4).map(tok).join("")}${logit.length ? `<div class="logit">${logit.slice(0, 4).map(tok).join("")}</div>` : ""}${sweep ? `<div class="dim">${esc(sweep)}</div>` : ""}</td>
-      <td class="num dim">${c.z.toFixed(0)}</td><td class="mono faint">L${c.layer}·${c.n}</td></tr>`;
+      <td class="num dim">${c.z.toFixed(0)}</td><td class="mono faint"><button class="row-action" data-l="${c.layer}" data-n="${c.n}" aria-label="Open L${c.layer} N${c.n}">L${c.layer}·${c.n}</button></td></tr>`;
   };
   el.outerHTML = `<div id="d-con-wrap">
     <div class="lens"><div><div class="lab">writes into</div><table class="dtable">${state.con.down.slice(0, 14).map(row).join("")}</table></div>
@@ -736,7 +828,7 @@ function headTablesHTML() {
     const id = `L${x.layer}·h${x.heads.length > 1 ? `${x.heads[0]}–${x.heads.at(-1)}` : x.head}`;
     return `<tr class="con" data-hl="${x.layer}" data-hh="${x.head}"><td class="pole mono dim">${x.role}</td>
       <td>${info ? info.write_toks.slice(0, 4).map(tok).join("") + `<div class="logit">${info.read_toks.slice(0, 4).map(tok).join("")}</div>` : ""}</td>
-      <td class="num dim">${x.z.toFixed(1)}</td><td class="mono faint">${id}</td></tr>`;
+      <td class="num dim">${x.z.toFixed(1)}</td><td class="mono faint"><button type="button" title="Open attention head ${id}">${id}</button></td></tr>`;
   };
   const rows = roles => roles.flatMap(r => (H.roles[r] || []).map(x => ({ ...x, role: r }))).filter(x => x.z >= 2).sort((a, b) => b.z - a.z);
   return `<div class="lens"><div><div class="lab">heads reading it</div><table class="dtable">${rows(["q", "k", "v"]).slice(0, 10).map(row).join("")}</table></div>
@@ -748,6 +840,8 @@ function goToNeuron(layer, n, kind = "neuron") {
   if (kind === "neuron") map.focusNeuron(layer, n);
 }
 $("#tab-details").addEventListener("click", e => {
+  const neuron = e.target.closest(".nline");
+  if (neuron) return goToNeuron(+neuron.dataset.nl, +neuron.dataset.nn);
   const th = e.target.closest("tr[data-hl]"); if (th) return openHead(+th.dataset.hl, +th.dataset.hh);
   const tr = e.target.closest("tr[data-l]"); if (tr) goToNeuron(+tr.dataset.l, +tr.dataset.n);
 });
@@ -770,7 +864,8 @@ function flushName() {
 // the name field wraps long names: a one-line textarea that grows to fit; Enter finishes editing instead of a newline
 function sizeNameField() { const t = $("#f-name"); t.style.height = "auto"; t.style.height = `${t.scrollHeight}px`; }
 function setNameField(v) { $("#f-name").value = v; sizeNameField(); }
-$("#f-name").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); e.target.blur(); } });
+$("#f-name").addEventListener("keydown", e => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); e.target.blur(); } });
+$("#f-name").addEventListener("blur", flushName);
 $("#f-name").addEventListener("input", () => { const t = $("#f-name"); if (t.value.includes("\n")) t.value = t.value.replace(/\n+/g, " "); sizeNameField(); });
 addEventListener("resize", sizeNameField);
 $("#f-name").addEventListener("input", () => {
@@ -783,23 +878,33 @@ $("#f-name").addEventListener("input", () => {
 // ---------- chat ----------
 const doseEl = $("#c-dose");
 function showDose() { doseEl.value = state.chat.mode === "mul" ? `×${state.chat.dose.mul}` : state.chat.dose.add; }
-doseEl.addEventListener("change", () => {
-  const v = parseFloat(doseEl.value.replace(/[×x*]/g, ""));
-  if (Number.isFinite(v) && v >= 0) state.chat.dose[state.chat.mode] = v;
-  showDose();
-});
+function applyDose() {
+  try {
+    state.chat.dose[state.chat.mode] = parseDose(doseEl.value);
+    doseEl.setCustomValidity("");
+    $("#c-error").textContent = ""; showDose(); return true;
+  } catch (err) {
+    doseEl.setCustomValidity(err.message); $("#c-error").textContent = err.message;
+    doseEl.reportValidity(); return false;
+  }
+}
+doseEl.addEventListener("change", applyDose);
+doseEl.addEventListener("input", () => doseEl.setCustomValidity(""));
 document.querySelectorAll("#c-mode button").forEach(b => b.onclick = () => {
   state.chat.mode = b.dataset.m;
-  document.querySelectorAll("#c-mode button").forEach(x => x.classList.toggle("on", x === b)); showDose();
+  doseEl.setCustomValidity(""); $("#c-error").textContent = "";
+  document.querySelectorAll("#c-mode button").forEach(x => setPressed(x, x === b)); showDose();
 });
 document.querySelectorAll("#c-dir button").forEach(b => b.onclick = () => {
   state.chat.dir = b.dataset.d;
-  document.querySelectorAll("#c-dir button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll("#c-dir button").forEach(x => setPressed(x, x === b));
   $("#tab-chat").classList.toggle("reads", b.dataset.d === "reads");
   $("#c-input").placeholder = b.dataset.d === "reads" ? "text to read" : "Who are you?";
+  updateChatEmpty();
 });
 function step(dir) {
-  const steps = state.chat.mode === "mul" ? MUL_STEPS : ADD_STEPS, key = state.chat.mode;
+  const positive = state.chat.mode === "mul" ? MUL_STEPS.filter(x => x > 0) : ADD_STEPS;
+  const steps = [...positive.map(x => -x).reverse(), 0, ...positive], key = state.chat.mode;
   // step to the next value in the ladder above or below the current dose (typed values land between steps)
   const v = state.chat.dose[key];
   const next = dir > 0 ? steps.find(x => x > v + 1e-9) : [...steps].reverse().find(x => x < v - 1e-9);
@@ -813,7 +918,7 @@ let running = null;
 state.thread = [];
 const ROWS = ["up", "zero", "down"];
 function turnLabels(t) {
-  return t.mode === "mul" ? [`▲ ×${t.dose}`, "×1", `▼ ×−${t.dose}`] : [`▲ +${t.dose}`, "0", `▼ −${t.dose}`];
+  return t.mode === "mul" ? [`▲ ×${t.dose}`, "×1", `▼ ×${-t.dose}`] : [`▲ ${fmtDose(t.dose)}`, "0", `▼ ${fmtDose(-t.dose)}`];
 }
 function renderThread() {
   const el = $("#c-thread");
@@ -822,26 +927,50 @@ function renderThread() {
     <div class="cols">${ROWS.map((c, r) => `<div class="col ${c}${t.live && !t.done[r] ? " live" : ""}"><span class="lab">${turnLabels(t)[r]}</span>${esc(t.replies[r])}</div>`).join("")}
     ${t.error ? `<div class="err">${esc(t.error)}</div>` : ""}</div></div>`).join("");
   el.scrollTop = el.scrollHeight;
+  updateChatEmpty();
 }
-$("#c-clear").onclick = () => { if (running) running.abort(); state.thread = []; renderThread(); };
-let reading = false;
+$("#c-clear").onclick = () => {
+  if (running || reading) return;
+  if ((state.thread.length || $("#c-reads").textContent) && !confirm("Clear this neuron's Chat history and reading result?")) return;
+  state.thread = []; state.chat.last_error = null;
+  $("#c-reads").textContent = ""; $("#c-error").textContent = ""; renderThread(); saveCurrentChatSession();
+};
+let reading = false, readsController = null;
+function cancelChat() { running?.abort(); readsController?.abort(); }
+function setChatBusy(busy) {
+  document.querySelectorAll("#chat-controls button, #chat-controls input").forEach(el => el.disabled = busy);
+  $("#c-go").textContent = busy ? "stop" : "run";
+  $("#c-input").required = !busy;
+  $("#c-thread").setAttribute("aria-busy", String(busy));
+}
+function updateChatEmpty() {
+  const reads = state.chat.dir === "reads";
+  $("#c-empty").hidden = reads ? Boolean($("#c-reads").textContent) : Boolean(state.thread?.length);
+  $("#c-empty").textContent = reads ? "Enter text to see how strongly this neuron activates on each token. The dose is used only for generation in writes mode."
+    : "Send a prompt to compare this neuron's positive dose, baseline, and opposite dose. Chat runs on the local Qwen model.";
+}
 
-$("#c-form").addEventListener("submit", async e => {
-  e.preventDefault();
-  if (running) { running.abort(); return; }
-  const f = state.focus; if (!f) return;
-  const text = $("#c-input").value.trim() || $("#c-input").placeholder;
-  if (state.chat.dir === "reads") return runReads(f, text);
-  const dose = state.chat.mode === "mul" ? state.chat.dose.mul : state.chat.dose.add;
+// Both manual submission and MCP commands call this same async operation.
+async function submitChat() {
+  if (running || reading) return { status: "error", error: "Chat generation is already running" };
+  const f = state.focus;
+  if (!f || f.kind !== "neuron") return { status: "error", error: "select a real neuron first" };
+  if (!applyDose()) return { status: "error", error: "Enter a finite dose before submitting." };
+  const text = $("#c-input").value.trim();
+  if (!text) { $("#c-input").reportValidity(); return { status: "error", error: "Enter a prompt before submitting." }; }
+  state.chat.last_error = null;
+  if (state.chat.dir === "reads") return runReads({ ...f }, text);
+  const dose = state.chat.dose[state.chat.mode];
   const history = state.thread.filter(t => !t.error).map(t => ({ user: t.user, replies: t.replies }));
   const turn = { user: text, replies: ["", "", ""], done: [false, false, false], dose, mode: state.chat.mode, live: true };
   state.thread.push(turn); $("#c-input").value = ""; renderThread();
   const cols = [...$("#c-thread").lastElementChild.querySelectorAll(".col")];
   const ctl = new AbortController(), thread = state.thread;
-  running = ctl; $("#c-go").textContent = "stop";
+  running = ctl; setChatBusy(true);
+  let ended = false, cancelled = false;
   try {
     const res = await fetch("/api/steer", { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctl.signal,
-      body: JSON.stringify({ layer: f.layer, n: f.n, prompt: text, dose, mode: state.chat.mode, history }) });
+      body: JSON.stringify({ layer: f.layer, n: f.n, prompt: text, dose, mode: turn.mode, history }) });
     if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 160)}`);
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = "";
@@ -854,34 +983,64 @@ $("#c-form").addEventListener("submit", async e => {
         if (!line.startsWith("data: ")) continue;
         const ev = JSON.parse(line.slice(6));
         if (ev.error) turn.error = ev.error;
-        if (ev.row == null) continue;
+        if (ev.row == null) { ended = true; continue; }
         turn.replies[ev.row] += ev.t;
         cols[ev.row].lastChild.nodeType === 3 ? (cols[ev.row].lastChild.textContent += ev.t) : cols[ev.row].append(ev.t);
         const th = $("#c-thread"); if (th.scrollHeight - th.scrollTop - th.clientHeight < 80) th.scrollTop = th.scrollHeight;
       }
     }
+    if (!ended && !turn.error) turn.error = "generation stream ended before completion";
   } catch (err) {
-    if (err.name !== "AbortError") turn.error = String(err);
+    if (err.name === "AbortError") { cancelled = true; turn.error = "generation cancelled"; }
+    else turn.error = String(err.message || err);
   } finally {
     turn.live = false; turn.done = [true, true, true];
-    if (running === ctl) { running = null; $("#c-go").textContent = "run"; }
-    if (state.thread === thread) renderThread();
+    if (running === ctl) { running = null; setChatBusy(false); }
+    if (state.thread === thread) { state.chat.last_error = turn.error || (cancelled ? "generation cancelled" : null); renderThread(); }
   }
+  return { status: cancelled ? "cancelled" : turn.error ? "error" : "completed", prompt: text,
+    layer: f.layer, n: f.n, dose, mode: turn.mode, direction: "writes", replies: [...turn.replies],
+    ...(turn.error ? { error: turn.error } : cancelled ? { error: "generation cancelled" } : {}) };
+}
+
+$("#c-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  if (running || reading) { cancelChat(); return; }
+  await submitChat();
 });
 
 async function runReads(f, text) {
-  if (reading) return;
-  reading = true; $("#c-go").textContent = "…";
-  let r;
-  try { r = await api("/api/reads", { layer: f.layer, n: f.n, text, chat: true }); }
-  catch (err) { $("#c-reads").textContent = err.message; return; }
-  finally { reading = false; $("#c-go").textContent = "run"; }
-  if (!isFocus(f.layer, f.n, "neuron")) return;
-  const m = Math.max(1e-6, ...r.units.map(u => Math.abs(u.act)));
-  $("#c-reads").innerHTML = r.units.map(u => {
-    const a = u.act / m, c = a >= 0 ? `rgba(255,181,71,${a * 0.85})` : `rgba(255,79,154,${-a * 0.85})`;
-    return `<span style="background:${c}" title="${u.pieces.map(v => v.toFixed(3)).join(" · ")}">${esc(u.text)}</span>`;
-  }).join("");
+  if (reading || running) return { status: "error", error: "Chat generation is already running" };
+  const epoch = selectionEpoch;
+  const current = () => epoch === selectionEpoch && isFocus(f.layer, f.n, "neuron");
+  const ctl = readsController = new AbortController();
+  reading = true; setChatBusy(true);
+  try {
+    const r = await api("/api/reads", { layer: f.layer, n: f.n, text, chat: true }, { signal: ctl.signal });
+    if (ctl.signal.aborted || !current()) return { status: "cancelled", error: "selection changed during reading" };
+    const m = Math.max(1e-6, ...r.units.map(u => Math.abs(u.act)));
+    $("#c-reads").innerHTML = r.units.map(u => {
+      const a = u.act / m, c = a >= 0 ? `rgba(255,181,71,${a * 0.85})` : `rgba(255,79,154,${-a * 0.85})`;
+      return `<span style="background:${c};color:${Math.abs(a) >= .5 ? "#101214" : "var(--ink)"}" title="${u.pieces.map(v => v.toFixed(3)).join(" · ")}">${esc(u.text)}</span>`;
+    }).join("");
+    updateChatEmpty();
+    return { status: "completed", direction: "reads you", prompt: text, layer: f.layer, n: f.n, tokens: r.units.length };
+  } catch (err) {
+    const error = err.name === "AbortError" ? "reading cancelled" : String(err.message || err);
+    if (current()) { $("#c-reads").textContent = error; state.chat.last_error = error; }
+    return { status: err.name === "AbortError" ? "cancelled" : "error", error };
+  } finally { reading = false; readsController = null; setChatBusy(false); updateChatEmpty(); }
+}
+
+function chatUiState() {
+  return { browser_id: browserId, selected_neuron: state.focus && state.focus.kind !== "head" ? { ...state.focus } : null,
+    selected_head: state.focus?.kind === "head" ? { layer: state.focus.layer, head: state.focus.n } : null,
+    open_tab: curTab() || null, transitioning: selectionPending,
+    chat: { dose: state.chat.dose[state.chat.mode], mode: state.chat.mode,
+      direction: state.chat.dir === "reads" ? "reads you" : "writes", prompt: $("#c-input").value,
+      placeholder: $("#c-input").placeholder, running: Boolean(running || reading),
+      generation: running ? "writes" : reading ? "reads you" : null,
+      history_length: state.thread.length, last_error: state.chat.last_error || null } };
 }
 
 // ---------- status ----------
@@ -900,20 +1059,29 @@ async function pollStatus() {
 }
 pollStatus();
 
-window.__ne = { map, state, scatter };
+window.__ne = { map, state, scatter, browserId };
 // ---------- start ----------
 const have = Object.keys(index.layers).map(Number);
-let saved = null; try { const v = localStorage.getItem("ne.layer"); if (v !== null) saved = +v; } catch {}
-const first = have.includes(saved) ? saved : have.includes(22) ? 22 : (have[0] ?? 0);
+let saved = null; try { const v = localStorage.getItem(modelKey("ne.layer")); if (v !== null) saved = +v; } catch {}
+const first = Number.isInteger(saved) && saved >= 0 && saved < arch.n_layers ? saved : have.includes(22) ? 22 : (have[0] ?? 0);
 await setLayer(first);
 if (location.hash) fromHash(); else restoreFocus();
 
-// ---------- claude: the Claude tab, one claude -p session per conversation ----------
-const agent = { chat: null, kind: "claude", busy: false, sending: 0, box: null, seg: null, segText: "", reply: "", waiters: [] };
-const agentEl = $("#tab-claude");
+// ---------- assistant: separate Codex and Claude conversations ----------
+const savedProvider = () => {
+  try {
+    const saved = localStorage.getItem("explorer.agent.provider");
+    if (saved === "claude" || saved === "codex") return saved;
+    return localStorage.getItem("explorer.agent.codex") && !localStorage.getItem("explorer.agent") ? "codex" : "claude";
+  } catch { return "claude"; }
+};
+const savedAccess = () => { try { return localStorage.getItem("explorer.agent.access") === "home" ? "home" : "project"; } catch { return "project"; } };
+const agent = { chat: null, ctl: null, provider: savedProvider(), access: savedAccess() };
+const providerName = () => agent.provider === "claude" ? "Claude" : "Codex";
+const agentEl = $("#tab-agent");
 function mdInline(t) {
   return esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
-    .replace(/\bL(\d{1,2})[ \/]N(\d{1,4})\b/g, (m, l, n) => `<a class="nref" data-l="${l}" data-n="${n}">${m}</a>`);
+    .replace(/\bL(\d+)[ \/]([Nh])(\d+)\b/g, (m, l, kind, n) => (kind === "h" ? validHead(+l, +n) : validNeuron(+l, +n)) ? `<a class="nref" href="#L${l}/${kind}${n}" data-l="${l}" data-n="${n}" data-kind="${kind}">${m}</a>` : m);
 }
 function md(src) {
   const out = []; let list = false;
@@ -928,64 +1096,87 @@ function md(src) {
   return out.join("");
 }
 const EMPTY = `<div class="a-empty dim">Ask anything about the model, or open a neuron and press <b>explain</b>.</div>`;
-// the conversation persists in this browser: chat id (= claude session, resumed server side) and the rendered thread
-const AGENT_KEY = "explorer.agent";
+// The browser keeps an explorer chat ID; the server maps it to its owned provider session.
+const agentKey = () => modelKey(`explorer.agent.${agent.provider}`);
+function savedChatDraft(chat) { try { return JSON.parse(localStorage.getItem(`explorer.draft.${chat}`) || "{}"); } catch { return {}; } }
 function saveAgent() {
-  try { localStorage.setItem(AGENT_KEY, JSON.stringify({ chat: agent.chat, kind: agent.kind, html: $("#a-thread").innerHTML })); } catch {}
-}
-// which agent the chat runs on: the tab is named after it, and the dropdown picks it for the next new chat
-function setAgentKind(kind) {
-  agent.kind = kind === "codex" ? "codex" : "claude";
-  $("#a-agent").value = agent.kind;
-  $('#tabs button[data-tab="claude"]').textContent = agent.kind === "codex" ? "Codex" : "Claude";
-}
-$("#a-agent").addEventListener("change", e => {
-  const kind = e.target.value;
-  try { localStorage.setItem("explorer.agentKind", kind); } catch {}
-  if (agent.chat || $("#a-thread .a-msg")) { pastStash = null; $("#a-past").classList.remove("on"); resetAgent(); clearAgentMarks(); }
-  setAgentKind(kind);
-});
-function loadAgent() {
   try {
-    const v = JSON.parse(localStorage.getItem(AGENT_KEY) || "null"); if (!v) return;
-    agent.chat = v.chat; $("#a-thread").innerHTML = v.html || EMPTY; setAgentKind(v.kind);
-    $("#a-thread").querySelectorAll("#a-usename, .a-msg.queued, .a-busy, .a-qctl").forEach(b => b.remove());
-    $("#a-thread").scrollTop = $("#a-thread").scrollHeight;
-    addTurnControls();
+    localStorage.setItem(agentKey(), JSON.stringify({ chat: agent.chat, html: $("#a-thread").innerHTML,
+      draft: $("#a-input").value, pending: agent.pending || [] }));
+    if (agent.chat) localStorage.setItem(`explorer.draft.${agent.chat}`, JSON.stringify({draft: $("#a-input").value, pending: (agent.pending || []).filter(a => a.id)}));
+    localStorage.setItem("explorer.agent.provider", agent.provider);
   } catch {}
 }
+function loadAgent(resume = true) {
+  agent.chat = null; agent.pending = []; agent.queue = [];
+  $("#a-thread").innerHTML = EMPTY; $("#a-input").value = "";
+  try {
+    const v = JSON.parse(localStorage.getItem(agentKey()) || (!index.cache_key && agent.provider === "claude" ? localStorage.getItem("explorer.agent") : null) || "null");
+    if (v) {
+      agent.chat = v.chat; $("#a-thread").innerHTML = v.html || EMPTY;
+      $("#a-input").value = v.draft || ""; agent.pending = (v.pending || []).filter(a => a.id);
+    }
+  } catch {}
+  $("#a-thread").querySelectorAll("#a-usename, .a-msg.queued, .a-busy").forEach(b => b.remove());
+  $("#a-thread").scrollTop = $("#a-thread").scrollHeight;
+  $("#a-provider").value = agent.provider;
+  $("#a-access").value = agent.access;
+  $("#a-thread").querySelectorAll(".a-approval button").forEach(b => b.disabled = true);
+  $("#a-input").placeholder = `Ask ${providerName()}…`;
+  $("#a-input").title = `Enter sends; Shift+Enter adds a line. While ${providerName()} works: Enter interrupts and sends, Ctrl/⌘+Enter queues`;
+  renderPending(); growInput(); addTurnControls();
+  if (resume && agent.chat) resumeAgent();
+}
+$("#a-provider").addEventListener("change", () => {
+  if (agent.ctl || agent.pending?.some(a => !a.id)) { $("#a-provider").value = agent.provider; return; }
+  saveAgent();
+  agent.provider = $("#a-provider").value;
+  clearAgentMarks(); loadAgent(); saveAgent();
+});
+$("#a-access").addEventListener("change", () => {
+  if (agent.ctl) { $("#a-access").value = agent.access; return; }
+  agent.access = $("#a-access").value;
+  try { localStorage.setItem("explorer.agent.access", agent.access); } catch {}
+});
+$("#a-thread").addEventListener("click", async e => {
+  const button = e.target.closest(".a-approval button"); if (!button) return;
+  const card = button.closest(".a-approval"), allow = button.dataset.allow === "true";
+  card.querySelectorAll("button").forEach(b => b.disabled = true);
+  try {
+    await api("/api/agent/approval", { chat: agent.chat, id: card.dataset.id, allow });
+    card.querySelector(".a-approval-status").textContent = allow ? "Approved" : "Declined";
+  } catch (err) { card.querySelector(".a-approval-status").textContent = err.message; }
+});
 // quick actions above the input, for the open neuron
 function renderAgentActions() {
   const f = state.focus;
-  $("#a-actions").innerHTML = f && f.kind === "neuron" ? `<button data-a="explain">explain L${f.layer} N${f.n}</button><button data-a="web">what does its web do?</button>`
-    : f && f.kind === "head" ? `<button data-a="explain">explain L${f.layer} h${f.n}</button>` : "";
+  $("#a-actions").innerHTML = f && f.kind === "neuron" ? `<button data-a="explain">explain L${f.layer} N${f.n}</button><button data-a="web">what does its web do?</button>` : f?.kind === "head" ? `<button data-a="explain">explain L${f.layer} h${f.n}</button>` : "";
 }
 $("#a-actions").addEventListener("click", e => {
-  const b = e.target.closest("button"); if (!b || agent.busy) return;
+  const b = e.target.closest("button"); if (!b || agent.ctl) return;
   if (b.dataset.a === "explain") explainFocus();
   else if (b.dataset.a === "web") { const f = state.focus; agentTurn(`Look at the cone of L${f.layer} N${f.n} (what it reads from and writes into, a few hops out) and tell me briefly what that circuit seems to do. Highlight the neurons you mention.`, `what does the web of L${f.layer} N${f.n} do?`); }
 });
-function resetAgent() {
-  closeEvents(); if (agent.busy) finishTurn();
+async function resetAgent() {
+  await stopAgent();
+  if (agent.ctl) agent.ctl.abort();
+  agent.ctl = null; agent.finished = null; agent.queue = []; agent.pending = [];
   agent.chat = null; $("#a-thread").innerHTML = EMPTY;
-  let pref = "claude"; try { pref = localStorage.getItem("explorer.agentKind") || "claude"; } catch {}
-  setAgentKind(pref);
-  saveAgent();
+  $("#a-input").value = ""; renderPending(); growInput(); setSendMode(false); saveAgent();
 }
 agentEl.addEventListener("click", e => {
-  const a = e.target.closest("a.nref"); if (a) goToNeuron(+a.dataset.l, +a.dataset.n);
+  const a = e.target.closest("a.nref");
+  if (a && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) { e.preventDefault(); if (a.dataset.kind === "h") openHead(+a.dataset.l, +a.dataset.n); else goToNeuron(+a.dataset.l, +a.dataset.n); }
 });
-// what Claude does to the screen (see agent_mcp.py)
-// Claude's labels and highlights last until its next reply, or until the person opens a neuron themselves
+// what the assistant does to the screen (see agent_mcp.py)
+// The assistant's labels and highlights last until its next reply, or until the person opens a neuron themselves
 function clearAgentMarks() {
   map.setNotes([]);
   if (agentMarked) { agentMarked = false; syncLeftMap(); }
 }
 async function agentUi(e) {
-  if (e.action === "head") {
-    agentSelecting = true;
-    try { await openHead(e.layer, e.head); } finally { agentSelecting = false; }
-  } else if (e.action === "select") {  // visibly go there
+  if (e.action === "head") { await openHead(e.layer, e.head); }
+  else if (e.action === "select") {  // visibly go there
     agentSelecting = true;
     try { await openNeuron(e.layer, e.n, "neuron", true, false); } finally { agentSelecting = false; }
     map.flyToNeuron(e.layer, e.n, 0.3);
@@ -1003,7 +1194,7 @@ async function agentUi(e) {
     if (e.mode === "home") map.home();
     else if (e.mode === "layer") map.viewLayer(e.layer);
     else if (e.mode === "neuron") map.flyToNeuron(e.layer, e.n, e.closeness || 0.22);
-  } else if (e.action === "tab") { if (state.focus && tabBtn(e.tab)) { if (curTab() === "claude") markFresh(e.tab); else setTab(e.tab); } }
+  } else if (e.action === "tab") { if (state.focus && tabBtn(e.tab)) { if (curTab() === "agent") markFresh(e.tab); else setTab(e.tab); } }
   else if (e.action === "search") {
     if (state.qMode !== "lens") $('#q-mode button[data-q="lens"]').click();
     $("#lens-q").value = e.query; $("#lens-q").dispatchEvent(new Event("input"));
@@ -1039,150 +1230,131 @@ function addMsg(cls, html) {
   const d = document.createElement("div"); d.className = `a-msg ${cls}`; d.innerHTML = html; th.append(d);
   th.scrollTop = th.scrollHeight; return d;
 }
-// one turn: the reply streams into a new assistant message, text and tool calls interleaved in the order they happen
-// ---- the chat: one claude process per chat on the server and one event stream here. Messages go in any time:
-// mid-reply they reach Claude between tool calls. Stop ends the reply only; background work keeps running and
-// reports back in a turn of its own, which renders like any other. ----
-function ensureChatId() { if (!agent.chat) agent.chat = crypto.randomUUID(); return agent.chat; }
-let evCtl = null, evChat = null;
-async function openEvents() {
-  const chat = agent.chat; if (!chat || (evCtl && evChat === chat)) return;
-  if (evCtl) evCtl.abort();
-  const ctl = evCtl = new AbortController(); evChat = chat;
-  while (!ctl.signal.aborted) {
-    try {
-      const r = await fetch(`/api/agent/events?chat=${encodeURIComponent(chat)}`, { signal: ctl.signal });
-      const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
-      for (;;) {
-        const { value, done } = await rd.read(); if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let i;
-        while ((i = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, i); buf = buf.slice(i + 1);
-          if (line && evCtl === ctl) onAgentEvent(JSON.parse(line));
-        }
+// One renderer handles saved events and live deltas; replay never repeats map actions.
+function assistantRenderer(initialBox = null) {
+  const th = $("#a-thread");
+  let box = initialBox, busy = null, seg = null, segText = "", reply = "", stopped = false;
+  function ensureBox() {
+    if (!box) box = addMsg("assistant", "");
+    if (!busy) { busy = document.createElement("div"); busy.className = "a-busy"; box.append(busy); }
+  }
+  return {
+    get box() { return box; }, get reply() { return reply; },
+    finish() { busy?.remove(); busy = null; },
+    event(e, replay = false) {
+      if (e.t === "user") {
+        busy?.remove(); busy = null; box = null; seg = null; reply = ""; stopped = false;
+        const u = addMsg("user", esc(e.shown || e.text) + ((e.attachments || []).length ? `<span class="a-att">📎 ${e.attachments.map(a => esc(a.name)).join(", ")}</span>` : ""));
+        u.dataset.msg = e.text; u.dataset.shown = e.shown || e.text; u.dataset.cls = "user"; u.dataset.att = JSON.stringify(e.attachments || []);
+        return;
       }
-    } catch { if (ctl.signal.aborted) return; }
-    await new Promise(r => setTimeout(r, 1500));  // reconnect (server restarts); its state event settles a turn that ended meanwhile
+      if (e.t === "done") { this.finish(); return; }
+      if (e.t === "stopped") { if (stopped) return; stopped = true; ensureBox(); const d = document.createElement("div"); d.className = "a-stopped"; d.textContent = "stopped"; box.insertBefore(d, busy); return; }
+      ensureBox();
+      const follow = th.scrollHeight - th.scrollTop - th.clientHeight < 80;
+      if (e.t === "chat") { agent.chat = e.chat; saveAgent(); }
+      else if (e.t === "text") {
+        if (!seg) { seg = document.createElement("div"); seg.className = "a-md"; box.insertBefore(seg, busy); segText = ""; }
+        segText += e.text; reply += e.text; seg.innerHTML = md(segText);
+      } else if (e.t === "approval") {
+        addMsg("approval", `<div class="a-approval" data-id="${esc(e.id)}"><b>Run this shell command?</b><pre>${esc(e.command)}</pre><div>Starting directory: ${esc(e.cwd)}</div><p>Runs with your user account. The starting directory does not restrict file or network access.</p><span class="a-approval-status">Waiting for approval</span><div><button data-allow="true">Run command</button><button data-allow="false">Decline</button></div></div>`);
+      } else if (e.t === "tool") {
+        // expandable: the call's arguments, then its (truncated) output once it arrives
+        seg = null;
+        const d = document.createElement("details"); d.className = "a-tool"; if (e.id) d.dataset.id = e.id;
+        d.innerHTML = `<summary>${esc(toolLabel(e.name, e.input || {}))}</summary><pre class="a-io"><b>${esc(e.name)}</b> ${esc(JSON.stringify(e.input || {}, null, 1))}</pre><pre class="a-io out">running…</pre>`;
+        box.insertBefore(d, busy);
+      } else if (e.t === "tool_result") {
+        const d = [...box.querySelectorAll("details.a-tool")].find(x => x.dataset.id === e.id);
+        if (d) { const o = d.querySelector(".out"); o.textContent = prettyOut(e.output); o.classList.toggle("err", e.error); }
+      } else if (e.t === "ui" && !replay) agentUi(e);
+      else if (e.t === "error") { const d = document.createElement("div"); d.className = "a-err"; d.textContent = e.error; box.insertBefore(d, busy); }
+      if (follow) th.scrollTop = th.scrollHeight;
+    },
+  };
+}
+function finishAssistant(ctl, notify = true) {
+  if (agent.ctl !== ctl) return;
+  $("#a-thread").querySelectorAll(".a-approval button").forEach(b => b.disabled = true);
+  agent.ctl = null; setSendMode(false); addTurnControls(); if (notify) markFresh("agent"); saveAgent();
+  if (!ctl.signal.aborted && !ctl.stopping && agent.queue.length) flushQueue();
+}
+function assistantError(error, renderer, ctl) {
+  if (error.name === "AbortError" && ctl.stopping) renderer.event({t: "stopped"});
+  else if (error.name !== "AbortError") renderer.event({ t: "error", error: `${error.message} Reload this conversation to reconnect.` });
+}
+async function resumeAgent() {
+  const chat = agent.chat, provider = agent.provider, ctl = agent.ctl = new AbortController();
+  let finish; agent.finished = new Promise(resolve => { finish = resolve; });
+  setSendMode(true); clearTurnControls();
+  let renderer = assistantRenderer(), wasRunning = false;
+  try {
+    let history = await api(`/api/agent/history?chat=${encodeURIComponent(chat)}`, null, {signal: ctl.signal});
+    if (!history.events.length) {
+      const messages = [...$("#a-thread").children].flatMap(el => {
+        if (el.classList.contains("user")) return [{ t: "user", text: el.dataset.msg || el.textContent }];
+        if (el.classList.contains("assistant") && el.textContent.trim()) {
+          const copy = el.cloneNode(true); copy.querySelectorAll(".a-ctl, .a-busy").forEach(b => b.remove());
+          return [{ t: "text", text: copy.textContent }];
+        }
+        return [];
+      });
+      if (messages.length) {
+        await api("/api/agent/history/import", {chat, messages}, {signal: ctl.signal});
+        history = await api(`/api/agent/history?chat=${encodeURIComponent(chat)}`, null, {signal: ctl.signal});
+      }
+    }
+    if (agent.ctl !== ctl || agent.provider !== provider) return;
+    $("#a-thread").innerHTML = EMPTY; renderer = assistantRenderer();
+    for (const event of history.events) renderer.event(event, true);
+    if (!history.events.length && history.history_error) renderer.event({t: "error", error: history.history_error}, true);
+    $("#a-thread").querySelectorAll(".a-approval").forEach(card => {
+      const active = history.running && history.approvals.includes(card.dataset.id);
+      card.querySelectorAll("button").forEach(button => button.disabled = !active);
+      if (!active) card.querySelector(".a-approval-status").textContent = "No longer pending";
+    });
+    if (history.running) {
+      wasRunning = true;
+      $("#a-access").value = history.access;
+      await followAssistant(chat, history.cursor, e => renderer.event(e), ctl.signal);
+    }
+  } catch (error) { assistantError(error, renderer, ctl); }
+  finally {
+    renderer.finish();
+    if (agent.ctl === ctl) $("#a-access").value = agent.access;
+    finishAssistant(ctl, wasRunning); finish();
   }
-}
-function closeEvents() { if (evCtl) evCtl.abort(); evCtl = evChat = null; }
-// the reply box under the latest message; its "thinking…" line moves with it
-function replyBox() {
-  if (agent.box) return agent.box;
-  $("#a-thread").querySelectorAll(".a-busy").forEach(x => x.remove());
-  $("#a-thread").querySelectorAll(".a-msg.assistant:empty").forEach(x => x.remove());  // a reply that moved under a newer message
-  const box = agent.box = addMsg("assistant", "");
-  agent.seg = null;
-  if (agent.busy) { const busy = document.createElement("div"); busy.className = "a-busy"; box.append(busy); }
-  return box;
-}
-const putInBox = el => { const box = replyBox(), busy = box.querySelector(".a-busy"); busy ? box.insertBefore(el, busy) : box.append(el); };
-function setBusy(b) { agent.busy = b; setSendMode(b); }
-function onAgentEvent(e) {
-  const th = $("#a-thread"), stick = th.scrollHeight - th.scrollTop - th.clientHeight < 80;
-  if (e.t === "state") {
-    // (re)connected: the turn in progress replays from its start, so what was drawn of it is drawn again
-    if (agent.box && e.busy) { agent.box.innerHTML = ""; agent.seg = null; agent.reply = ""; }
-    if (e.busy) { setBusy(true); replyBox(); if (!agent.box.querySelector(".a-busy")) { const d = document.createElement("div"); d.className = "a-busy"; agent.box.append(d); } }
-    else if (agent.busy && !agent.sending) finishTurn();  // a message still on its way makes the server busy in a moment
-    return;
-  }
-  if (e.t === "ping" || e.t === "sent") return;
-  if (e.t === "ui") return agentUi(e);
-  if (e.t === "done") return finishTurn();
-  if (!agent.busy) { setBusy(true); clearTurnControls(); }  // a turn Claude started itself (background work finished)
-  if (e.t === "text") {
-    if (!agent.seg) { agent.seg = document.createElement("div"); agent.seg.className = "a-md"; agent.segText = ""; putInBox(agent.seg); }
-    agent.segText += e.text; agent.reply += e.text; agent.seg.innerHTML = md(agent.segText);
-  } else if (e.t === "tool") { agent.seg = null; putInBox(toolDetails(e)); }
-  else if (e.t === "tool_result") { if (agent.box) fillTool(agent.box, e); }
-  else if (e.t === "error") { const d = document.createElement("div"); d.className = "a-err"; d.textContent = e.error; putInBox(d); }
-  if (stick) th.scrollTop = th.scrollHeight;
-}
-function finishTurn() {
-  const box = agent.box, reply = agent.reply;
-  $("#a-thread").querySelectorAll(".a-busy").forEach(x => x.remove());
-  agent.box = agent.seg = null; agent.reply = "";
-  setBusy(false); addTurnControls(); markFresh("claude"); saveAgent();
-  for (const w of agent.waiters.splice(0)) w({ reply, box });
 }
 async function agentTurn(message, shown, shownCls = "user", atts = []) {
-  const f = state.focus, th = $("#a-thread");
-  if (pastStash !== null) { th.innerHTML = pastStash; pastStash = null; $("#a-past").classList.remove("on"); }
+  if (agent.ctl) return { reply: "", box: $("#a-thread") };
+  const ctl = agent.ctl = new AbortController(), f = state.focus;
+  let finish; agent.finished = new Promise(resolve => { finish = resolve; });
   clearAgentMarks(); clearTurnControls();
   const ub = addMsg(shownCls, esc(shown) + (atts.length ? `<span class="a-att">📎 ${atts.map(a => esc(a.name)).join(", ")}</span>` : ""));
   ub.dataset.msg = message; ub.dataset.shown = shown; ub.dataset.cls = shownCls; ub.dataset.att = JSON.stringify(atts);
-  agent.box = agent.seg = null;  // the reply, or the rest of the one in progress, goes under this message
-  ensureChatId(); openEvents();
-  setBusy(true); replyBox(); th.scrollTop = th.scrollHeight; saveAgent();
-  const out = new Promise(res => agent.waiters.push(res));
-  agent.sending++;
+  const renderer = assistantRenderer(addMsg("assistant", ""));
+  setSendMode(true);
   try {
-    const r = await api("/api/agent/send", { chat: agent.chat, agent: agent.kind, message, attachments: atts.map(a => a.id),
-      ...(f && f.kind === "neuron" ? { layer: f.layer, n: f.n } : f && f.kind === "head" ? { layer: f.layer, head: f.n } : {}) });
-    if (r.error) throw new Error(r.error);
-  } catch (err) {
-    const d = document.createElement("div"); d.className = "a-err"; d.textContent = String(err.message || err); putInBox(d); finishTurn();
-  } finally { agent.sending--; }
-  return out;
-}
-async function stopAgent() {
-  if (!agent.busy) return;
-  const d = document.createElement("div"); d.className = "a-stopped"; d.textContent = "stopped"; putInBox(d);
-  const r = agent.chat ? await api("/api/agent/interrupt", { chat: agent.chat }).catch(() => ({})) : {};
-  if (!r.running && agent.busy) finishTurn();  // nothing running server side: settle here
-}
-function toolDetails(e) {
-  const d = document.createElement("details"); d.className = "a-tool"; if (e.id) d.dataset.id = e.id;
-  d.innerHTML = `<summary>${esc(toolLabel(e.name, e.input || {}))}</summary><pre class="a-io"><b>${esc(e.name)}</b> ${esc(JSON.stringify(e.input || {}, null, 1))}</pre><pre class="a-io out">running…</pre>`;
-  return d;
-}
-function fillTool(box, e) {
-  const d = [...box.querySelectorAll("details.a-tool")].find(x => x.dataset.id === e.id);
-  if (d) { const o = d.querySelector(".out"); o.textContent = prettyOut(e.output); o.classList.toggle("err", e.error); }
-}
-// ---- past chats: "past" lists the sessions on disk; picking one rebuilds its thread and later turns resume it ----
-let pastStash = null;  // the thread shown before the list opened
-const ago = t => { const s = Date.now() / 1000 - t; return s < 3600 ? `${Math.max(1, Math.round(s / 60))}m ago` : s < 86400 ? `${Math.round(s / 3600)}h ago` : new Date(t * 1000).toLocaleDateString(); };
-async function togglePast() {
-  const th = $("#a-thread");
-  if (pastStash !== null) { th.innerHTML = pastStash; pastStash = null; $("#a-past").classList.remove("on"); addTurnControls(); return; }
-  pastStash = th.innerHTML; $("#a-past").classList.add("on");
-  th.innerHTML = `<div class="dim">…</div>`;
-  const list = await api("/api/agent/chats");
-  if (pastStash === null) return;
-  th.innerHTML = list.length ? list.map(c => `<button class="a-pastrow${c.chat === agent.chat ? " on" : ""}" data-chat="${c.chat}" data-agent="${c.agent || "claude"}"><span class="t">${esc(c.title || "—")}</span><span class="m">${c.agent === "codex" ? "codex · " : ""}${ago(c.t)} · ${c.turns} message${c.turns === 1 ? "" : "s"}</span></button>`).join("")
-    : `<div class="dim">—</div>`;
-}
-async function openPast(chat, kind) {
-  const r = await api(`/api/agent/history?chat=${encodeURIComponent(chat)}`);
-  pastStash = null; $("#a-past").classList.remove("on");
-  const th = $("#a-thread"); th.innerHTML = EMPTY;
-  let box = null, seg = null, segText = "";
-  for (const e of r.events || []) {
-    if (e.t === "user") {
-      const ub = addMsg("user", esc(e.text));
-      Object.assign(ub.dataset, { msg: e.text, shown: e.text, cls: "user", att: "[]" });
-      box = seg = null; continue;
+    const body = { browser: browserId, provider: agent.provider, access: agent.access, chat: agent.chat,
+      message, shown, attachments: atts.map(a => a.id), attachment_names: atts.map(a => a.name),
+      ...(f && ["neuron", "head"].includes(f.kind) ? {layer: f.layer, ...(f.kind === "head" ? {head: f.n} : {n: f.n})} : {}) };
+    let startReady;
+    const starting = agent.starting = new Promise(resolve => { startReady = resolve; });
+    let started;
+    try {
+      started = await api("/api/agent/send", body, {signal: ctl.signal});
+      agent.chat = started.chat; saveAgent();
+    } finally {
+      startReady(); if (agent.starting === starting) agent.starting = null;
     }
-    if (!box) { box = addMsg("assistant", ""); seg = null; }
-    if (e.t === "text") {
-      if (!seg) { seg = document.createElement("div"); seg.className = "a-md"; box.append(seg); segText = ""; }
-      segText += (segText ? "\n\n" : "") + e.text; seg.innerHTML = md(segText);
-    } else if (e.t === "tool") { seg = null; box.append(toolDetails(e)); }
-    else if (e.t === "tool_result") fillTool(box, e);
-    else if (e.t === "error") { seg = null; const d = document.createElement("div"); d.className = "a-err"; d.textContent = e.error; box.append(d); }
-  }
-  closeEvents(); if (agent.busy) { agent.box = null; finishTurn(); }
-  agent.chat = chat; setAgentKind(kind); clearAgentMarks(); addTurnControls(); saveAgent(); openEvents();
-  th.scrollTop = th.scrollHeight;
+    await followAssistant(agent.chat, started.cursor, e => { if (e.t !== "user") renderer.event(e); }, ctl.signal);
+  } catch (error) { assistantError(error, renderer, ctl); }
+  finally { renderer.finish(); finishAssistant(ctl); finish(); }
+  return {reply: renderer.reply, box: renderer.box};
 }
-$("#a-thread").addEventListener("click", e => { const b = e.target.closest(".a-pastrow"); if (b) openPast(b.dataset.chat, b.dataset.agent); });
 async function explainFocus() {
-  const f = state.focus; if (!f) return;
-  if (f.kind === "head") return agentTurn(`Explain attention head L${f.layer} h${f.n}: write the head report.`, `explain L${f.layer} h${f.n}`);
-  if (f.kind !== "neuron") return;
+  const f = state.focus; if (!f || !["neuron", "head"].includes(f.kind)) return;
+  if (f.kind === "head") { await agentTurn(`Explain attention head L${f.layer} h${f.n}: report its q/k/v/o roles and verify its attention on contrasting texts.`, `explain L${f.layer} h${f.n}`); return; }
   const { reply, box } = await agentTurn(`Explain L${f.layer} N${f.n}: write the autointerp report.`, `explain L${f.layer} N${f.n}`);
   const name = reply.match(/\*\*Name\*\*:?\s*(.+)/)?.[1].replace(/[*`]/g, "").trim();
   if (name) {
@@ -1196,30 +1368,80 @@ function sendChat() {
   if (agent.pending.some(a => !a.id) || (!msg && !agent.pending.length)) return false;
   const atts = agent.pending; agent.pending = []; renderPending();
   $("#a-input").value = ""; growInput();
+  if (agent.ctl) { queueMessage(msg || "(see the attached files)", atts); return true; }  // busy: it goes after this reply
   agentTurn(msg || "(see the attached files)", msg || "(attached files)", "user", atts);
   return true;
 }
+
+// ---- stop / queue / interrupt: while the assistant works, the send button stops it and new messages queue behind it ----
+agent.queue = [];
 function setSendMode(busy) {
+  $("#a-provider").disabled = busy || agent.pending?.some(a => !a.id); $("#a-access").disabled = busy;
+  $("#a-history-toggle").disabled = busy || agent.pending?.some(a => !a.id);
+  $("#a-actions").querySelectorAll("button").forEach(b => b.disabled = busy);
   const b = $("#a-send"); b.disabled = false; b.classList.toggle("stop", busy);
   b.textContent = busy ? "■" : "↑"; b.title = busy ? "stop" : "send"; b.setAttribute("aria-label", busy ? "stop" : "send");
 }
+async function stopAgent() {
+  if (!agent.ctl) return;
+  const ctl = agent.ctl;
+  ctl.stopping = true;
+  try {
+    // Wait for send acceptance, including when adding a turn to an existing chat.
+    if (agent.starting) await agent.starting;
+    if (agent.chat && agent.ctl === ctl) await api("/api/agent/interrupt", {chat: agent.chat});
+    ctl.abort();
+  } catch (error) { addMsg("assistant", `<div class="a-err">${esc(error.message)}</div>`); }
+}
+function queueMessage(msg, atts) {
+  const q = { msg, atts }; agent.queue.push(q);
+  const d = addMsg("user queued", esc(msg) + (atts.length ? `<span class="a-att">📎 ${atts.map(a => esc(a.name)).join(", ")}</span>` : "")
+    + `<div class="a-qctl"><span>queued</span><button data-q="now">send now</button><button data-q="drop">×</button></div>`);
+  q.el = d;
+}
+function flushQueue() {
+  const q = agent.queue.splice(0); if (!q.length) return;
+  for (const x of q) x.el?.remove();
+  const msg = q.map(x => x.msg).join("\n\n"), atts = q.flatMap(x => x.atts);
+  agentTurn(msg, msg, "user", atts);
+}
+async function interruptQueue() {
+  const finished = agent.finished;
+  await stopAgent();
+  if (finished) await finished;
+  // A reset or a different turn may have started while the interrupted stream closed.
+  if (agent.finished === finished && !agent.ctl) flushQueue();
+}
+$("#a-thread").addEventListener("click", e => {
+  const b = e.target.closest(".a-qctl button"); if (!b) return;
+  const el = b.closest(".a-msg"), i = agent.queue.findIndex(x => x.el === el);
+  if (b.dataset.q === "drop") { if (i >= 0) agent.queue.splice(i, 1); el.remove(); return; }
+  interruptQueue();
+});
 
 // ---- attachments: picked, dropped or pasted files upload right away and go with the next message ----
 agent.pending = [];
 function renderPending() {
   $("#a-files").innerHTML = agent.pending.map((a, i) => `<span class="a-file${a.id ? "" : " up"}">${esc(a.name)}<button data-i="${i}" aria-label="remove">×</button></span>`).join("");
+  $("#a-provider").disabled = Boolean(agent.ctl || agent.pending.some(a => !a.id));
+  $("#a-history-toggle").disabled = $("#a-provider").disabled;
 }
-$("#a-files").addEventListener("click", e => { const b = e.target.closest("button"); if (b) { agent.pending.splice(+b.dataset.i, 1); renderPending(); } });
+$("#a-files").addEventListener("click", e => { const b = e.target.closest("button"); if (b) { agent.pending.splice(+b.dataset.i, 1); renderPending(); saveAgent(); } });
 async function attachFiles(files) {
+  const pending = agent.pending;
   for (const file of files) {
-    const a = { name: file.name || "pasted", id: null }; agent.pending.push(a); renderPending();
-    const data = await new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(String(r.result).split(",")[1] || ""); r.onerror = bad; r.readAsDataURL(file); });
+    if (agent.pending !== pending) break;
+    const a = { name: file.name || "pasted", id: null }; pending.push(a); renderPending();
     try {
+      const data = await new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(String(r.result).split(",")[1] || ""); r.onerror = () => bad(new Error("Could not read this file.")); r.readAsDataURL(file); });
       const res = await api("/api/agent/upload", { name: a.name, type: file.type, data });
       if (res.error) throw new Error(res.error);
       a.id = res.id;
-    } catch (err) { agent.pending.splice(agent.pending.indexOf(a), 1); addMsg("assistant", `<div class="a-err">${esc(a.name)}: ${esc(String(err.message || err))}</div>`); }
-    renderPending();
+    } catch (err) {
+      const i = pending.indexOf(a); if (i >= 0) pending.splice(i, 1);
+      if (agent.pending === pending) addMsg("assistant", `<div class="a-err">${esc(a.name)}: ${esc(String(err.message || err))}</div>`);
+    }
+    if (agent.pending === pending) { renderPending(); saveAgent(); }
   }
 }
 $("#a-attach").onclick = () => $("#a-file").click();
@@ -1229,7 +1451,7 @@ agentEl.addEventListener("dragleave", e => { if (!agentEl.contains(e.relatedTarg
 agentEl.addEventListener("drop", e => { if (!e.dataTransfer?.files?.length) return; e.preventDefault(); agentEl.classList.remove("drop"); attachFiles([...e.dataTransfer.files]); });
 $("#a-input").addEventListener("paste", e => { const fs = [...(e.clipboardData?.files || [])]; if (fs.length) { e.preventDefault(); attachFiles(fs); } });
 
-// ---- edit / reroll the latest turn: cut the claude session back to before it, then resend or hand it back ----
+// ---- edit / reroll the latest turn: cut the provider session back to before it, then resend or hand it back ----
 function clearTurnControls() { document.querySelectorAll("#a-thread .a-ctl").forEach(x => x.remove()); }
 function lastTurn() {
   const users = [...document.querySelectorAll("#a-thread .a-msg.user")], u = users[users.length - 1];
@@ -1247,10 +1469,14 @@ function addTurnControls() {
 }
 async function rewindLast(act) {
   const t = lastTurn(); if (!t) return;
-  if (agent.busy) { agent.box = null; finishTurn(); }
+  await stopAgent();
+  if (agent.finished) await agent.finished;
   const u = t.u, msg = u.dataset.msg ?? u.childNodes[0]?.textContent ?? "", shown = u.dataset.shown ?? msg;
   const cls = u.dataset.cls || "user", atts = JSON.parse(u.dataset.att || "[]");
-  if (agent.chat) { try { await api("/api/agent/rewind", { chat: agent.chat, text: msg }); } catch {} }
+  if (agent.chat) {
+    try { await api("/api/agent/rewind", { provider: agent.provider, chat: agent.chat, text: msg }); }
+    catch (err) { addMsg("assistant", `<div class="a-err">${esc(err.message)}</div>`); return; }
+  }
   for (const x of [u, ...t.after]) x.remove();
   if (!$("#a-thread").children.length) $("#a-thread").innerHTML = EMPTY;
   if (act === "reroll") agentTurn(msg, shown, cls, atts);
@@ -1258,17 +1484,76 @@ async function rewindLast(act) {
 }
 $("#a-thread").addEventListener("click", e => { const b = e.target.closest(".a-ctl button"); if (b) rewindLast(b.dataset.act); });
 function growInput() { const t = $("#a-input"); t.style.height = "auto"; t.style.height = `${Math.min(200, t.scrollHeight)}px`; }
-$("#a-input").addEventListener("input", growInput);
-// Enter sends, also while Claude works: the message reaches it between tool calls
-$("#a-input").addEventListener("keydown", e => {
-  if (e.key !== "Enter" || e.shiftKey) return;
-  e.preventDefault();
-  sendChat();
+let draftTimer;
+$("#a-input").addEventListener("input", () => {
+  growInput(); clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => { draftTimer = null; saveAgent(); }, 250);
 });
-// the button sends, or stops the reply while Claude works (Enter always sends: mid-reply the message goes straight in)
-$("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.busy) stopAgent(); else sendChat(); });
-$("#a-new").onclick = () => { pastStash = null; $("#a-past").classList.remove("on"); resetAgent(); clearAgentMarks(); };
-$("#a-past").onclick = togglePast;
-{ let pref = "claude"; try { pref = localStorage.getItem("explorer.agentKind") || "claude"; } catch {} setAgentKind(pref); }
-loadAgent(); renderAgentActions(); openEvents();
-syncEdge(); updateInsets();
+// A read-only tab must not overwrite a newer conversation saved by another tab when it closes.
+addEventListener("pagehide", () => { if (draftTimer) { clearTimeout(draftTimer); saveAgent(); } });
+// Enter sends; while the assistant works it interrupts and sends now (steer); Cmd/Ctrl+Enter queues behind the reply instead
+$("#a-input").addEventListener("keydown", e => {
+  if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
+  e.preventDefault();
+  if (agent.ctl && !(e.metaKey || e.ctrlKey)) { if (sendChat()) interruptQueue(); }
+  else sendChat();
+});
+// the button sends, or stops while the assistant works (Enter still sends, which queues while it works)
+$("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.ctl) stopAgent(); else sendChat(); });
+$("#a-new").onclick = async () => {
+  if (($("#a-input").value || agent.pending.length || agent.queue.length || agent.ctl) && !confirm("Start a new chat? Unsaved drafts, attachments, and queued messages will be cleared; a running reply will stop. This conversation stays in Past chats.")) return;
+  await resetAgent(); clearAgentMarks(); $("#a-input").focus();
+};
+$("#a-history-toggle").onclick = async () => {
+  const panel = $("#a-history"), toggle = $("#a-history-toggle");
+  panel.hidden = !panel.hidden; toggle.setAttribute("aria-expanded", String(!panel.hidden));
+  if (panel.hidden) return;
+  panel.textContent = "Loading conversations…";
+  try {
+    const {chats} = await api("/api/agent/chats");
+    panel.innerHTML = chats.length ? chats.map(c => `<button type="button" data-chat="${esc(c.chat)}" data-provider="${esc(c.provider)}" ${c.chat === agent.chat ? 'aria-current="true"' : ''}><span>${esc(c.title)}</span><small>${esc(c.provider)} · ${esc(new Date(c.updated * 1000).toLocaleString())}${c.running ? ' · running' : ''}</small></button>`).join("") : '<div class="slot">No saved conversations yet.</div>';
+  } catch (error) { panel.textContent = error.message; }
+};
+$("#a-history").addEventListener("click", async e => {
+  const button = e.target.closest("button[data-chat]"); if (!button || agent.ctl) return;
+  if (agent.pending.some(a => !a.id)) return;
+  saveAgent();
+  const chat = button.dataset.chat;
+  agent.provider = button.dataset.provider;
+  loadAgent(false);
+  agent.chat = chat;
+  $("#a-thread").innerHTML = EMPTY;
+  const draft = savedChatDraft(chat);
+  $("#a-input").value = draft.draft || ""; agent.pending = draft.pending || [];
+  renderPending(); growInput(); clearAgentMarks(); saveAgent();
+  $("#a-history").hidden = true; $("#a-history-toggle").setAttribute("aria-expanded", "false");
+  await resumeAgent();
+});
+loadAgent(); renderAgentActions();
+syncTabs(); syncEdge(); updateInsets();
+document.querySelectorAll(".seg:not(#views) button, #ltabs button[data-lt]").forEach(b => setPressed(b, b.classList.contains("on")));
+
+// Acknowledged commands use the same selection, tab, dose, button, and submit handlers as manual UI actions.
+const chatUiController = createChatUiController({
+  arch, state: chatUiState,
+  selectHead: openHead,
+  select: async (layer, n) => {
+    agentSelecting = true;
+    try { await openNeuron(layer, n, "neuron", true, false); } finally { agentSelecting = false; }
+    map.flyToNeuron(layer, n, 0.3);
+  },
+  openTab: tab => {
+    const button = tabBtn(tab);
+    if (!button || button.disabled) throw new Error("that tab is unavailable for the selected neuron");
+    button.click();
+  },
+  controls: patch => {
+    if ("mode" in patch) $(`#c-mode button[data-m="${patch.mode}"]`).click();
+    if ("direction" in patch) $(`#c-dir button[data-d="${patch.direction === "reads you" ? "reads" : "writes"}"]`).click();
+    if ("dose" in patch) { doseEl.value = String(patch.dose); doseEl.dispatchEvent(new Event("change", { bubbles: true })); }
+  },
+  prompt: value => { $("#c-input").value = value; $("#c-input").dispatchEvent(new Event("input", { bubbles: true })); },
+  submit: submitChat,
+  cancel: () => { running?.abort(); readsController?.abort(); },
+});
+connectUiBridge(browserId, chatUiController);

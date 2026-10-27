@@ -6,6 +6,7 @@ multiply, and reading are all exact. Add doses are in units of the median residu
 unit as the sweep's `--dose-unit rel`.
 """
 import json
+from functools import wraps
 import os
 import sqlite3
 import threading
@@ -16,7 +17,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb, l2norm
 
-MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
+from model_config import MODEL, REVISION, data_paths
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
@@ -26,24 +27,25 @@ REFERENCE_TEXT = (
 )
 
 
-CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+CACHE = str(data_paths()["cache"])
 
 
 def _locked(f):
     """Runs a method entirely under the model lock, so its GPU temporaries are created and freed while no other
     thread is using the GPU (MPS fails when two threads' work interleaves)."""
+    @wraps(f)
     def g(self, *a, **k):
         with self.lock:
             return f(self, *a, **k)
-    g.__doc__, g.__name__ = f.__doc__, f.__name__
     return g
 
 
 class Runtime:
-    def __init__(self, stats_dir):
+    def __init__(self, stats_dir, *, model=MODEL, revision=REVISION, cache_dir=CACHE):
         self.stats_dir = stats_dir
-        os.makedirs(CACHE, exist_ok=True)
-        self._db = sqlite3.connect(os.path.join(CACHE, "connections.sqlite"), check_same_thread=False)
+        self.model_id, self.revision, self.cache = model, revision, str(cache_dir)
+        os.makedirs(self.cache, exist_ok=True)
+        self._db = sqlite3.connect(os.path.join(self.cache, "connections.sqlite"), check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS con (key TEXT PRIMARY KEY, val TEXT)")
         self._db_lock = threading.Lock()
         self._lens_idx = None
@@ -73,27 +75,45 @@ class Runtime:
         with self.lock:
             if self.model is not None:
                 return
-            self.status = "loading"
-            dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-            self.tok = AutoTokenizer.from_pretrained(MODEL)
-            m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
-            self.dev, self.model, self.lm = dev, m, m.model.language_model
-            for i, layer in enumerate(self.lm.layers):
-                layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
-                layer.register_forward_hook(self._resid_hook(i))
-                # attention output projection: its input is the heads side by side (full attention: o_proj, 16 x 256
-                # after the output gate; linear attention: out_proj, 32 value heads x 128 after the gated norm)
-                if hasattr(layer, "self_attn"):
-                    a = layer.self_attn
-                    a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
-                else:
-                    a = layer.linear_attn
-                    a.out_proj.register_forward_pre_hook(self._head_hook(i, a.num_v_heads))
-                a.register_forward_pre_hook(self._qk_hook(i), with_kwargs=True)
-                if hasattr(layer, "linear_attn"):
-                    a.norm.register_forward_pre_hook(self._gnorm_hook(i, a.num_v_heads))
-                layer.post_attention_layernorm.register_forward_hook(self._mlp_in_hook(i))
-            self.status = "ready"
+            if not os.environ.get("EXPLORER_CACHE_WORKER"):
+                from cache_storage import job_lock
+                from model_config import ROOT
+                self._device_lease = job_lock(ROOT / "explorer/cache/.device.lock")
+                try:
+                    self._device_lease.__enter__()
+                except RuntimeError:
+                    self._device_lease = None
+                    self.status = "model busy: pause the cache job and restart the server"
+                    raise
+            try:
+                self.status = "loading"
+                dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+                self.tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
+                m = Qwen3_5ForConditionalGeneration.from_pretrained(self.model_id, revision=self.revision, dtype=torch.bfloat16).to(dev).eval()
+                self.dev, self.model, self.lm = dev, m, m.model.language_model
+                for i, layer in enumerate(self.lm.layers):
+                    layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
+                    layer.register_forward_hook(self._resid_hook(i))
+                    # attention output projection: its input is the heads side by side (full attention: o_proj, 16 x 256
+                    # after the output gate; linear attention: out_proj, 32 value heads x 128 after the gated norm)
+                    if hasattr(layer, "self_attn"):
+                        a = layer.self_attn
+                        a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
+                    else:
+                        a = layer.linear_attn
+                        a.out_proj.register_forward_pre_hook(self._head_hook(i, a.num_v_heads))
+                    a.register_forward_pre_hook(self._qk_hook(i), with_kwargs=True)
+                    if hasattr(layer, "linear_attn"):
+                        a.norm.register_forward_pre_hook(self._gnorm_hook(i, a.num_v_heads))
+                    layer.post_attention_layernorm.register_forward_hook(self._mlp_in_hook(i))
+                self.status = "ready"
+            except Exception:
+                self.model = self.lm = None
+                self.status = "load failed"
+                if getattr(self, "_device_lease", None) is not None:
+                    self._device_lease.__exit__(None, None, None)
+                    self._device_lease = None
+                raise
 
     def _hook(self, i):
         def hook(mod, inp):
@@ -430,7 +450,9 @@ class Runtime:
                 for h, (WV, WO) in enumerate(heads):
                     qv.append(torch.linalg.qr(WV.T.cpu())[0]); qo.append(torch.linalg.qr(WO.cpu())[0])
                     spans.append((l, h, at, at + hd)); at += hd
-        self._hb = (torch.cat(qv, 1).to(self.dev), torch.cat(qo, 1).to(self.dev), spans)
+        # Keep the large retained bases off the GPU for larger backbones (9B: about 5 GiB including q/k).
+        basis_dev = "cpu" if self.lm.config.hidden_size > 2560 else self.dev
+        self._hb = (torch.cat(qv, 1).to(basis_dev), torch.cat(qo, 1).to(basis_dev), spans)
         return self._hb
 
     @_locked
@@ -442,9 +464,9 @@ class Runtime:
         QV, QO, spans = self._head_bases()
         with self.lock, torch.inference_mode():
             me = self.lm.layers[layer]
-            d = me.mlp.down_proj.weight[:, n].float()
-            w = 1.0 + me.post_attention_layernorm.weight.float()
-            gr, ur = me.mlp.gate_proj.weight[n].float() * w, me.mlp.up_proj.weight[n].float() * w
+            d = me.mlp.down_proj.weight[:, n].float().to(QV.device)
+            w = 1.0 + me.post_attention_layernorm.weight.float().to(QO.device)
+            gr, ur = me.mlp.gate_proj.weight[n].float().to(QO.device) * w, me.mlp.up_proj.weight[n].float().to(QO.device) * w
             pr = (QV.T @ d).cpu()  # projections of the down column on every head's read basis
             pg, pu = (QO.T @ gr).cpu(), (QO.T @ ur).cpu()
         dn, gn, un, hid = float(d.norm()), float(gr.norm()), float(ur.norm()), d.shape[0]
@@ -496,7 +518,8 @@ class Runtime:
                     for W, hs in units:
                         cols.append(torch.linalg.qr((W.float() * g).T.cpu())[0].half())
                         spans.append((l, hs, at, at + W.shape[0])); at += W.shape[0]
-                out[role] = (torch.cat(cols, 1).to(self.dev), spans)
+                basis_dev = "cpu" if self.lm.config.hidden_size > 2560 else self.dev
+                out[role] = (torch.cat(cols, 1).to(basis_dev), spans)
         self._qkb = out
         return out
 
@@ -511,7 +534,7 @@ class Runtime:
         with self.lock, torch.inference_mode():
             d = self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
             dn = float(d.norm())
-            proj = {r: (B.T @ d.half()).float().cpu() for r, (B, _) in qk.items()}
+            proj = {r: (B.T @ d.to(device=B.device, dtype=B.dtype)).float().cpu() for r, (B, _) in qk.items()}
         roles = {}
         for r, (_, spans) in qk.items():  # shares relative to a random direction's, as in neuron_heads
             side = [(l, hs, float(proj[r][a:b].norm()) / dn / ((b - a) / d.shape[0]) ** 0.5) for l, hs, a, b in spans if l > layer]
@@ -596,7 +619,13 @@ class Runtime:
                 ids = torch.tensor([[pad] * (T - len(q)) + q for q in seqs], device=self.dev)
                 mask = torch.tensor([[0] * (T - len(q)) + [1] * len(q) for q in seqs], device=self.dev)
                 pos = (mask.cumsum(-1) - 1).clamp(min=0)
-                eos = self.tok.convert_tokens_to_ids("<|im_end|>")
+                configured_eos = self.model.generation_config.eos_token_id
+                eos = set(configured_eos if isinstance(configured_eos, (list, tuple)) else [configured_eos])
+                eos.add(self.tok.eos_token_id)
+                end = self.tok.convert_tokens_to_ids("<|im_end|>")
+                if end is not None and end != self.tok.unk_token_id:
+                    eos.add(end)
+                eos.discard(None)
                 done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
                 self._push = push
                 with torch.inference_mode():
@@ -610,7 +639,7 @@ class Runtime:
                             if done[r]:
                                 continue
                             t = int(nxt[r])
-                            if t == eos:
+                            if t in eos:
                                 done[r] = True
                                 continue
                             out_ids[r].append(t)
@@ -720,7 +749,7 @@ class Runtime:
     def con_index(self):
         """Precomputed connections (build_connections.py), loaded once."""
         if self._con_idx is None:
-            path = os.path.join(CACHE, "connections.npz")
+            path = os.path.join(self.cache, "connections.npz")
             if os.path.exists(path):
                 z = np.load(path)
                 self._con_idx = {key: z[key] for key in z.files}
@@ -732,7 +761,7 @@ class Runtime:
     # ---------- logit lens ----------
     def lens_index(self):
         if self._lens_idx is None:
-            path = os.path.join(CACHE, "lens_index.npz")
+            path = os.path.join(self.cache, "lens_index.npz")
             if os.path.exists(path):
                 z = np.load(path)
                 self._lens_idx = {"up": z["up"], "down": z["down"]}
@@ -740,7 +769,7 @@ class Runtime:
 
     def steer_index(self):
         if getattr(self, "_steer_idx", None) is None:
-            path = os.path.join(CACHE, "steer_index.npz")
+            path = os.path.join(self.cache, "steer_index.npz")
             self._steer_idx = dict(np.load(path)) if os.path.exists(path) else False
         return self._steer_idx or None
 
@@ -878,14 +907,15 @@ class Runtime:
 
     def vocab_strings(self):
         if getattr(self, "_vocab", None) is None:
-            path = os.path.join(CACHE, "vocab.json")
+            path = os.path.join(self.cache, "vocab.json")
             if os.path.exists(path):
                 self._vocab = json.load(open(path))
             else:
                 if self.tok is None:
-                    self.tok = AutoTokenizer.from_pretrained(MODEL)
+                    self.tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
                 self._vocab = [self.tok.decode([i]) for i in range(len(self.tok))]
-                json.dump(self._vocab, open(path, "w"))
+                from cache_storage import atomic_json
+                atomic_json(path, self._vocab)
         return self._vocab
 
     # ---------- which neurons fire on a text ----------

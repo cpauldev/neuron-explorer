@@ -15,6 +15,7 @@ export function createScatter(canvas, cb) {
   const ctx = canvas.getContext("2d");
   let data = null, colorBy = "neuron", sel = null, hoverIdx = -1;
   let view = { x: 0, y: 0, k: 1 };
+  let insets = { left: 404, right: 0 };
   const dpr = Math.min(devicePixelRatio, 2);
 
   function size() {
@@ -24,8 +25,9 @@ export function createScatter(canvas, cb) {
 
   const pad = 60;
   function toScreen(i) {
-    const w = canvas.clientWidth - 2 * pad - 320, h = canvas.clientHeight - 2 * pad - 44, s = Math.min(w, h);
-    const ox = 320 + pad + (w - s) / 2, oy = 44 + pad + (h - s) / 2;
+    const narrow = canvas.clientWidth <= 760, left = narrow ? 0 : insets.left, right = narrow ? 0 : insets.right;
+    const w = Math.max(20, canvas.clientWidth - 2 * pad - left - right), h = Math.max(20, canvas.clientHeight - 2 * pad - 44), s = Math.min(w, h);
+    const ox = left + pad + (w - s) / 2, oy = 44 + pad + (h - s) / 2;
     return [(ox + data.x[i] * s) * view.k + view.x, (oy + (1 - data.y[i]) * s) * view.k + view.y];
   }
   function color(i) {
@@ -35,7 +37,7 @@ export function createScatter(canvas, cb) {
     if (colorBy === "kind") return KIND_COLORS[data.kind[i]];
     return data.kind[i] === "random" ? "#3a3a3a" : hashColor(data.neuron[i]);
   }
-  function isSel(i) { return sel && data.kind[i] === "neuron" && data.neuron[i] === sel.n; }
+  function isSel(i) { return sel && sel.layer === data.layer && data.kind[i] === "neuron" && data.neuron[i] === sel.n; }
 
   function draw() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -43,13 +45,14 @@ export function createScatter(canvas, cb) {
     if (!data || !data.x) return;
     const r = Math.max(1.6, Math.min(4, 2.2 * Math.sqrt(view.k)));
     const n = data.x.length;
-    ctx.globalAlpha = sel ? 0.25 : 0.85;
+    const selected = sel && sel.layer === data.layer;
+    ctx.globalAlpha = selected ? 0.25 : 0.85;
     for (let i = 0; i < n; i++) {
       if (isSel(i)) continue;
       const [x, y] = toScreen(i);
       ctx.fillStyle = color(i); ctx.fillRect(x - r / 2, y - r / 2, r, r);
     }
-    if (sel) {
+    if (selected) {
       ctx.globalAlpha = 1;
       for (let i = 0; i < n; i++) if (isSel(i)) {
         const [x, y] = toScreen(i);
@@ -75,11 +78,15 @@ export function createScatter(canvas, cb) {
   }
 
   let drag = null, moved = false;
-  canvas.addEventListener("pointerdown", e => { drag = [e.clientX, e.clientY, view.x, view.y]; moved = false; });
+  canvas.addEventListener("pointerdown", e => { if (e.button !== 0) return; drag = [e.clientX, e.clientY, view.x, view.y]; moved = false; });
   addEventListener("pointerup", e => {
-    if (drag && !moved && data && hoverIdx >= 0) cb.onPick(hoverIdx);
+    if (drag && !moved && data && e.target === canvas) {
+      const r = canvas.getBoundingClientRect(), i = nearest(e.clientX - r.left, e.clientY - r.top);
+      if (i >= 0) cb.onPick(i);
+    }
     drag = null;
   });
+  canvas.addEventListener("pointercancel", () => { drag = null; });
   canvas.addEventListener("pointermove", e => {
     if (!data || !data.x) return;
     if (drag) {
@@ -103,6 +110,7 @@ export function createScatter(canvas, cb) {
   return {
     setData(d) { data = d; view = { x: 0, y: 0, k: 1 }; hoverIdx = -1; draw(); },
     setColorBy(c) { colorBy = c; draw(); },
+    setInsets(left, right) { insets = { left, right }; draw(); },
     select(layer, n) { sel = n == null ? null : { layer, n }; draw(); },
     draw,
     get data() { return data; },
