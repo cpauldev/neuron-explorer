@@ -4,6 +4,14 @@
 
 ### Added
 
+- Text-only dense Qwen3.5 checkpoint support, including Qwenputer, and a reusable desktop cache progress window.
+- Cache tab in the explorer sidebar that replays saved layouts on the shared map, shows checkpoint coverage and sampled connections, and controls existing jobs without loading model weights in the server.
+
+- React/TypeScript/Vite frontend with reusable toolbar, analysis, inspector, local Chat and research-result components.
+- Official assistant-ui prebuilt approval, terminal, tool fallback, connection and queue components, with strict frontend typechecking during builds.
+- assistant-ui conversation, Markdown and composer primitives using the existing provider backends and durable journal.
+- React component/store tests for draft isolation, attachments, approvals, history, streaming and selection races.
+
 - Shared Codex and Claude research tools, with provider-specific conversations, drafts and attachments.
 - Acknowledged MCP tools to read UI state, configure neuron Chat, fill its prompt and submit it through the normal UI.
 - Model/revision-specific data paths and resumable background cache jobs with progress, pause/resume, atomic
@@ -30,6 +38,9 @@
 - Cache-worker validation before launch and failure reporting when a pause request is pending.
 
 ### Upgrade notes
+
+- Install Node.js 22.12+ and run `npm ci` followed by `npm run build` before starting the Python server.
+  `npm run dev` watches and rebuilds the frontend; FastAPI continues to serve the app and API on one origin.
 
 - Restart the explorer, refresh its browser page, and reconnect existing MCP clients after updating.
 - New models require their own caches and sufficient hardware memory. Support currently covers dense

@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "paths": { "@/*": ["./frontend/src/*"] },
+    "types": ["vite/client", "node"]
+  },
+  "include": ["frontend/src/**/*.ts", "frontend/src/**/*.tsx"],
+  "exclude": ["frontend/src/**/*.test.*", "frontend/src/test-helpers.js"]
+}

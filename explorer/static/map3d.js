@@ -1,3 +1,4 @@
+import { flightPosition } from "./camera-flight.js";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
@@ -47,6 +48,9 @@ function glowPoints(sizePx, maxScale = 3) {
 }
 
 export function createMap(canvas, labelsDiv, arch, cb) {
+  let disposed = false;
+  const lifetime = new AbortController();
+  const listen = (type, fn, options = {}) => canvas.addEventListener(type, fn, { ...options, signal: lifetime.signal });
   const L = arch.n_layers, N = arch.inter;
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -60,6 +64,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   let fitPerPx = null;
   const camera = new THREE.PerspectiveCamera(32, 1, 0.02, 2000);
   let homeDist = 60;
+  let shadingDist = 60;
   const home = { target: new THREE.Vector3((L - 1) * GAP / 2, SHEET_Y0 + SHEET / 2 - 0.4, 0), dir: new THREE.Vector3(0.62, 0.4, 1).normalize() };
   camera.position.copy(home.target).addScaledVector(home.dir, homeDist);
   const controls = new OrbitControls(camera, canvas);
@@ -335,29 +340,36 @@ export function createMap(canvas, labelsDiv, arch, cb) {
 
   let pending = false;
   function render() {
-    if (pending) return; pending = true;
+    if (pending || disposed) return; pending = true;
     requestAnimationFrame(() => {
+      if (disposed) return;
       pending = false;
-      for (const m of [pointMat, hiMat, markPts.material, webPts.material]) { m.uniforms.ref.value = homeDist; m.uniforms.tdist.value = curDist(); }
+      for (const m of [pointMat, hiMat, markPts.material, webPts.material]) { m.uniforms.ref.value = shadingDist; m.uniforms.tdist.value = curDist(); }
       applyFade();
       renderer.render(scene, camera); placeNotes();
     });
   }
   function resize() {
     const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (!w || !h || disposed) return;
     renderer.setSize(w, h, false);
     webMat.resolution.set(w, h);
-    const narrow = w <= 760, li = narrow ? 0 : insets.left, ri = narrow ? 0 : insets.right;
+    const narrow = innerWidth <= 760, li = narrow ? 0 : insets.left, ri = narrow ? 0 : insets.right;
     const availW = Math.max(200, w - li - ri);
     camera.aspect = w / h;
-    if (fitPerPx === null) {
+    {
       // distance at which the model's bounding sphere fits the visible gap, then place the camera there once
       const center = home.target, r = Math.max(...bounds.map(b => b.distanceTo(center)));
       const vHalf = THREE.MathUtils.degToRad(camera.fov / 2), hHalf = Math.atan(Math.tan(vHalf) * availW / h);
-      homeDist = r / Math.sin(Math.min(vHalf, hHalf)) * 0.82;
-      camera.position.copy(home.target).addScaledVector(home.dir, homeDist);
-      controls.update();
-      fitPerPx = homeDist;
+      const fitDistance = r / Math.sin(Math.min(vHalf, hHalf));
+      homeDist = fitDistance * 1.08;
+      // Preserve upstream glow/fade normalization independently of overview framing.
+      shadingDist = fitDistance * 0.82;
+      if (fitPerPx === null) {
+        camera.position.copy(home.target).addScaledVector(home.dir, homeDist);
+        controls.update();
+        fitPerPx = homeDist;
+      }
     }
     // the orbit target (and vanishing point) sits in the middle of the visible gap between the list and the neuron
     // panel, or at ?targetx= of the canvas width
@@ -365,7 +377,8 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     camera.setViewOffset(w, h, w / 2 - tx, 0, w, h);
     camera.updateProjectionMatrix(); render();
   }
-  new ResizeObserver(resize).observe(canvas);
+  const resizeObserver = new ResizeObserver(resize);
+  resizeObserver.observe(canvas);
   controls.addEventListener("change", render);
 
   // picking
@@ -414,13 +427,16 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     if (b) return { type: "block", ...b.object.userData };
     return null;
   }
+  canvas.style.cursor = "grab";
   let moveQueued = null, downAt = null;
-  canvas.addEventListener("pointermove", ev => {
+  listen("pointermove", ev => {
     if (moveQueued) { moveQueued = ev; return; }
     moveQueued = ev;
     requestAnimationFrame(() => {
+      if (disposed) return;
       const e = moveQueued; moveQueued = null;
       const p = pick(e);
+      canvas.style.cursor = e.buttons ? "grabbing" : p ? "pointer" : "grab";
       const h = p && p.type === "neuron" ? { layer: p.layer, n: p.n } : null;
       if (JSON.stringify(h) !== JSON.stringify(hovered)) { hovered = h; refreshHighlights(); }
       const hh = p && p.type === "head" ? { layer: p.layer, head: p.head } : null;
@@ -428,9 +444,10 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       cb.onHover(p, e.clientX, e.clientY);
     });
   });
-  canvas.addEventListener("pointerleave", () => { hovered = null; refreshHighlights(); if (headHover) { headHover = null; paintHeads(); render(); } cb.onHover(null); });
-  canvas.addEventListener("pointerdown", ev => { downAt = [ev.clientX, ev.clientY]; });
-  canvas.addEventListener("pointerup", ev => {
+  listen("pointerleave", () => { hovered = null; refreshHighlights(); if (headHover) { headHover = null; paintHeads(); render(); } cb.onHover(null); });
+  listen("pointerdown", ev => { downAt = [ev.clientX, ev.clientY]; canvas.style.cursor = "grabbing"; });
+  listen("pointerup", ev => {
+    canvas.style.cursor = "grab";
     if (!downAt || Math.hypot(ev.clientX - downAt[0], ev.clientY - downAt[1]) > 4) return;
     const p = pick(ev);
     if (p && p.type === "neuron") cb.onPick(p.layer, p.n);
@@ -479,7 +496,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     dataOutline.visible = true;
     // continuous in zoom: eased on log-distance from the overview (no fade) to a sheet filling the view (full fade)
     const dist = camera.position.distanceTo(controls.target);
-    const far = Math.log(homeDist * 0.7), near = Math.log(homeDist * 0.07);
+    const far = Math.log(shadingDist * 0.7), near = Math.log(shadingDist * 0.07);
     const amt = THREE.MathUtils.smoothstep(THREE.MathUtils.clamp((far - Math.log(dist)) / (far - near), 0, 1), 0, 1);
     // the focus is the layer whose sheet centre lands closest to the middle of the view on screen
     const tv = controls.target.clone().project(camera), pv = new THREE.Vector3();
@@ -507,17 +524,16 @@ export function createMap(canvas, labelsDiv, arch, cb) {
 
   let flight = 0;
   controls.addEventListener("start", () => { flight++; });
-  function flyTo(target, dist) {
+  function flyTo(target, dist, direction = null) {
     const mine = ++flight, duration = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 450;
     const from = controls.target.clone(), to = target.clone();
-    const dir = camera.position.clone().sub(controls.target), d0 = dir.length();
-    dir.normalize();
+    const offset = camera.position.clone().sub(controls.target);
     const t0 = performance.now();
     (function step(t) {
       if (mine !== flight) return;
       const k = duration ? Math.min(1, (t - t0) / duration) : 1, e = k * k * (3 - 2 * k);
       controls.target.lerpVectors(from, to, e);
-      camera.position.copy(controls.target).addScaledVector(dir, d0 + (dist - d0) * e);
+      camera.position.copy(flightPosition(controls.target, offset, dist, e, direction));
       controls.update(); render();
       if (k < 1) requestAnimationFrame(step);
     })(t0);
@@ -542,6 +558,24 @@ export function createMap(canvas, labelsDiv, arch, cb) {
 
   return {
     neuronPos,
+    resetBuildProgress() {
+      for (let i = 0; i < L * N; i++) PAL.idle.toArray(col, i * 3);
+      geo.attributes.color.needsUpdate = true;
+      render();
+    },
+    // Build observer colours are independent of scientific activation/steering scores.
+    /** @param {number[]} counts @param {{layer: number, start: number, end: number} | null} active */
+    setBuildProgress(counts, active = null) {
+      // Low intensities preserve colour when thousands of additive points overlap in the overview.
+      const saved = new THREE.Color(0.003, 0.025, 0.035), working = new THREE.Color(0.07, 0.035, 0.003);
+      const pending = new THREE.Color(0.001, 0.002, 0.003);
+      for (let l = 0; l < L; l++) for (let n = 0; n < N; n++) {
+        const current = active && active.layer === l && n >= active.start && n < active.end;
+        (current ? working : n < (counts[l] || 0) ? saved : pending).toArray(col, (l * N + n) * 3);
+      }
+      geo.attributes.color.needsUpdate = true;
+      render();
+    },
     // heads lit by level (0..1 per head, per layer; null clears), and the selected head
     setHeadLevels(levels) { headLevels = levels; paintHeads(); render(); },
     selectHead(layer, head) {
@@ -632,7 +666,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     // fly close to one neuron, keeping the current viewing direction
     flyToNeuron(layer, n, closeness = 0.22) { flyTo(neuronPos(layer, n), homeDist * closeness); },
     get layerMode() { return layerMode; },
-    home() { flyTo(home.target, homeDist); },
+    home() { flyTo(home.target, homeDist, home.dir); },
     setMarks(marks) {
       lastMarks = marks;
       const p = [], c = [], up = new THREE.Color(1.0, 0.71, 0.28), down = new THREE.Color(1.0, 0.31, 0.6);
@@ -648,5 +682,18 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     hover(layer, n) { hovered = layer == null ? null : { layer, n }; refreshHighlights(); },
     debug() { const tv = controls.target.clone().project(camera); return { tgtScreenX: +((tv.x + 1) / 2).toFixed(3), cam: camera.position.toArray().map(v => +v.toFixed(2)), tgt: controls.target.toArray().map(v => +v.toFixed(2)), selected, hovered, n: connections.length, hover: hoverCon ? hoverCon.list.length : 0, dist: curDist(), homeDist, w: canvas.clientWidth, h: canvas.clientHeight, insets }; },
     render,
+    dispose() {
+      disposed = true; flight++; lifetime.abort(); resizeObserver.disconnect(); controls.dispose();
+      const resources = new Set();
+      scene.traverse(object => {
+        if (object.geometry) resources.add(object.geometry);
+        for (const material of object.material ? (Array.isArray(object.material) ? object.material : [object.material]) : []) {
+          resources.add(material);
+          for (const value of Object.values(material)) if (value?.isTexture) resources.add(value);
+        }
+      });
+      for (const resource of resources) resource.dispose();
+      renderer.dispose(); labelsDiv.replaceChildren();
+    },
   };
 }

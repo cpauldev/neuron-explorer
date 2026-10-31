@@ -8,6 +8,13 @@ import sys
 import urllib.parse
 import urllib.request
 import urllib.error
+from research_report import REPORT_TOOL, validate_findings
+
+# MCP stdio is UTF-8 even when Windows launches Python with a legacy code page.
+# Findings and research prompts can contain multilingual tokens in the request.
+for stream in (sys.stdin, sys.stdout):
+    if hasattr(stream, 'reconfigure'):
+        stream.reconfigure(encoding='utf-8')
 
 URL = os.environ.get("EXPLORER_URL", "http://127.0.0.1:8791")
 CHAT = os.environ.get("EXPLORER_CHAT", "")
@@ -246,6 +253,7 @@ TOOLS = [
          "required": ["layer", "n"]}}}, "required": ["neurons"]}},
 ]
 
+TOOLS.append(REPORT_TOOL)
 
 def get(path, **q):
     with urllib.request.urlopen(f"{URL}{path}?{urllib.parse.urlencode(q)}", timeout=60) as r:
@@ -265,6 +273,8 @@ def post(path, body, timeout=60):
 
 
 def call(name, a):
+    if name == "present_findings":
+        return validate_findings(a, get("/api/agent/overview")["arch"])
     if name in UI_TOOLS:
         timeout = a.get("timeout_seconds", 300) if name == "submit_chat_prompt" else 120 if name == "select_head" else 20
         if type(timeout) is not int or not 1 <= timeout <= 900:

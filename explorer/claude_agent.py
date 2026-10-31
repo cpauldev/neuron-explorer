@@ -158,8 +158,9 @@ class ClaudeClient:
                      '--mcp-config', json.dumps(mcp), '--strict-mcp-config', '--tools', '',
                      '--allowedTools', 'mcp__explorer', '--setting-sources', '',
                      '--settings', json.dumps({'enabledPlugins': {}})]
-        if os.environ.get('EXPLORER_CLAUDE_MODEL'):
-            self.args += ['--model', os.environ['EXPLORER_CLAUDE_MODEL']]
+        model = getattr(self, 'model', None) or os.environ.get('EXPLORER_CLAUDE_MODEL') or 'default'
+        if model:
+            self.args += ['--model', model]
         return self.thread
 
     async def call(self, method, params):

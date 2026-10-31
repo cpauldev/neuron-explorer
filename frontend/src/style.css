@@ -1,0 +1,556 @@
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+@import "tailwindcss/preflight.css" layer(base);
+@import "../../explorer/static/style.css" layer(base);
+@import "tw-animate-css";
+@import "tw-shimmer";
+@custom-variant dark (&:where(.dark, .dark *));
+/* Base UI exposes orientation through data-orientation; keep registry utilities compatible. */
+@custom-variant data-horizontal (&:where([data-horizontal], [data-orientation="horizontal"]));
+@custom-variant data-vertical (&:where([data-vertical], [data-orientation="vertical"]));
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    overflow: hidden;
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+  }
+}
+/* Standard shadcn neutral dark tokens; component utilities own the styling. */
+:root {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --radius: 0.625rem;
+}
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+.assistant-queue [data-slot="message-queue"] {
+  max-width: none;
+}
+.research-terminal,
+.research-tool {
+  margin: 10px 0;
+  max-width: 100%;
+}
+#root {
+  height: 100%;
+}
+.app-shell {
+  height: 100dvh;
+  min-height: 0;
+  flex-direction: column;
+}
+.app-toolbar {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.65rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--background);
+}
+.app-identity {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  min-width: 0;
+}
+.unit-navigation {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  width: 17rem;
+  margin-left: auto;
+}
+.unit-error {
+  position: absolute;
+  top: calc(100% + 0.5rem);
+  left: 0;
+  z-index: 60;
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--popover);
+  box-shadow: 0 4px 16px #0003;
+}
+.workspace-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.app-shell > main {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+/* Pane chrome shares one fixed baseline; controls keep their default variants. */
+.workspace-panel-header,
+.canvas-toolbar {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 0.5rem;
+  height: 3rem;
+  padding: 0 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.workspace-notice,
+.assistant-status {
+  position: absolute;
+  z-index: 40;
+  bottom: 0.75rem;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 2rem);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 0.5rem 0.75rem;
+  background: var(--popover);
+  font-size: 0.75rem;
+}
+.assistant-status {
+  bottom: 3.5rem;
+}
+.model-workspace {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  overflow: hidden;
+  container-type: inline-size;
+}
+.canvas-scene {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+@container (max-width: 480px) {
+  .canvas-display-label {
+    display: none;
+  }
+}
+.canvas-caption {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2rem;
+  padding: 0.3rem 0.75rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted-foreground);
+  font-size: 0.7rem;
+}
+.workspace-sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--background);
+}
+.tool-content {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.tool-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.tool-pane > form,
+.tool-pane > .border-b {
+  flex-shrink: 0;
+}
+.results-region {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 8rem;
+}
+.inspector-content {
+  min-width: 0;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 1rem;
+}
+.turn .cols {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+}
+.rows li {
+  display: block;
+  padding: 0;
+}
+.rows li.head {
+  padding: 0.75rem 1rem;
+  font-size: 0.75rem;
+  color: var(--muted-foreground);
+}
+.rows li.sel {
+  background: var(--muted);
+}
+.rows .result-row {
+  display: grid;
+  grid-template-columns: 52px 40px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 0.5rem;
+  width: 100%;
+  height: auto;
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
+.rows li.res .result-row {
+  grid-template-columns: 88px 40px minmax(0, 1fr);
+}
+.lrow {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+.lrow .sgn {
+  flex-shrink: 0;
+  width: 1em;
+  font-family: var(--mono);
+}
+.lrow .sgn.up,
+.pole.up {
+  color: var(--up);
+}
+.lrow .sgn.down,
+.pole.down {
+  color: var(--down);
+}
+.cache-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+#c-reads {
+  display: block;
+}
+/* Inactive Base UI panels stay mounted without participating in layout or focus. */
+[hidden]:not([hidden="until-found"]) {
+  display: none !important;
+}
+@media (max-width: 767px) {
+  .app-toolbar {
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+  }
+  .app-identity {
+    flex: 1;
+  }
+  .app-identity p {
+    max-width: 9rem;
+  }
+  .workspace-actions {
+    margin-left: auto;
+  }
+  .unit-navigation {
+    order: 1;
+    width: 100%;
+  }
+}
+
+.cache-panel {
+  width: 100%;
+  overflow-y: auto;
+}
+.cache-panel > * {
+  flex-shrink: 0;
+}
+.cache-panel .wsum {
+  padding: 0.75rem 1rem;
+}
+.cache-panel select {
+  width: 100%;
+}
+.cache-panel p {
+  line-height: 1.6;
+  margin: 8px 0;
+}
+.build-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.build-state {
+  margin-top: 6px;
+  font-size: 11px;
+}
+.build-stages {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.build-stages li {
+  border-bottom: 1px solid var(--raise);
+}
+.build-step-icon {
+  width: 12px;
+  flex: none;
+  text-align: center;
+}
+.build-stages [aria-current="step"] .build-step-icon {
+  color: var(--up);
+}
+.build-step-name {
+  min-width: 0;
+}
+.build-stages small {
+  margin-left: auto;
+  flex: none;
+  font: 10px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.build-step-progress {
+  padding: 0 12px 10px 32px;
+}
+.build-step-meta {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  color: var(--dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.build-legend {
+  display: flex;
+  gap: 12px;
+}
+.build-legend span:first-child {
+  color: #30a6bb;
+}
+.build-legend span:last-child {
+  color: #ffb547;
+}
+.startup-state {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+  color: var(--dim);
+}
+.startup-state h1 {
+  font-size: 20px;
+  color: var(--ink);
+  font-weight: 500;
+}
+.assistant-thread {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+.assistant-notice {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--dim);
+  border-top: 1px solid var(--raise);
+}
+.tool-neuron-card,
+.tool-heatmap,
+.tool-table-wrap {
+  padding: 10px;
+}
+.tool-neuron-card strong {
+  display: block;
+  margin-bottom: 8px;
+}
+.tool-table-wrap {
+  overflow-x: auto;
+}
+.tool-heatmap {
+  white-space: pre-wrap;
+  font: 12px/1.9 var(--mono);
+}
+.tool-heatmap span {
+  padding: 2px 0;
+}
+#tip {
+  position: fixed;
+  max-width: min(520px, calc(100vw - 1rem));
+}
+.tool-comparison {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  padding: 10px;
+  font-size: 12px;
+}
+.tool-comparison .col {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.tool-comparison .col.up .lab {
+  color: var(--up);
+}
+.tool-comparison .col.down .lab {
+  color: var(--down);
+}
+#c-reads {
+  white-space: pre-wrap;
+  line-height: 1.7;
+}
+@media (max-width: 760px) {
+  .tool-comparison {
+    grid-template-columns: 1fr;
+  }
+}
+
+@custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));
+
+@custom-variant data-closed (&:where([data-state="closed"], [data-closed]:not([data-closed="false"])));
+
+@theme inline {
+  @keyframes collapsible-down {
+    from {
+      height: 0;
+    }
+    to {
+      height: var(
+        --radix-collapsible-content-height,
+        var(--collapsible-panel-height, auto)
+      );
+    }
+  }
+  @keyframes collapsible-up {
+    from {
+      height: var(
+        --radix-collapsible-content-height,
+        var(--collapsible-panel-height, auto)
+      );
+    }
+    to {
+      height: 0;
+    }
+  }
+}
+/* Official components keep their own utilities; only the inspector boundary is sized here. */
+@layer base {
+  .assistant-surface,
+  [data-assistant-ui] {
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    line-height: 1.5;
+    color: var(--foreground);
+  }
+}
+.assistant-surface {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--background);
+}
+.assistant-surface.on {
+  display: flex;
+  flex-direction: column;
+}
+.assistant-surface > header {
+  flex-shrink: 0;
+}
+.assistant-surface .aui-thread-root {
+  min-height: 0;
+}
+.assistant-surface [data-slot="aui_thread-viewport"] {
+  min-height: 0;
+  overscroll-behavior: contain;
+}
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--color-border);
+  }
+}
+
+.assistant-surface .tool-comparison {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+}
+
+/* Explicit app cursor preference, shared by generated controls and custom actions. */
+button:not(:disabled):not([aria-disabled="true"]),
+[role="button"]:not([aria-disabled="true"]),
+[role="option"]:not([data-disabled]),
+a[href],
+summary,
+label:has(input[type="radio"], input[type="checkbox"]) {
+  cursor: pointer;
+}
+
+@container (max-width: 380px) {
+  .canvas-toolbar {
+    gap: 0.25rem;
+    padding-inline: 0.5rem;
+  }
+}

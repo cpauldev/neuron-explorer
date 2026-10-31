@@ -28,6 +28,7 @@ class FakeCodex:
     async def start(self): pass
     async def open_thread(self, root, chat, port, instructions, thread=None):
         self.calls.append(('resume' if thread else 'start', thread))
+        self.calls.append(('model', getattr(self, 'model', None)))
         return thread or 'owned-thread'
     async def call(self, method, params):
         self.calls.append((method, params))
@@ -47,6 +48,7 @@ class FakeClaude(FakeCodex):
 
     async def open_thread(self, root, chat, port, instructions, thread=None):
         self.calls.append(('resume' if thread else 'start', thread))
+        self.calls.append(('model', getattr(self, 'model', None)))
         return thread or 'claude-thread'
 
     async def rewind(self, message): self.calls.append(('claude/rewind', message))
@@ -85,10 +87,12 @@ class RouteTests(unittest.TestCase):
             def __init__(self, cwd, queue):
                 super().__init__(cwd, queue)
                 self.alive, self.hold = True, False
+                self.held_started = asyncio.Event()
                 self.created.append(self)
             async def close(self): self.alive = False
             async def call(self, method, params):
                 if self.hold and method == 'turn/start':
+                    self.held_started.set()
                     return {'turn': {'id': 'held-turn'}}
                 return await super().call(method, params)
 
@@ -111,7 +115,7 @@ class RouteTests(unittest.TestCase):
                 self.assertEqual(server.agent_pool.clients[cid]['thread'], 'owned-thread')
                 changed.hold = True
                 await server.agent_send(JsonRequest(provider=provider, chat=cid, access='home', message='hold'))
-                await asyncio.sleep(0)
+                await asyncio.wait_for(changed.held_started.wait(), 2)
                 pending = asyncio.get_running_loop().create_future()
                 server._chats[cid]['approvals']['pending'] = pending
                 await server.agent_interrupt(JsonRequest(chat=cid))
@@ -228,13 +232,16 @@ class RouteTests(unittest.TestCase):
             asyncio.run(run())
 
     def test_background_stop_declines_approvals_and_closes_provider(self):
+        ready = asyncio.Event()
         class WaitingClaude(FakeClaude):
-            async def call(self, method, params): return {'turn': {'id': 'turn1'}}
+            async def call(self, method, params):
+                ready.set()
+                return {'turn': {'id': 'turn1'}}
 
         async def run():
             started = await server.agent_send(JsonRequest({'provider': 'claude', 'message': 'work'}))
             cid = started['chat']
-            await asyncio.sleep(0)
+            await asyncio.wait_for(ready.wait(), 2)
             c = server._chats[cid]
             pending = asyncio.get_running_loop().create_future()
             c['approvals']['pending'] = pending
@@ -293,6 +300,17 @@ class RouteTests(unittest.TestCase):
         r = self.client.post('/api/agent/chat', json={'provider': 'codex', 'message': 'hello', **body})
         self.assertEqual(r.status_code, 200, r.text)
         return [json.loads(line) for line in r.text.splitlines()]
+
+    def test_selected_model_is_applied_and_restored_with_conversation(self):
+        events = self.chat(model='test-model')
+        cid = events[0]['chat']
+        self.assertIn(('model', 'test-model'), FakeCodex.calls)
+        history = self.client.get('/api/agent/history', params={'chat': cid}).json()
+        self.assertEqual(history['model'], 'test-model')
+        self.chat(chat=cid)
+        self.assertEqual([value for name, value in FakeCodex.calls if name == 'model'], ['test-model', 'test-model'])
+        result = self.client.post('/api/agent/chat', json={'provider': 'codex', 'message': 'bad model', 'model': '--unsafe-option'})
+        self.assertEqual(result.status_code, 400)
 
     def test_stream_resume_and_revert_owned_history(self):
         events = self.chat()

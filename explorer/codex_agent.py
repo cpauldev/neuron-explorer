@@ -200,7 +200,14 @@ class CodexClient:
         params = {'cwd': self.cwd, 'approvalPolicy': 'never', 'sandbox': 'read-only',
                   'developerInstructions': instructions,
                   'config': thread_config(effective, root, chat, port)}
-        model = os.environ.get('EXPLORER_CODEX_MODEL')
+        model = getattr(self, 'model', None) or os.environ.get('EXPLORER_CODEX_MODEL') or effective.get('model')
+        if not model and thread:
+            # Resuming without an override would retain the prior thread model.
+            # Resolve CLI default explicitly when returning from a chosen model.
+            choices = await self.call('model/list', {'includeHidden': False})
+            model = next((item.get('model') or item.get('id') for item in choices.get('data', []) if item.get('isDefault')), None)
+            if not model:
+                raise AgentError('Could not resolve the CLI default model. Select a specific model before continuing this conversation.')
         if model:
             params['model'] = model
         if thread:

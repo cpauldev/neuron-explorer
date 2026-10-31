@@ -1,7 +1,8 @@
-"""Interruption/replay tests use tiny synthetic weights, never a model download or GPU."""
+"""Cache recovery and model compatibility tests use synthetic weights, no downloads or GPU."""
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -15,9 +16,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "explorer"))
-from cache_job import Job, Paused, VERSION, launch, main, run, run_stages
+from cache_job import Job, Paused, VERSION, launch, main, read_status, request_pause, run, run_stages
 from cache_storage import atomic_json, atomic_write, job_lock
-from cache_builders import activations, connections, grid_cells, layout, lens, steer, load_part
+from cache_builders import activations, connections, grid_cells, layout, layout_cells, lens, steer, load_part
 from model_config import DEFAULT_MODEL, ROOT, Weights, data_paths, validate_config
 
 
@@ -108,6 +109,19 @@ class CacheTests(unittest.TestCase):
     def test_signed_steering_resume(self):
         self.resumed_equals_fresh("steer", lambda j: steer(j, self.fake_runtime(), self.cfg), "steer_index.npz")
 
+    def test_benchmark_steering_visits_selected_layers_and_chunks(self):
+        job, rt = self.job("samples"), self.fake_runtime()
+        def progress(stage, done, total, **kwargs):
+            if done == 4:
+                raise RuntimeError("sample complete")
+        job.progress = progress
+        with self.assertRaisesRegex(RuntimeError, "sample complete"):
+            steer(job, rt, self.cfg, layers=[0, 2], starts=[0, 8])
+        self.assertEqual(sorted(p.stem for p in (job.directory / 'parts/steer').glob('*.npz')),
+                         ['0-0', '0-8', '2-0', '2-8'])
+        self.assertFalse((job.cache / 'steer_index.npz').exists())
+        self.assertTrue(all(not l.mlp.down_proj._forward_pre_hooks for l in rt.lm.layers))
+
     def test_worker_runtime_receives_pinned_identity_and_cache(self):
         from cache_builders import build
         job = self.job("job")
@@ -142,6 +156,36 @@ class CacheTests(unittest.TestCase):
         rt.model = Model()
         self.assertEqual(list(rt.steer_multi([], [[], [], []], max_new=3)), [(None, None)])
         self.assertEqual(len(calls), 1)
+
+    def test_runtime_selects_text_only_and_multimodal_loaders(self):
+        import runtime
+        lm = types.SimpleNamespace(layers=[])
+        for text_only in (True, False):
+            config_dict = self.cfg if text_only else {"text_config": self.cfg}
+            config = types.SimpleNamespace(model_type="qwen3_5_text" if text_only else "qwen3_5",
+                                           to_dict=lambda: config_dict)
+            model = types.SimpleNamespace(model=lm if text_only else types.SimpleNamespace(language_model=lm))
+            model.to = lambda device: model
+            model.eval = lambda: model
+            rt = runtime.Runtime(str(self.root / "stats"), model="test/model", cache_dir=self.root / str(text_only))
+            try:
+                with (
+                    self.subTest(text_only=text_only),
+                    patch.dict(os.environ, {"EXPLORER_CACHE_WORKER": "1"}),
+                    patch.object(runtime, "NO_MODEL", False),
+                    patch.object(runtime.AutoConfig, "from_pretrained", return_value=config),
+                    patch.object(runtime.AutoTokenizer, "from_pretrained"),
+                    patch.object(runtime.Qwen3_5ForCausalLM, "from_pretrained", return_value=model) as causal,
+                    patch.object(runtime.Qwen3_5ForConditionalGeneration, "from_pretrained", return_value=model) as multimodal,
+                ):
+                    rt.ensure_loaded()
+                    self.assertIs(rt.lm, lm)
+                    self.assertEqual(causal.call_count, int(text_only))
+                    self.assertEqual(multimodal.call_count, int(not text_only))
+                    loader = causal if text_only else multimodal
+                    self.assertIs(loader.call_args.kwargs["config"], config)
+            finally:
+                rt._db.close()
 
     def test_reads_layout_resume(self):
         weights = types.SimpleNamespace(tensor=lambda name: self.weights[name])
@@ -189,6 +233,36 @@ class CacheTests(unittest.TestCase):
                 with job_lock(path): pass
         with job_lock(path): pass
 
+    def test_status_observes_supervisor_and_stage_without_rewriting_state(self):
+        job = self.job("status")
+        saved = {"status": "running", "stage": "lens"}
+        atomic_json(job.directory / "status.json", saved)
+        state, running = read_status(job.directory)
+        self.assertFalse(running)
+        self.assertEqual(state["status"], "interrupted")
+        for name in ("worker.lock", "stage.lock"):
+            with self.subTest(lock=name), job_lock(job.directory / name):
+                state, running = read_status(job.directory)
+                self.assertTrue(running)
+                self.assertEqual(state, saved)
+        self.assertEqual(json.loads((job.directory / "status.json").read_text()), saved)
+
+    def test_compute_contention_preserves_pause_and_does_not_spawn(self):
+        job = self.job("busy")
+        request_pause(job.directory)
+        with patch("cache_job.ROOT", self.root), job_lock(self.root / "explorer/cache/.device.lock"), \
+             patch("cache_job.subprocess.Popen") as spawn:
+            with self.assertRaises(RuntimeError):
+                launch(job.directory, True)
+        spawn.assert_not_called()
+        self.assertTrue((job.directory / "pause").exists())
+
+    def test_pause_rejects_missing_job_without_creating_files(self):
+        missing = self.root / "missing"
+        with self.assertRaises(FileNotFoundError):
+            request_pause(missing)
+        self.assertFalse(missing.exists())
+
     def test_paths_and_compatibility(self):
         self.assertEqual(data_paths(DEFAULT_MODEL, None)["cache"], ROOT / "explorer/cache")
         self.assertNotEqual(data_paths("Qwen/other", "a"), data_paths("Qwen/other", "b"))
@@ -204,6 +278,80 @@ class CacheTests(unittest.TestCase):
         torch.testing.assert_close(Weights(self.root).tensor(name), self.weights[name])
         atomic_json(self.root / "model.safetensors.index.json", {"weight_map": {k: "model.safetensors" for k in self.weights}})
         torch.testing.assert_close(Weights(self.root).tensor(name), self.weights[name])
+
+    def test_text_only_weights_use_the_same_builders(self):
+        from safetensors.torch import save_file
+        weights = {k.replace("model.language_model.", "model."): v for k, v in self.weights.items()}
+        save_file(weights, self.root / "model.safetensors")
+        reader = Weights(self.root)
+        for name, value in self.weights.items():
+            torch.testing.assert_close(reader.tensor(name), value)
+        with patch("torch.cuda.is_available", return_value=False), patch("torch.backends.mps.is_available", return_value=False):
+            with contextlib.redirect_stdout(io.StringIO()):
+                connections(self.job("text"), self.cfg, reader)
+
+    def test_layout_excludes_zero_padding_without_losing_neurons(self):
+        weights = types.SimpleNamespace(tensor=lambda name: self.weights[name].clone())
+        inactive = np.ones(25, dtype=bool)
+        inactive[[1, 5, 9, 17]] = False
+        for l in range(3):
+            self.weights[f"model.language_model.layers.{l}.mlp.down_proj.weight"][:, inactive] = 0
+        seen = []
+        def embed(z):
+            seen.append(len(z))
+            return z[:, :2]
+        umap = types.SimpleNamespace(UMAP=lambda **kwargs: types.SimpleNamespace(fit_transform=embed))
+        with patch.dict(sys.modules, {"umap": umap}):
+            cells = layout_cells(weights, 0, "writes")
+            np.testing.assert_array_equal(np.sort(cells), np.arange(25))
+            np.testing.assert_array_equal(cells[inactive], np.arange(4, 25))
+            self.weights['model.language_model.layers.0.mlp.down_proj.weight'].zero_()
+            np.testing.assert_array_equal(layout_cells(weights, 0, "writes"), np.arange(25))
+        self.assertEqual(seen, [4])
+
+    def test_layout_preserves_directions_of_large_compiled_weights(self):
+        seen = []
+        def embed(z):
+            self.assertTrue(np.isfinite(z).all())
+            self.assertGreater(float(np.linalg.norm(z)), 0)
+            seen.append(z)
+            return z[:, :2]
+        umap = types.SimpleNamespace(UMAP=lambda **kwargs: types.SimpleNamespace(fit_transform=embed))
+        with patch.dict(sys.modules, {"umap": umap}), np.errstate(over="raise", invalid="raise"):
+            for scale in (1, 1e25):
+                weights = types.SimpleNamespace(tensor=lambda name: self.weights[name] * scale)
+                cells = layout_cells(weights, 0, "reads")
+                np.testing.assert_array_equal(np.sort(cells), np.arange(25))
+        # PCA signs/rotations may differ; the pairwise geometry must not.
+        np.testing.assert_allclose(seen[0] @ seen[0].T, seen[1] @ seen[1].T, rtol=1e-5, atol=1e-6)
+
+    def test_zero_write_columns_have_finite_steering_cache(self):
+        rt = self.fake_runtime()
+        for layer in rt.lm.layers:
+            layer.mlp.down_proj.weight.data[:, :4] = 0
+        job = self.job("zero")
+        with contextlib.redirect_stdout(io.StringIO()):
+            steer(job, rt, self.cfg)
+        arrays = load_part(job.cache / "steer_index.npz")
+        for key in ("up_kl", "down_kl"):
+            self.assertTrue(np.isfinite(arrays[key]).all())
+            np.testing.assert_allclose(arrays[key][:, :4], 0, atol=1e-6)
+
+    def test_zero_write_column_live_add_is_explicit(self):
+        from runtime import Runtime
+        rt = Runtime.__new__(Runtime)
+        rt.dev = "cpu"
+        rt.down_col = lambda *args: torch.zeros(8)
+        rt.layer_resid_p50 = lambda layer: 1.0
+        with self.assertRaisesRegex(ValueError, "zero write vector"):
+            rt._push_entry(0, 0, .8, "add", (1, 0, -1))
+        self.assertTrue(torch.isfinite(rt._push_entry(0, 0, 0, "add", (1, 0, -1))[3]).all())
+        self.assertTrue(torch.isfinite(rt._push_entry(0, 0, .8, "mul", (1, 0, -1))[3]).all())
+
+    def test_compiled_weight_norms_do_not_overflow(self):
+        from runtime import _safe_norm
+        for vector in (torch.zeros(8), torch.ones(8), torch.full((8,), 5e33)):
+            np.testing.assert_allclose(_safe_norm(vector), float(vector.double().norm()), rtol=1e-6)
 
     def test_stage_marker_is_written_only_after_success(self):
         job = self.job("job")

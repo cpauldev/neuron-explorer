@@ -64,8 +64,12 @@ class Weights:
             from safetensors import safe_open
             with safe_open(self.root / "model.safetensors", framework="pt") as f:
                 self.index = dict.fromkeys(f.keys(), "model.safetensors")
+        # Text-only Qwen checkpoints omit the multimodal language_model wrapper.
+        self.layer_prefix = ("model.language_model.layers." if any(
+            name.startswith("model.language_model.layers.") for name in self.index) else "model.layers.")
 
     def tensor(self, name):
         from safetensors import safe_open
+        name = name.replace("model.language_model.layers.", self.layer_prefix, 1)
         with safe_open(self.root / self.index[name], framework="pt") as f:
             return f.get_tensor(name)

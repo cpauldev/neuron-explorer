@@ -14,10 +14,11 @@ import threading
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+from transformers import AutoConfig, AutoTokenizer, Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb, l2norm
 
-from model_config import MODEL, REVISION, data_paths
+from model_config import MODEL, REVISION, data_paths, validate_config
+from token_display import token_label
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
@@ -28,6 +29,15 @@ REFERENCE_TEXT = (
 
 
 CACHE = str(data_paths()["cache"])
+
+
+def _safe_norm(vector):
+    """Compiled weight vectors can overflow float32 when squared."""
+    vector = vector.detach()
+    value = vector.norm()
+    if not torch.isfinite(value):
+        value = vector.to(device="cpu", dtype=torch.float64).norm()
+    return float(value)
 
 
 def _locked(f):
@@ -88,9 +98,15 @@ class Runtime:
             try:
                 self.status = "loading"
                 dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+                config = AutoConfig.from_pretrained(self.model_id, revision=self.revision)
+                validate_config(config.to_dict())
                 self.tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
-                m = Qwen3_5ForConditionalGeneration.from_pretrained(self.model_id, revision=self.revision, dtype=torch.bfloat16).to(dev).eval()
-                self.dev, self.model, self.lm = dev, m, m.model.language_model
+                text_only = config.model_type == "qwen3_5_text"
+                model_class = Qwen3_5ForCausalLM if text_only else Qwen3_5ForConditionalGeneration
+                m = model_class.from_pretrained(self.model_id, revision=self.revision, config=config,
+                                                dtype=torch.bfloat16).to(dev).eval()
+                self.dev, self.model = dev, m
+                self.lm = m.model if text_only else m.model.language_model
                 for i, layer in enumerate(self.lm.layers):
                     layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
                     layer.register_forward_hook(self._resid_hook(i))
@@ -469,14 +485,15 @@ class Runtime:
             gr, ur = me.mlp.gate_proj.weight[n].float().to(QO.device) * w, me.mlp.up_proj.weight[n].float().to(QO.device) * w
             pr = (QV.T @ d).cpu()  # projections of the down column on every head's read basis
             pg, pu = (QO.T @ gr).cpu(), (QO.T @ ur).cpu()
-        dn, gn, un, hid = float(d.norm()), float(gr.norm()), float(ur.norm()), d.shape[0]
+        dn, gn, un = (max(_safe_norm(v), 1e-12) for v in (d, gr, ur))
+        hid = d.shape[0]
         reads, writes = [], []
         for l, h, a, b in spans:
             base = ((b - a) / hid) ** 0.5  # a random direction's expected share of a (b - a)-dim space
             if l > layer:
-                reads.append((l, h, float(pr[a:b].norm()) / dn / base))
+                reads.append((l, h, _safe_norm(pr[a:b]) / dn / base))
             else:
-                writes.append((l, h, float(pg[a:b].norm()) / gn * float(pu[a:b].norm()) / un / base ** 2))
+                writes.append((l, h, _safe_norm(pg[a:b]) / gn * _safe_norm(pu[a:b]) / un / base ** 2))
         out = {}
         for side in (reads, writes):
             if len(side) < 2:
@@ -533,11 +550,11 @@ class Runtime:
         zs = self.neuron_heads(layer, n)
         with self.lock, torch.inference_mode():
             d = self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
-            dn = float(d.norm())
+            dn = max(_safe_norm(d), 1e-12)
             proj = {r: (B.T @ d.to(device=B.device, dtype=B.dtype)).float().cpu() for r, (B, _) in qk.items()}
         roles = {}
         for r, (_, spans) in qk.items():  # shares relative to a random direction's, as in neuron_heads
-            side = [(l, hs, float(proj[r][a:b].norm()) / dn / ((b - a) / d.shape[0]) ** 0.5) for l, hs, a, b in spans if l > layer]
+            side = [(l, hs, _safe_norm(proj[r][a:b]) / dn / ((b - a) / d.shape[0]) ** 0.5) for l, hs, a, b in spans if l > layer]
             if len(side) < 2:
                 roles[r] = []
                 continue
@@ -688,7 +705,10 @@ class Runtime:
         if mode == "mul":
             vals = [dose if r > 0 else 1.0 if r == 0 else -dose for r in rows]
         else:
-            unit = self.layer_resid_p50(layer) / float(self.down_col(layer, n).norm())
+            norm = _safe_norm(self.down_col(layer, n))
+            if norm == 0 and dose != 0:
+                raise ValueError("This neuron has a zero write vector; use multiply mode or select another neuron.")
+            unit = self.layer_resid_p50(layer) / norm if norm else 0.0
             vals = [r * dose * unit for r in rows]
         return (layer, n, mode, torch.tensor(vals, device=self.dev))
 
@@ -777,7 +797,7 @@ class Runtime:
     def lens(self, layer, n, k=16):
         idx = self.lens_index()
         if idx is not None and k <= idx["up"].shape[-1]:
-            v = self.vocab_strings()
+            v = self.vocab_labels()
             out = {"up": [v[t] for t in idx["up"][layer, n, :k]], "down": [v[t] for t in idx["down"][layer, n, :k]]}
             st = self.steer_index()
             if st is not None:
@@ -793,7 +813,7 @@ class Runtime:
             for sign, name in ((1, "up"), (-1, "down")):
                 logits = self.model.lm_head(self.lm.norm(sign * d))[0, 0].float()
                 top = logits.topk(k).indices.tolist()
-                out[name] = [self.tok.decode([t]) for t in top]
+                out[name] = [self.vocab_labels()[t] for t in top]
         self._lens_cache[(layer, n, k)] = out
         return out
 
@@ -818,7 +838,7 @@ class Runtime:
                              for i in range(k) if z[i] > -1e4]
             idx = self.steer_index() or self.lens_index()  # linked neurons show their steer lens when there is one
             if lens_k and idx is not None:
-                v = self.vocab_strings()
+                v = self.vocab_labels()
                 lg = self.lens_index()
                 for c in out["down"] + out["up"]:
                     c["lens"] = [v[t] for t in idx["up"][c["layer"], c["n"], :lens_k]]
@@ -827,7 +847,7 @@ class Runtime:
                         c["logit"] = [v[t] for t in lg["up"][c["layer"], c["n"], :lens_k]]
                         c["logit_neg"] = [v[t] for t in lg["down"][c["layer"], c["n"], :lens_k]]
             return out
-        dkey = f"{layer}:{n}:{k}:{lens_k}"
+        dkey = f"display-v1:{layer}:{n}:{k}:{lens_k}"
         with self._db_lock:
             row = self._db.execute("SELECT val FROM con WHERE key = ?", (dkey,)).fetchone()
         if row:
@@ -865,7 +885,7 @@ class Runtime:
             every = out["down"] + out["up"]
             idx = self.steer_index() or self.lens_index()
             if every and lens_k and idx is not None and lens_k <= idx["up"].shape[-1]:
-                v = self.vocab_strings()
+                v = self.vocab_labels()
                 for c in every:
                     c["lens"] = [v[t] for t in idx["up"][c["layer"], c["n"], :lens_k]]
                     c["lens_neg"] = [v[t] for t in idx["down"][c["layer"], c["n"], :lens_k]]
@@ -874,8 +894,8 @@ class Runtime:
                 logits = self.model.lm_head(self.lm.norm(D[:, None]))[:, 0].float()
                 ids, ids_neg = logits.topk(lens_k).indices.tolist(), (-logits).topk(lens_k).indices.tolist()
                 for c, row, row_neg in zip(every, ids, ids_neg):
-                    c["lens"] = [self.tok.decode([t]) for t in row]
-                    c["lens_neg"] = [self.tok.decode([t]) for t in row_neg]
+                    c["lens"] = [self.vocab_labels()[t] for t in row]
+                    c["lens_neg"] = [self.vocab_labels()[t] for t in row_neg]
         if len(self._con_cache) > 2000:
             self._con_cache.clear()
         self._con_cache[key] = out
@@ -917,6 +937,29 @@ class Runtime:
                 from cache_storage import atomic_json
                 atomic_json(path, self._vocab)
         return self._vocab
+
+    def vocab_labels(self):
+        """Versioned display cache; raw vocabulary remains unchanged for search and analysis."""
+        if getattr(self, "_vocab_labels", None) is None:
+            path = os.path.join(self.cache, "vocab-display-v1.json")
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as source:
+                    self._vocab_labels = json.load(source)
+            else:
+                raw = self.vocab_strings()
+                labels = list(raw)
+                broken = [i for i, text in enumerate(raw) if "\ufffd" in text]
+                if broken:
+                    if self.tok is None:
+                        self.tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
+                    decoder = getattr(getattr(self.tok, "backend_tokenizer", None), "decoder", None)
+                    byte_level = bool(decoder and json.loads(decoder.__getstate__()).get("type") == "ByteLevel")
+                    for i in broken:
+                        labels[i] = token_label(raw[i], self.tok.convert_ids_to_tokens(i), i, byte_level)
+                from cache_storage import atomic_json
+                atomic_json(path, labels)
+                self._vocab_labels = labels
+        return self._vocab_labels
 
     # ---------- which neurons fire on a text ----------
     def all_activations(self, ids, skip_first=False):

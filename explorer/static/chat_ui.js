@@ -43,7 +43,7 @@ export function createChatUiController(handlers) {
         if (!["select", "head"].includes(action) && !before.selected_neuron && !before.selected_head) throw new Error("select a neuron first");
         if (action.startsWith("chat_") && before.selected_neuron?.kind !== "neuron") throw new Error("Chat requires a real neuron selection");
         if (action === "chat_submit") {
-          if (before.open_tab !== "chat") throw new Error("open the neuron Chat tab before submitting");
+          if (before.open_tab !== "chat") throw new Error("open the selected neuron's Experiment view before submitting");
           if (!before.chat.prompt.trim()) throw new Error("the visible Chat prompt is empty");
           submission = id;
           try {
@@ -89,6 +89,9 @@ export function connectUiBridge(browser, controller) {
     } catch { /* Server/disconnection errors are surfaced to the waiting tool. */ }
   };
   events.onerror = () => { for (const id of active) controller.cancel(id); };
-  addEventListener("pagehide", () => { for (const id of active) controller.cancel(id); events.close(); }, { once: true });
+  const close = events.close.bind(events);
+  const onPageHide = () => { for (const id of active) controller.cancel(id); events.close(); };
+  events.close = () => { removeEventListener("pagehide", onPageHide); close(); };
+  addEventListener("pagehide", onPageHide, { once: true });
   return events;
 }

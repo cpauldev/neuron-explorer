@@ -8,11 +8,15 @@ This guide covers implementation boundaries, testing and integration decisions.
 
 | Module | Responsibility |
 | --- | --- |
+| `explorer/token_display.py` | Lossless labels for isolated vocabulary tokens; display caches stay separate from raw analysis data. |
 | `explorer/runtime.py` | Local Qwen inference, interventions, weight analysis and attention reconstruction. |
 | `explorer/model_config.py` | Model identity, architecture checks, isolated paths and Safetensors access. |
 | `explorer/cache_job.py` | Job lifecycle, progress, resume policy and command-line controls. |
+| `explorer/cache_progress.py` | Optional desktop progress window using the same cache-job controls. |
+| `explorer/benchmark_cache.py` | Isolated all-stage comparisons using production builders and stratified samples. |
 | `explorer/cache_storage.py` | Atomic file replacement and OS-owned locks shared by inference and cache builders. |
 | `explorer/cache_builders.py` | Checkpointed scientific cache stages; existing output schemas. |
+| `explorer/build_monitor.py` | Model-free job snapshots, partial layouts and bounded connection previews for the live build view. |
 | `explorer/server.py` | HTTP endpoints, model integration and assistant turn orchestration. |
 | `explorer/agent_mcp.py` | Shared MCP schemas and routing for both providers. |
 | `explorer/agent_prompt.md`, `explorer/agent_methodology.md` | Assistant operating instructions and separate research methodology, combined when a turn starts. |
@@ -24,15 +28,24 @@ This guide covers implementation boundaries, testing and integration decisions.
 | `explorer/ui_bridge.py` | Server-side UI validation, browser ownership and acknowledgements. |
 | `explorer/static/chat_ui.js` | Browser-side command validation and dispatch to normal UI handlers. |
 | `explorer/static/assistant_stream.js` | Cursor-based reconnect, stream decoding and duplicate suppression. |
-| `explorer/static/app.js` | UI handlers, selection state and conversation presentation. |
+| `frontend/src/App.tsx`, `frontend/src/components/` | Typed React app shell, toolbar, analysis, inspector, examples and local experiments. |
+| `frontend/src/explorer.ts`, `frontend/src/types.ts` | Explorer state/contracts and actions; scientific requests, selection races, local inference and acknowledged UI commands. |
+| `frontend/src/assistant/` | assistant-ui runtime, structured journal conversion, provider/draft lifecycle and research tool renderers. |
+| `frontend/src/context.tsx`, `frontend/src/lib/store.ts` | Typed selective React store subscriptions and shared HTTP/storage/stream helpers. |
 | `explorer/static/map3d.js`, `explorer/static/scatter.js` | Visualization and interaction. |
+| `vite.config.mjs`, `frontend/index.html` | Vite entry and same-origin compiled assets in `explorer/static/dist/`. |
 
 The small assistant modules separate persistence, process control and permission boundaries. Keep provider
 details in the adapters and shared policy in the shared modules. UI validation deliberately runs on both sides
 of the browser boundary. Backend and frontend validation serve different trust boundaries; they are not
 interchangeable implementations to merge into one utility.
 
-The main remaining structural debt is the size of `server.py` and `app.js`. Future extraction should move a
+Cache storage stays independent of orchestration and model loading. The job module owns shared status,
+pause and launch controls used by the CLI, browser monitor and optional Tk desktop window. Scientific builders
+remain separate so monitoring never imports Torch. Model compatibility tests share the cache tests' small
+weight/runtime fixtures; they do not require another fixture module or real downloads.
+
+The main remaining structural debt is the size of `server.py`. Future extraction should move a
 complete responsibility with explicit dependencies, rather than adding generic helpers or mixing unrelated
 functions merely to reduce the number of files.
 
@@ -41,6 +54,8 @@ functions merely to reduce the number of files.
 Run from the configured environment with Node.js available:
 
 ```sh
+node --version                    # 22.12+
+npm ci
 python tests/run_checks.py
 uv lock --check
 ```
@@ -48,8 +63,9 @@ uv lock --check
 Install test dependencies with `uv sync --group dev`. If the environment has a custom CUDA PyTorch build,
 install the development dependencies without replacing it, then run checks with that environment's Python.
 
-The runner checks Python syntax, discovers Python tests, checks all frontend JavaScript syntax, and executes
-the JavaScript suites. It does not synchronize or replace an existing Python environment. Tests use temporary
+The runner checks Python syntax, discovers Python tests, checks the visualization/helper JavaScript syntax,
+executes the protocol suites, typechecks/builds the React app, and runs Vitest/React Testing Library tests. It does not
+synchronize or replace an existing Python environment. Tests use temporary
 files, fake provider processes and synthetic model inputs; no model downloads or provider logins are needed.
 
 - Provider tests cover transport, history ownership, rewind and cleanup. Shared helpers and route tests cover
@@ -60,14 +76,37 @@ files, fake provider processes and synthetic model inputs; no model downloads or
   synthetic tensors, without loading model weights.
 - `tests/test_cache_job.py` checks resumed results against uninterrupted builds for every core cache stage,
   atomic file replacement, compute locks, pinned model identity, launch validation and failure/pause reporting.
-- Frontend tests cover provider/draft state, UI handlers, Chat commands and reconnect decoding. CommonJS suites
-  use Node's VM for existing app handlers; ES module suites import the standalone browser modules directly.
-  The handler tests use source boundaries and a small DOM fixture, so they complement actual browser checks.
+- Frontend tests cover provider/draft state, attachments, stale approvals, journal conversion, selection races,
+  React controls, local streaming, experiment commands and reconnect decoding. Vitest exercises the stores and real
+  React components, including assistant-ui. ES module protocol suites also run directly under Node.
 - `tests/live_chat_smoke.py --browser-id <id>` is optional. It uses a real server, browser and model, appends
-  visible Chat turns, and should target a separate test tab.
+  visible experiment turns, and should target a separate test tab.
 
 Live Claude authentication and populated sweep/embedding views need separate verification when available.
 The current Starlette test client emits a non-failing HTTPX deprecation warning.
+
+## React frontend
+
+The application uses TypeScript with strict checking. `npm run typecheck` runs it independently; production
+builds include it automatically. `npm run format` formats frontend source; `npm run format:check` checks it. See [assistant-ui integration](assistant-ui.md) for the documented runtime,
+prebuilt component choices, registry source locations and backend-specific behavior.
+
+Run `npm run build` once before starting FastAPI. For frontend development, keep `npm run dev` (Vite build
+watch mode) running alongside Python and reload the browser after a rebuild. This deliberately uses a single
+origin: local-only HTTP checks, uploads, inference streams and the browser-owned MCP bridge all use the Python
+server's address. The Python server returns an actionable 503 message when compiled assets are missing.
+Generated `explorer/static/dist/` assets are ignored; source and the npm lockfile are tracked.
+
+All page controls and content are React components. `createExplorer` owns application state and async actions;
+manual UI handlers and MCP commands call those same actions. `useStore` subscribes to selected state fields,
+so hovering the map does not re-render every panel. The canvas engines retain imperative drawing internally
+and expose explicit disposal of observers, listeners and GPU resources. React owns their canvas lifecycle.
+
+The Assistant is loaded when first opened and kept mounted after visiting it. `useExternalStoreRuntime`
+adapts server-owned messages to assistant-ui's thread/message/composer primitives. The existing journal is the
+source of history; local storage holds chat pointers, drafts and attachment IDs, not rendered HTML. Old HTML
+caches are imported as text only when the server has no history. History replay never dispatches UI actions.
+Tool cards are presentation-only; execution, file scopes and shell approvals remain on the Python backend.
 
 ## Upstream integration
 
@@ -80,7 +119,7 @@ Upstream baseline: `e566e83e3f9fe00f85438231a788f90e83e2af43`. Its HTTP routes a
 | Provider processes | Reuse healthy configured clients, bounded to four idle clients and a five-minute timeout. Stop, failures, policy changes, rewind and shutdown close the process tree; saved provider threads retain context. Mid-turn messages use the app's queue or explicit interrupt-and-send behavior. |
 | Permissions | Retain local-only HTTP access, shared scoped file tools and explicit shell approvals. Native provider file/shell tools and unrelated integrations remain disabled. Stop cancels pending approvals and approved commands. |
 | History | Import only explorer-owned transcripts; replay never repeats map actions or authorizes old commands. Keep `/api/agent/chat` for existing clients alongside reconnectable `/api/agent/send`. |
-| UI | Retain stable inspector tabs, shared segmented controls, lowercase map/embeddings labels, shareable selection links and acknowledged UI commands. |
+| UI | Keep the dedicated Assistant, center canvas and unified Explorer tools navigation; preserve shareable selection links and acknowledged UI protocol aliases. See [UI architecture](assistant-ui.md#workspace-and-navigation). |
 
 The scientific runtime retains the upstream attention algorithms, with model/revision-specific loading,
 compute ownership, and CPU retention of large attention bases for backbones wider than 2560 dimensions.
@@ -100,7 +139,7 @@ interrupt-and-send instead. This trades some steering convenience for a simpler,
 ## Known limits and release checks
 
 - Activation inspection uses a process-wide cache; analyzing another text can replace the current analysis.
-- Neuron Chat history is in browser memory and resets on reload. Assistant drafts share provider-specific
+- Neuron experiment history is in browser memory and resets on reload. Assistant drafts share provider-specific
   browser storage; simultaneous editing of one conversation in multiple tabs is not isolated.
 - Legacy model-analysis HTTP endpoints do not all enforce the same input bounds as the newer UI commands.
 - Dense result lists are capped rather than fully virtualized.
@@ -119,3 +158,20 @@ environments, conversations, uploads, generated profiles, database sidecars and 
 
 Python changes require an explorer restart; static UI changes require a page refresh. Reconnect external MCP
 clients after tool-schema changes. A server restart interrupts active replies while retaining saved history.
+
+## Potential improvements
+
+These are proposals, not implemented features or scheduled releases:
+
+- Persist and export local neuron experiments with their model and intervention settings.
+- Add explicit local-model download, loading and unload controls.
+- Investigate CUDA-graph decoding with numerical-parity tests before enabling it.
+
+## Documentation ownership
+
+The README is the entry point; [usage](usage.md) owns user workflows and operating commands,
+this guide owns setup/testing and backend boundaries, and [UI architecture](assistant-ui.md) owns component
+choices and integration contracts. Update current behavior in those guides instead of adding successive
+review reports. Record notable changes in the [changelog](../CHANGELOG.md), and experimental observations
+in the [research log](../research_log.md). [Historical source notes](research/source-notes.md) are research
+background, not a description of the current UI. Assistant prompt/methodology files remain runtime inputs.

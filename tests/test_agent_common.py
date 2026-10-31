@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 import sys
@@ -10,6 +11,13 @@ from agent_common import AgentError, AgentPool, explorer_mcp, process_options, s
 
 
 class CommonTests(unittest.IsolatedAsyncioTestCase):
+    def test_structured_outputs_remain_parseable_and_plain_output_stays_bounded(self):
+        payload = {'evidence': ['写作' * 1000], 'references': [{'layer': 16, 'n': 2311}]}
+        encoded = json.dumps(payload, ensure_ascii=False)
+        self.assertEqual(json.loads(tool_output(encoded)), payload)
+        self.assertEqual(tool_output('x' * 2000), 'x' * 1500 + ' … (2000 chars)')
+        self.assertLess(len(tool_output(json.dumps({'text': 'x' * 1_048_576}))), 1600)
+
     async def test_process_cleanup_targets_the_tree(self):
         proc = AsyncMock(pid=12345, returncode=None)
         if os.name == 'nt':

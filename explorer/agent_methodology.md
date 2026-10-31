@@ -60,10 +60,11 @@ A working method for explaining a single MLP neuron, built from hands-on investi
 
 ## Writing it up
 
-- Lead with the strongest firings and the steering result, then the near misses that bound the label.
-- State the verdict (one job / two related jobs / not yet understood) with confidence, and say which view you weight when views disagree.
-- Name what remains unexplained.
-- End with the specific test that would break the explanation.
+- Answer the person's current question in plain language. Lead with the best-supported interpretation and a concrete example; scale detail to the conversation.
+- Distinguish where the neuron activates from what changing it causes. Explain measurements in context rather than listing scores alone.
+- Treat labels as hypotheses. Do not force a one-job/two-job verdict, infer a detector from steering alone, or present opposite poles as proven semantic opposites.
+- Separate what was observed, what it suggests, and what remains unknown. Explain the reason for uncertainty; confidence must track the scope and number of tests.
+- Propose a specific next test using ordinary wording, such as "Test risky versus sensible advice." Avoid jargon such as "break the label."
 
 ## Reference neurons
 

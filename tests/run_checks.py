@@ -14,10 +14,14 @@ def main():
     node = shutil.which('node')
     if node is None:
         raise SystemExit('Node.js is required for the frontend checks.')
+    npm = shutil.which('npm.cmd' if sys.platform == 'win32' else 'npm')
+    if npm is None:
+        raise SystemExit('npm is required. Install Node.js and run npm ci first.')
     commands = [[sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_*.py', '-v']]
     commands += [[node, '--check', str(path.relative_to(ROOT))] for path in sorted((ROOT / 'explorer/static').glob('*.js'))]
     commands += [[node, str(path.relative_to(ROOT))] for path in sorted((ROOT / 'tests').glob('test_*.cjs'))]
     commands += [[node, str(path.relative_to(ROOT))] for path in sorted((ROOT / 'tests').glob('test_*.mjs'))]
+    commands += [[npm, 'run', 'build'], [npm, 'test']]
     for command in commands:
         print('Running:', ' '.join(command), flush=True)
         subprocess.run(command, cwd=ROOT, check=True)

@@ -1,5 +1,6 @@
 """Shared CLI transport configuration and process cleanup for assistant providers."""
 import asyncio
+import json
 import os
 from pathlib import Path
 import signal
@@ -95,6 +96,14 @@ def process_options():
 
 
 def tool_output(text, limit=1500):
+    # Renderers need intact structured data, not a preview cut through JSON.
+    # Plain command output still uses the compact journal preview.
+    if len(text) <= 1_048_576:
+        try:
+            if isinstance(json.loads(text), (dict, list)):
+                return text
+        except (ValueError, TypeError):
+            pass
     return text[:limit] + (f' … ({len(text)} chars)' if len(text) > limit else '')
 
 

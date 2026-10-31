@@ -1,4 +1,13 @@
-# Neuron explorer — source notes
+# Historical source notes
+
+Collected October 18, 2026. These are historical research references and early design ideas, not current UI
+or implementation guidance. Paths in code spans are relative to the repository root; mirrored third-party
+material remains local and ignored. Some proposed features below have since been implemented.
+
+See the [usage guide](../usage.md) for the current app, [UI architecture](../assistant-ui.md) for maintained
+design decisions, and the [research log](../../research_log.md) for experimental findings.
+
+## Original notes
 
 Three inputs, collected 2026-10-18.
 

@@ -20,6 +20,28 @@ class Paused(Exception):
     pass
 
 
+def read_status(directory):
+    """Observe both processes without rewriting stale status; a stage can outlive its supervisor."""
+    directory = Path(directory)
+    state = json.loads((directory / "status.json").read_text())
+    running = False
+    try:
+        with job_lock(directory / "worker.lock"), job_lock(directory / "stage.lock"):
+            pass
+    except RuntimeError:
+        running = True
+    if state.get("status") == "running" and not running:
+        state = {**state, "status": "interrupted"}
+    return state, running
+
+
+def request_pause(directory):
+    directory = Path(directory)
+    if not (directory / "job.json").is_file():
+        raise FileNotFoundError(f"Cache job not found: {directory}")
+    atomic_json(directory / "pause", {"requested": time.time()})
+
+
 class Job:
     def __init__(self, directory):
         self.directory = Path(directory).resolve()
@@ -113,6 +135,10 @@ def launch(directory, background):
     # Detect duplicate launch before removing a requested pause.
     with job_lock(directory / "worker.lock"):
         with job_lock(directory / "stage.lock"):
+            # Fail before spawning (or clearing a pause) when another job or the
+            # live model owns compute. The stage acquires the lasting lease.
+            with job_lock(ROOT / "explorer/cache/.device.lock"):
+                pass
             (directory / "pause").unlink(missing_ok=True)
     if not background:
         return run(directory)
@@ -167,17 +193,10 @@ def main():
     elif a.command in ("start", "resume"):
         launch(a.job, a.background)
     elif a.command == "pause":
-        atomic_json(a.job / "pause", {"requested": time.time()})
+        request_pause(a.job)
         print("Pause requested. Worker exits after its current checkpoint; wait for status=paused before resuming.")
     elif a.command == "status":
-        state = json.loads((a.job / "status.json").read_text())
-        try:
-            with job_lock(a.job / "worker.lock"):
-                with job_lock(a.job / "stage.lock"):
-                    if state.get("status") == "running":
-                        state["status"] = "interrupted"
-        except RuntimeError:
-            pass
+        state, _ = read_status(a.job)
         print(json.dumps(state, indent=2))
     elif a.command == "_run":
         run(a.job)

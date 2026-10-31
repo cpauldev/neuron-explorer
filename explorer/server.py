@@ -34,6 +34,7 @@ from codex_agent import CodexClient  # noqa: E402
 from claude_agent import ClaudeClient, legacy_session  # noqa: E402
 from research_tools import SCOPES, file_operation, scoped_path, run_shell  # noqa: E402
 from ui_bridge import UiBridge, UI_COMMAND_FIELDS, validate_ui_command, validate_head  # noqa: E402
+from build_monitor import BuildMonitor
 
 _paths = data_paths()
 RUNS, STATS, NAMES = (str(_paths[key]) for key in ("runs", "stats", "names"))
@@ -47,6 +48,52 @@ ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter":
         "linear_v_heads": _cfg.linear_num_value_heads}
 
 app = FastAPI()
+build_monitor = BuildMonitor(Path(ROOT) / "cache-jobs")
+
+
+@app.get("/api/cache-builds")
+def cache_builds():
+    return {"jobs": build_monitor.jobs()}
+
+
+@app.get("/api/cache-builds/{name}")
+def cache_build_snapshot(name: str):
+    try:
+        return build_monitor.snapshot(name)
+    except (ValueError, OSError) as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@app.get("/api/cache-builds/{name}/layout")
+def cache_build_layout(name: str, kind: str = "writes"):
+    try:
+        return build_monitor.layout(name, kind)
+    except (ValueError, OSError) as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/api/cache-builds/{name}/edges")
+def cache_build_edges(name: str):
+    try:
+        return build_monitor.edges(name)
+    except (ValueError, OSError) as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.post("/api/cache-builds/{name}/{action}")
+def cache_build_control(name: str, action: str):
+    from cache_job import launch, request_pause
+    try:
+        directory = build_monitor.directory(name)
+        if action == "pause":
+            request_pause(directory)
+        elif action == "resume":
+            launch(directory, background=True)
+        else:
+            raise ValueError("Action must be pause or resume")
+        return {"ok": True}
+    except (ValueError, OSError, RuntimeError) as error:
+        raise HTTPException(409, str(error)) from error
 
 
 # only this machine's own pages and tools: a page on another site (or a DNS name rebound to 127.0.0.1) can't reach
@@ -1461,6 +1508,15 @@ async def agent_chat(req: Request):
     return await prepare_agent_turn(req)
 
 
+@app.get("/api/agent/models")
+async def agent_models(provider: str = "codex"):
+    """Read model choices from the installed CLI, without starting a conversation."""
+    from agent_models import model_catalog
+    if provider not in ("codex", "claude"):
+        return JSONResponse({"error": "choose codex or claude"}, status_code=400)
+    return await model_catalog(provider, AGENT_DIR, CodexClient)
+
+
 @app.post("/api/agent/send")
 async def agent_send(req: Request):
     return await prepare_agent_turn(req, background=True)
@@ -1477,6 +1533,8 @@ async def prepare_agent_turn(req, background=False):
         path, session, provider = selected_agent_session(b, cid)
         if b.get("chat") and not session:
             raise ValueError("saved chat not found; start a new conversation")
+        from agent_models import validate_model
+        model = validate_model(b.get("model", session.get("model"))) or os.environ.get(f"EXPLORER_{provider.upper()}_MODEL")
         original = b["message"]
         if not isinstance(original, str) or not original.strip() or len(original) > 200_000:
             raise ValueError("provide a message up to 200,000 characters")
@@ -1489,6 +1547,7 @@ async def prepare_agent_turn(req, background=False):
         access = b.get("access", "project")
         if access not in SCOPES:
             raise ValueError("choose project or home file access")
+        context = None
         content = [{"type": "text", "text": original}]
         if b.get("layer") is not None:
             if b.get("head") is not None:
@@ -1497,6 +1556,7 @@ async def prepare_agent_turn(req, background=False):
             else:
                 validate_ui_command({"action": "select", "layer": b["layer"], "n": b["n"]}, ARCH)
                 selected = f"L{b['layer']} N{b['n']}"
+            context = {"layer": b["layer"], "n": b.get("head", b.get("n")), "kind": "head" if b.get("head") is not None else "neuron"}
             content[0]["text"] = f"[The person has {selected} open in the explorer.]\n\n{original}"
         content += [await asyncio.to_thread(attachment_input, fid, provider) for fid in b.get("attachments") or []]
     except (ValueError, KeyError, TypeError, OSError) as e:
@@ -1516,12 +1576,13 @@ async def prepare_agent_turn(req, background=False):
                 instructions = Path(agent_prompt_file()).read_text(encoding="utf-8")
                 instructions += f"\n\nCurrent file-tool scope: {access}. Use list_files, read_file, write_file and run_shell for research scripts. Native shell/file tools are disabled in both providers. File tools are restricted to the project{' and your home folder' if access == 'home' else ''}. Every run_shell command requires the person's approval and runs with their user account, not inside a filesystem sandbox. Never suggest that a shell starting directory restricts what a command can access. Keep scratch work under {AGENT_DIR}/work."
                 async def connect(client):
+                    client.model = model
                     await client.start()
                     return await client.open_thread(ROOT, cid, PORT, instructions, saved.get("thread"))
 
                 if background:
                     c["client_key"] = cid
-                    policy = (provider, access, instructions, os.environ.get(f"EXPLORER_{provider.upper()}_MODEL"),
+                    policy = (provider, access, instructions, model,
                               os.environ.get(f"EXPLORER_{provider.upper()}_BIN"))
                     lease = await agent_pool.acquire(cid, policy, lambda: agent_client(provider, q), connect)
                     client, thread = lease["client"], lease["thread"]
@@ -1529,7 +1590,7 @@ async def prepare_agent_turn(req, background=False):
                 else:
                     client = agent_client(provider, q)
                     thread = await connect(client)
-                saved.update(thread=thread, provider=provider, access=access)
+                saved.update(thread=thread, provider=provider, access=access, model=model)
                 save_agent_session(path, saved)
                 yield json.dumps({"t": "chat", "chat": cid, "provider": provider}) + "\n"
                 result = await client.call("turn/start", {"threadId": thread, "input": content})
@@ -1575,9 +1636,9 @@ async def prepare_agent_turn(req, background=False):
         return StreamingResponse(events(), media_type="application/x-ndjson")
     journal = chat_journal(cid, c)
     start = journal.cursor
-    session.update(provider=provider, access=access, title=session.get("title") or original[:100], updated=time.time())
+    session.update(provider=provider, access=access, model=model, title=session.get("title") or original[:100], updated=time.time())
     save_agent_session(path, session)
-    journal.append({"t": "user", "text": original, "shown": b.get("shown", original),
+    journal.append({"t": "user", "text": original, "context": context, "shown": b.get("shown", original),
                     "attachments": [{"id": fid, "name": (b.get("attachment_names") or [])[i] if i < len(b.get("attachment_names") or []) else "attachment"}
                                     for i, fid in enumerate(b.get("attachments") or [])]})
 
@@ -1639,7 +1700,7 @@ async def agent_chats():
         try:
             _, session = agent_session(path.stem)
             result.append({"chat": path.stem, "provider": session.get("provider", "codex"),
-                           "title": session.get("title") or session.get("last_message") or "Conversation",
+                           "title": session.get("title") or session.get("last_message") or "Conversation", "model": session.get("model"),
                            "updated": session.get("updated", path.stat().st_mtime),
                            "running": busy_chat(_chats.get(path.stem, {}))})
         except (ValueError, OSError, TypeError):
@@ -1669,7 +1730,7 @@ async def agent_history(chat: str):
                         c.pop("recovering", None)
         pending = [aid for aid, future in c.get("approvals", {}).items() if not future.done()]
         return {"chat": chat, "provider": session.get("provider", "codex"), "access": session.get("access", "project"),
-                "events": journal.events, "cursor": journal.cursor, "running": busy_chat(c), "approvals": pending,
+                "model": session.get("model"), "events": journal.events, "cursor": journal.cursor, "running": busy_chat(c), "approvals": pending,
                 "history_error": history_error}
     except (ValueError, OSError) as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -1760,7 +1821,18 @@ def status():
     return {"status": rt.status}
 
 
-app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), html=True), name="static")
+@app.get("/")
+def frontend():
+    entry = Path(ROOT) / "explorer" / "static" / "dist" / "index.html"
+    if not entry.is_file():
+        return PlainTextResponse(
+            "The React frontend has not been built. Run `npm ci` and `npm run build` in the project root, then reload.",
+            status_code=503,
+        )
+    return FileResponse(entry, headers={"Cache-Control": "no-cache"})
+
+
+app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static")), name="static")
 
 @app.on_event("startup")
 def preload():

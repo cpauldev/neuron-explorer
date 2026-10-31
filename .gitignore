@@ -1,4 +1,9 @@
 .venv/
+node_modules/
+.npm-cache/
+explorer/static/dist/
+output/
+.playwright-cli/
 __pycache__/
 .DS_Store
 
@@ -31,6 +36,9 @@ sweep/pod_template.json
 explorer/cache/head_profiles.json
 explorer/cache/head_profiles.json.tmp
 explorer/cache/*.tmp-*
+
+# Regenerated token-display labels (raw vocabulary remains shipped)
+explorer/cache/vocab-display-*.json
 
 # Model-specific derived data and resumable job checkpoints
 explorer/cache/models/

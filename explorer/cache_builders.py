@@ -3,6 +3,9 @@
 Algorithms match the original builders; outputs retain the server's existing NPZ schemas.
 cache_job invokes stages in separate processes to release model allocations. One-shot layout and
 connection commands reuse the same scientific routines.
+
+Optional layer/chunk/target selections serve benchmark_cache only. Its progress callback stops
+after the final sample, before full-cache aggregation; ordinary jobs always visit every unit.
 """
 import json
 import math
@@ -48,9 +51,10 @@ def build(job, stage):
             activations(job, rt, cfg)
 
 
-def grid_cells(xy):
+def grid_cells(xy, side=None):
     """Padded square grid, matching map3d's ceil(sqrt(N)); no phantom neurons."""
-    count, side = len(xy), math.ceil(math.sqrt(len(xy)))
+    count = len(xy)
+    side = side or math.ceil(math.sqrt(count))
     cells = np.empty(count, np.int16)
     by_y = np.argsort(xy[:, 1], kind="stable")
     for start in range(0, count, side):
@@ -69,17 +73,40 @@ def layout_cells(weights, layer, kind, pca=50, neighbors=30):
     else:
         x = np.concatenate([weights.tensor(prefix + name + ".weight").float().numpy()
                             for name in ("gate_proj", "up_proj")], axis=1)
-    x = x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
+    count = len(x)
+    with np.errstate(over="ignore"):
+        norms = np.linalg.norm(x, axis=1, keepdims=True)
+    overflow = ~np.isfinite(norms[:, 0])
+    if overflow.any():
+        # Compiled gates can exceed sqrt(float32.max). Rescaling each affected
+        # row preserves its direction without squaring enormous coefficients.
+        x = x.copy()
+        x[overflow] /= np.abs(x[overflow]).max(axis=1, keepdims=True)
+        norms[overflow] = np.linalg.norm(x[overflow], axis=1, keepdims=True)
+    active = norms[:, 0] > 0
+    active_count = int(active.sum())
+    cells = np.arange(count, dtype=np.int16)
+    cells[~active] = np.arange(active_count, count)
+    if active_count < 4:
+        cells[active] = np.arange(active_count)
+        return cells
+    # Zero padding has no direction to cluster. Keep those neurons together in
+    # index order, after the embedded nonzero vectors, on the same full-size grid.
+    if active_count < count:
+        x, norms = x[active], norms[active]
+    x = x / np.maximum(norms, 1e-12)
     x = x - x.mean(0)
     u, s, _ = np.linalg.svd(x, full_matrices=False)
     z = u[:, :pca] * s[:pca]
-    xy = umap.UMAP(n_neighbors=neighbors, min_dist=0.05, metric="cosine", random_state=0).fit_transform(z)
-    return grid_cells(xy)
+    xy = umap.UMAP(n_neighbors=min(neighbors, len(x) - 1), min_dist=0.05,
+                   metric="cosine", random_state=0).fit_transform(z)
+    cells[active] = grid_cells(xy, side=math.ceil(math.sqrt(count)))
+    return cells
 
 
-def layout(job, stage, cfg, weights):
+def layout(job, stage, cfg, weights, *, layers=None):
     L = cfg["num_hidden_layers"]
-    for layer in range(L):
+    for layer in range(L) if layers is None else layers:
         job.boundary()
         path = job.part(stage, layer)
         cached = path.exists()
@@ -89,12 +116,14 @@ def layout(job, stage, cfg, weights):
     job.save(job.cache / f"{stage}.npz", cell=np.stack([load_part(job.part(stage, l))["cell"] for l in range(L)]))
 
 
-def lens(job, rt, cfg):
+def lens(job, rt, cfg, *, layers=None, starts=None):
     L, N, chunk, k = cfg["num_hidden_layers"], cfg["intermediate_size"], 1024, 12
     total = L * math.ceil(N / chunk)
     done = 0
-    for l, layer in enumerate(rt.lm.layers):
-        for start in range(0, N, chunk):
+    starts = range(0, N, chunk) if starts is None else starts
+    for l in range(L) if layers is None else layers:
+        layer = rt.lm.layers[l]
+        for start in starts:
             job.boundary()
             path = job.part("lens", f"{l}-{start}")
             cached = path.exists()
@@ -113,7 +142,7 @@ def lens(job, rt, cfg):
 
 
 @torch.inference_mode()
-def steer(job, rt, cfg):
+def steer(job, rt, cfg, *, layers=None, starts=None):
     """Same four contexts and signed residual-normalized dose as sweep/steer_lens.py."""
     tok, lm = rt.tok, rt.lm
     contexts = [rt.chat_ids(c) for c in CHAT] + [tok(p).input_ids for p in PLAIN]
@@ -152,10 +181,15 @@ def steer(job, rt, cfg):
             base = prediction(ids, mask, positions)
         L, N, B, k = cfg["num_hidden_layers"], cfg["intermediate_size"], job.manifest["batch"], 12
         total, done = L * math.ceil(N / B), 0
+        starts = range(0, N, B) if starts is None else starts
         output = {key: [] for key in ("up_tok", "down_tok", "up_kl", "down_kl")}
-        for l, layer in enumerate(lm.layers):
-            unit = residuals[l] / layer.mlp.down_proj.weight.float().norm(dim=0)
-            for start in range(0, N, B):
+        for l in range(L) if layers is None else layers:
+            layer = lm.layers[l]
+            norms = layer.mlp.down_proj.weight.float().norm(dim=0)
+            # Compiled/padded models contain zero write columns. They cannot change
+            # the residual; a zero intervention preserves their true zero effect.
+            unit = torch.where(norms > 0, residuals[l] / norms.clamp(min=1e-12), 0)
+            for start in starts:
                 job.boundary()
                 path = job.part("steer", f"{l}-{start}")
                 cached = path.exists()
@@ -178,7 +212,7 @@ def steer(job, rt, cfg):
                 done += 1
                 job.progress("steer", done, total, measured=not cached)
             for key in output:
-                output[key].append(np.concatenate([load_part(job.part("steer", f"{l}-{s}"))[key] for s in range(0, N, B)]))
+                output[key].append(np.concatenate([load_part(job.part("steer", f"{l}-{s}"))[key] for s in starts]))
         job.save(job.cache / "steer_index.npz", **{key: np.stack(value) for key, value in output.items()})
     finally:
         for handle in handles:
@@ -191,7 +225,8 @@ def connections(job, cfg, weights):
     job.save(job.cache / "connections.npz", **out, k=24)
 
 
-def connection_arrays(cfg, weights, *, k=24, checkpoint=None, boundary=lambda: None, progress=lambda done, total: None):
+def connection_arrays(cfg, weights, *, k=24, checkpoint=None, boundary=lambda: None,
+                      progress=lambda done, total: None, targets=None):
     """Shared direct-path top-k algorithm; optional checkpoint retains the running aggregate per target layer."""
     L, N, K = cfg["num_hidden_layers"], cfg["intermediate_size"], k
     dev = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -221,7 +256,7 @@ def connection_arrays(cfg, weights, *, k=24, checkpoint=None, boundary=lambda: N
             best[f"{side}_{key}"][l] = value.gather(1, choice)
 
     with torch.inference_mode():
-        for j in range(next_layer, L):
+        for j in range(next_layer, L) if targets is None else targets:
             boundary()
             for i in range(j):
                 boundary()
