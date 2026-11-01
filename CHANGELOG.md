@@ -4,6 +4,8 @@
 
 ### Added
 
+- Official assistant-ui run activity, settled code highlighting and current-conversation search with keyboard navigation.
+
 - Text-only dense Qwen3.5 checkpoint support, including Qwenputer, and a reusable desktop cache progress window.
 - Cache tab in the explorer sidebar that replays saved layouts on the shared map, shows checkpoint coverage and sampled connections, and controls existing jobs without loading model weights in the server.
 
@@ -20,6 +22,11 @@
   attention reconstruction and interrupted cache builds.
 
 ### Changed
+
+- Interface and chat typography use locally bundled IBM Plex Sans; code, token displays and map labels use IBM Plex Mono.
+
+- Codex, Claude and MCP adapters use pinned official SDKs. Explorer stores sessions, events, submission receipts and approval decisions in SQLite, with automatic legacy history import.
+- Existing-file overwrites require approval and reject changed contents; interrupted responses retain Markdown with a retry action.
 
 - Assistant conversations use durable event replay and bounded reuse of healthy provider processes.
 - File tools enforce the selected scope; shell commands require approval in the Assistant panel.

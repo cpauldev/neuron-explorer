@@ -93,6 +93,11 @@ export function createExplorer(index: ModelIndex) {
       : have.includes(22)
         ? 22
         : (have[0] ?? 0);
+  const panels = readStorage<{
+    assistantOpen?: boolean;
+    toolsOpen?: boolean;
+    activePanel?: ExplorerState["activePanel"];
+  }>("explorer.panels");
   const store = createStore<ExplorerState>({
     index,
     arch,
@@ -111,14 +116,24 @@ export function createExplorer(index: ModelIndex) {
       ? "build"
       : "net",
     mapReady: false,
-    assistantOpen: true,
-    toolsOpen: true,
+    assistantOpen:
+      typeof panels?.assistantOpen === "boolean" ? panels.assistantOpen : true,
+    toolsOpen: new URLSearchParams(location.search).has("build")
+      ? true
+      : typeof panels?.toolsOpen === "boolean"
+        ? panels.toolsOpen
+        : true,
     activePanel: new URLSearchParams(location.search).has("build")
       ? "tools"
-      : typeof matchMedia === "function" &&
-          matchMedia("(min-width: 768px)").matches
-        ? "assistant"
-        : null,
+      : panels &&
+          (panels.activePanel === null ||
+            panels.activePanel === "assistant" ||
+            panels.activePanel === "tools")
+        ? panels.activePanel
+        : typeof matchMedia === "function" &&
+            matchMedia("(min-width: 768px)").matches
+          ? "assistant"
+          : null,
     workbenchTab: new URLSearchParams(location.search).has("build")
       ? "cache"
       : "search",
@@ -166,6 +181,20 @@ export function createExplorer(index: ModelIndex) {
   const get = store.getSnapshot,
     set = store.set,
     browserId = crypto.randomUUID();
+  let panelState = JSON.stringify({
+    assistantOpen: get().assistantOpen,
+    toolsOpen: get().toolsOpen,
+    activePanel: get().activePanel,
+  });
+  const unsubscribePanels = store.subscribe(() => {
+    const { assistantOpen, toolsOpen, activePanel } = get();
+    const next = { assistantOpen, toolsOpen, activePanel };
+    const serialized = JSON.stringify(next);
+    if (serialized !== panelState) {
+      panelState = serialized;
+      writeStorage("explorer.panels", next);
+    }
+  });
   const sessions = new Map<string, LocalChatState>(),
     layouts: Record<string, Int16Array> = {},
     hoverCache = new Map<string, any>(),
@@ -469,8 +498,8 @@ export function createExplorer(index: ModelIndex) {
       nheads: null,
       headInfo: null,
       webSum: null,
-      toolsOpen: true,
-      ...(options.agent
+      ...(options.preservePanels ? {} : { toolsOpen: true }),
+      ...(options.agent || options.preservePanels
         ? {}
         : { activePanel: "tools" as const, workbenchTab: "inspect" as const }),
       selectionTab:
@@ -1128,14 +1157,16 @@ export function createExplorer(index: ModelIndex) {
     submit: submitChat,
     cancel: cancelChat,
   });
-  function restoreFocus() {
+  function restoreFocus(event?: Event) {
     const m = location.hash.match(/^#L(\d+)\/(N|h)(\d+)$/),
       f: Focus | null = m
         ? { layer: +m[1], n: +m[3], kind: m[2] === "h" ? "head" : "neuron" }
         : readStorage<Focus>(modelKey("explorer.focus"));
     if (!f || (get().focus && refLabel(get().focus) === refLabel(f))) return;
     if (f.kind === "head" ? validHead(f.layer, f.n) : validNeuron(f.layer, f.n))
-      safe(select(f.layer, f.n, f.kind, { push: false }));
+      safe(
+        select(f.layer, f.n, f.kind, { push: false, preservePanels: !event }),
+      );
   }
   async function pollStatus() {
     try {
@@ -1466,6 +1497,7 @@ export function createExplorer(index: ModelIndex) {
       if (!disposed && get().analysisMode !== "build") restoreFocus();
     },
     dispose() {
+      unsubscribePanels();
       disposed = true;
       ++attachmentEpoch;
       ++epoch;

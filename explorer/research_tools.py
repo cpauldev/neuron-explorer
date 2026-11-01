@@ -23,7 +23,16 @@ def scoped_path(root, access, value='.'):
     return path
 
 
-def file_operation(root, access, operation, path='.', content=None):
+def file_revision(path):
+    import hashlib
+    try:
+        with path.open('rb') as f:
+            return hashlib.file_digest(f, 'sha256').hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def file_operation(root, access, operation, path='.', content=None, expected_revision=None):
     target = scoped_path(root, access, path)
     if operation == 'list':
         entries = sorted(target.iterdir(), key=lambda p: p.name.lower())
@@ -41,8 +50,11 @@ def file_operation(root, access, operation, path='.', content=None):
             raise ValueError('file content must be UTF-8 text up to 256 KB')
         if '.git' in target.parts:
             raise ValueError('direct writes into .git are not supported')
+        if expected_revision is not None and (file_revision(target) or 'absent') != expected_revision:
+            raise ValueError('file changed while approval was pending; read it again before writing')
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding='utf-8')
+        with target.open('x' if expected_revision == 'absent' else 'w', encoding='utf-8') as f:
+            f.write(content)
         return {'path': str(target), 'written': True}
     raise ValueError('unknown file operation')
 

@@ -28,11 +28,12 @@ from rank import compute_units  # noqa: E402
 from runtime import CACHE, NO_MODEL, Runtime  # noqa: E402
 from model_config import MODEL, REVISION, DEFAULT_MODEL, data_paths, model_key, validate_config
 from agent_history import Journal
+from agent_store import AssistantStore
 from agent_common import AgentError, AgentPool  # noqa: E402
 from agent_attachments import UploadTooLarge, store_upload, attachment_input as read_attachment  # noqa: E402
 from codex_agent import CodexClient  # noqa: E402
 from claude_agent import ClaudeClient, legacy_session  # noqa: E402
-from research_tools import SCOPES, file_operation, scoped_path, run_shell  # noqa: E402
+from research_tools import SCOPES, file_operation, file_revision, scoped_path, run_shell  # noqa: E402
 from ui_bridge import UiBridge, UI_COMMAND_FIELDS, validate_ui_command, validate_head  # noqa: E402
 from build_monitor import BuildMonitor
 
@@ -1305,20 +1306,53 @@ def active_research_chat(body):
     return c
 
 
+async def research_approval(c, command, cwd, kind="shell"):
+    import uuid
+    aid = uuid.uuid4().hex
+    approval = asyncio.get_running_loop().create_future()
+    approvals, cancel = c["approvals"], c["cancel"]
+    request_id = c.get("request_id")
+    approvals[aid] = approval
+    store = AssistantStore(AGENT_DIR)
+    store.approval(aid, request_id, command, str(cwd))
+    store.transition(request_id, "awaiting_approval")
+    c["queue"].put_nowait(("event", {"t": "approval", "id": aid, "command": command, "cwd": str(cwd), "kind": kind}))
+    try:
+        allowed = await asyncio.wait_for(approval, 600)
+        return allowed and not cancel.is_set()
+    except asyncio.TimeoutError:
+        return False
+    finally:
+        approvals.pop(aid, None)
+        store.decide(aid, False)
+        store.transition(request_id, "running")
+
+
 @app.post("/api/agent/files")
 async def agent_files(req: Request):
     body = await req.json()
     try:
         c = active_research_chat(body)
+        revision = None
+        if body["operation"] == "write":
+            target = scoped_path(ROOT, c["access"], body.get("path", "."))
+            content = body.get("content")
+            if not isinstance(content, str) or len(content.encode("utf-8")) > 256_000:
+                raise ValueError("file content must be UTF-8 text up to 256 KB")
+            revision = await asyncio.to_thread(file_revision, target)
+            if revision is not None:
+                if not await research_approval(c, f"Overwrite {target}\n\nNew contents:\n{content}", target.parent, "file_write"):
+                    return {"error": "file overwrite declined or conversation stopped; no file was written"}
+            else:
+                revision = "absent"
         return await asyncio.to_thread(file_operation, ROOT, c["access"], body["operation"],
-                                       body.get("path", "."), body.get("content"))
+                                       body.get("path", "."), body.get("content"), revision)
     except (ValueError, KeyError, OSError) as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
 @app.post("/api/agent/shell")
 async def agent_shell(req: Request):
-    import uuid
     body = await req.json()
     try:
         c = active_research_chat(body)
@@ -1333,23 +1367,12 @@ async def agent_shell(req: Request):
             raise ValueError("shell timeout must be between 1 and 300 seconds")
     except (ValueError, KeyError, OSError) as e:
         return JSONResponse({"error": str(e)}, status_code=400)
-    aid = uuid.uuid4().hex
-    approval = asyncio.get_running_loop().create_future()
-    approvals, cancel = c["approvals"], c["cancel"]
-    approvals[aid] = approval
-    c["queue"].put_nowait(("event", {"t": "approval", "id": aid, "command": command, "cwd": str(cwd)}))
+    if not await research_approval(c, command, cwd):
+        return {"error": "shell command declined or conversation stopped; no command was run"}
     try:
-        try:
-            allowed = await asyncio.wait_for(approval, 600)
-        except asyncio.TimeoutError:
-            return {"error": "shell approval expired; no command was run"}
-        if not allowed or cancel.is_set():
-            return {"error": "shell command declined or conversation stopped; no command was run"}
-        return await run_shell(command, cwd, timeout, os.path.join(AGENT_DIR, "work"), cancel)
+        return await run_shell(command, cwd, timeout, os.path.join(AGENT_DIR, "work"), c["cancel"])
     except (ValueError, OSError) as e:
         return {"error": str(e)}
-    finally:
-        approvals.pop(aid, None)
 
 
 @app.post("/api/agent/approval")
@@ -1361,6 +1384,14 @@ async def agent_approval(req: Request):
         return JSONResponse({"error": "this approval is no longer active"}, status_code=409)
     if not isinstance(body.get("allow"), bool):
         return JSONResponse({"error": "approval must be true or false"}, status_code=400)
+    if not AssistantStore(AGENT_DIR).decide(body["id"], body["allow"]):
+        pending.set_result(False)
+        return JSONResponse({"error": "this approval has expired"}, status_code=409)
+    decision = {"t": "approval_result", "id": body["id"], "state": "approved" if body["allow"] else "denied"}
+    if journal := c.get("journal"):
+        journal.append(decision)
+    else:
+        c["queue"].put_nowait(("event", decision))
     pending.set_result(body["allow"])
     return {"ok": True}
 
@@ -1410,16 +1441,11 @@ def agent_session(cid):
     import uuid
     if not isinstance(cid, str) or str(uuid.UUID(cid)) != cid:
         raise ValueError("invalid explorer chat id; start a new conversation")
-    folder = os.path.join(AGENT_DIR, "sessions")
-    os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, f"{cid}.json")
-    return path, json.loads(Path(path).read_text(encoding="utf-8")) if os.path.exists(path) else {}
+    return cid, AssistantStore(AGENT_DIR).session(cid)
 
 
-def save_agent_session(path, session):
-    with open(path + ".tmp", "w") as f:
-        json.dump(session, f)
-    os.replace(path + ".tmp", path)
+def save_agent_session(chat, session):
+    AssistantStore(AGENT_DIR).save_session(chat, session)
 
 
 def agent_provider(body, session):
@@ -1489,7 +1515,11 @@ async def agent_rewind(req: Request):
             await client.start()
             await client.open_thread(ROOT, b["chat"], PORT, Path(agent_prompt_file()).read_text(encoding="utf-8"), session["thread"])
             if provider == "claude":
-                await client.rewind(session["last_message"])
+                new_thread = await client.rewind(session["last_message"])
+                if new_thread:
+                    session["thread"] = new_thread
+                else:
+                    session.pop("thread", None)
             else:
                 await client.call("thread/revert", {"threadId": session["thread"], "beforeTurnId": session["last_turn"]})
             session.pop("last_turn", None)
@@ -1529,6 +1559,16 @@ async def prepare_agent_turn(req, background=False):
         b = await req.json()
         if not isinstance(b, dict):
             raise ValueError("assistant request must be an object")
+        request_id = b.get("request_id") or str(uuid.uuid4())
+        if not isinstance(request_id, str) or str(uuid.UUID(request_id)) != request_id:
+            raise ValueError("request_id must be a UUID")
+        import hashlib
+        fingerprint = hashlib.sha256(json.dumps({k: v for k, v in b.items() if k not in ("request_id", "browser")},
+                                                sort_keys=True).encode()).hexdigest()
+        store = AssistantStore(AGENT_DIR)
+        if background and (receipt := store.receipt(request_id, fingerprint)):
+            previous = store.session(receipt["chat"])
+            return {**receipt, "provider": previous.get("provider", "codex")}
         cid = b.get("chat") or str(uuid.uuid4())
         path, session, provider = selected_agent_session(b, cid)
         if b.get("chat") and not session:
@@ -1561,12 +1601,16 @@ async def prepare_agent_turn(req, background=False):
         content += [await asyncio.to_thread(attachment_input, fid, provider) for fid in b.get("attachments") or []]
     except (ValueError, KeyError, TypeError, OSError) as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    if background and (receipt := store.receipt(request_id, fingerprint)):
+        return {**receipt, "provider": provider}
     c = _chats.setdefault(cid, {"lock": asyncio.Lock()})
     if busy_chat(c) or c.get("recovering"):
         return JSONResponse({"error": "this conversation is already running or restoring; stop it or wait"}, status_code=409)
 
     async def events():
         async with c["lock"]:
+            if not background:
+                c.pop("request_id", None)
             c["active_task"] = asyncio.current_task()
             c["queue"] = q = asyncio.Queue()
             c.update(access=access, cancel=asyncio.Event(), approvals={}, browser=b.get("browser"))
@@ -1597,6 +1641,7 @@ async def prepare_agent_turn(req, background=False):
                 client.turn = result["turn"]["id"]
                 saved.update(last_turn=client.turn, last_message=original)
                 save_agent_session(path, saved)
+                AssistantStore(AGENT_DIR).transition(c.get("request_id"), "running", client.turn)
                 while True:
                     kind, item = await q.get()
                     if kind == "ui":
@@ -1635,12 +1680,14 @@ async def prepare_agent_turn(req, background=False):
     if not background:
         return StreamingResponse(events(), media_type="application/x-ndjson")
     journal = chat_journal(cid, c)
-    start = journal.cursor
     session.update(provider=provider, access=access, model=model, title=session.get("title") or original[:100], updated=time.time())
-    save_agent_session(path, session)
-    journal.append({"t": "user", "text": original, "context": context, "shown": b.get("shown", original),
-                    "attachments": [{"id": fid, "name": (b.get("attachment_names") or [])[i] if i < len(b.get("attachment_names") or []) else "attachment"}
-                                    for i, fid in enumerate(b.get("attachments") or [])]})
+    user_event = {"t": "user", "text": original, "context": context, "shown": b.get("shown", original),
+                  "attachments": [{"id": fid, "name": (b.get("attachment_names") or [])[i] if i < len(b.get("attachment_names") or []) else "attachment"}
+                                  for i, fid in enumerate(b.get("attachments") or [])]}
+    start, accepted = store.reserve(request_id, cid, fingerprint, session, user_event)
+    journal.events.append(accepted)
+    c["notify_events"]()
+    c["request_id"] = request_id
 
     async def run():
         completed = None
@@ -1665,7 +1712,8 @@ async def prepare_agent_turn(req, background=False):
             save_agent_session(path, saved)
             # Publish completion only after provider/process cleanup. Reconnecting
             # readers can then finish and send their next turn immediately.
-            journal.append(completed or {"t": "done", "status": "interrupted"})
+            terminal = completed or {"t": "done", "status": "interrupted"}
+            journal.append(terminal, request_id=request_id)
 
     c["job"] = asyncio.create_task(run())
     return {"chat": cid, "provider": provider, "cursor": start}
@@ -1677,10 +1725,18 @@ def busy_chat(c):
 
 def chat_journal(cid, c):
     if "journal" not in c:
-        c["journal"] = Journal(AGENT_DIR, cid)
+        c["event_listeners"] = set()
+
+        def notify():
+            for ready in c["event_listeners"]:
+                ready.set()
+
+        c["notify_events"] = notify
+        c["journal"] = Journal(AGENT_DIR, cid, notify=notify)
         events = c["journal"].events
+        AssistantStore(AGENT_DIR).recover(cid)
         if events and events[-1]["t"] != "done":
-            c["journal"].append({"t": "error", "error": "Server restarted before this reply completed."})
+            c["journal"].append({"t": "error", "error": "Server restarted before this reply completed. An operation may already have executed; it was not retried."})
             c["journal"].append({"t": "done", "status": "interrupted"})
     return c["journal"]
 
@@ -1696,15 +1752,11 @@ def owned_chat(cid):
 @app.get("/api/agent/chats")
 async def agent_chats():
     result = []
-    for path in Path(AGENT_DIR, "sessions").glob("*.json"):
-        try:
-            _, session = agent_session(path.stem)
-            result.append({"chat": path.stem, "provider": session.get("provider", "codex"),
-                           "title": session.get("title") or session.get("last_message") or "Conversation", "model": session.get("model"),
-                           "updated": session.get("updated", path.stat().st_mtime),
-                           "running": busy_chat(_chats.get(path.stem, {}))})
-        except (ValueError, OSError, TypeError):
-            continue
+    for cid, session in AssistantStore(AGENT_DIR).sessions():
+        result.append({"chat": cid, "provider": session.get("provider", "codex"),
+                       "title": session.get("title") or session.get("last_message") or "Conversation",
+                       "model": session.get("model"), "updated": session.get("updated", 0),
+                       "running": busy_chat(_chats.get(cid, {}))})
     return {"chats": sorted(result, key=lambda c: c["updated"], reverse=True)}
 
 
@@ -1721,7 +1773,8 @@ async def agent_history(chat: str):
                     try:
                         await client.start()
                         for event in await client.history(session["thread"]):
-                            journal.append(event)
+                            # Import time is not the original generation time.
+                            journal.append({"at": None, **event})
                     except (AgentError, OSError) as e:
                         history_error = str(e)
                     finally:
@@ -1751,9 +1804,9 @@ async def agent_import_history(req: Request):
             if not isinstance(record, dict) or record.get("t") not in ("user", "text") or not isinstance(record.get("text"), str):
                 raise ValueError("history requires user or text records")
         for record in records:
-            journal.append({"t": record["t"], "text": record["text"]})
+            journal.append({"t": record["t"], "text": record["text"], "at": None})
         if records:
-            journal.append({"t": "done", "status": "completed"})
+            journal.append({"t": "done", "status": "completed", "at": None})
         return {"ok": True}
     except (KeyError, ValueError, TypeError, OSError) as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -1770,16 +1823,24 @@ async def agent_events(chat: str, after: int = 0):
 
     async def follow():
         cursor = after
-        while True:
-            batch = journal.events[cursor:]
-            for event in batch:
-                yield json.dumps(event) + "\n"
-                cursor = event["seq"]
-            if not busy_chat(c):
-                break
-            if not batch:
-                yield "\n"  # heartbeat; disconnecting a listener does not cancel the job
-            await asyncio.sleep(0.25)
+        ready = asyncio.Event()
+        c["event_listeners"].add(ready)
+        try:
+            while True:
+                # Each connection has its own signal; another tab cannot clear it.
+                ready.clear()
+                batch = journal.events[cursor:]
+                for event in batch:
+                    yield json.dumps(event) + "\n"
+                    cursor = event["seq"]
+                if not busy_chat(c):
+                    break
+                try:
+                    await asyncio.wait_for(ready.wait(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield "\n"  # heartbeat; disconnecting a listener does not cancel the job
+        finally:
+            c["event_listeners"].discard(ready)
 
     return StreamingResponse(follow(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store"})
 

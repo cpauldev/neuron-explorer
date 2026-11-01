@@ -14,6 +14,15 @@ from codex_agent import CodexClient, browser_event, thread_config
 
 
 class EventTests(unittest.TestCase):
+    def test_preserves_explicit_public_message_phase_and_item_identity(self):
+        for phase in ('commentary', 'final_answer', None):
+            item = {'type': 'agentMessage', 'id': 'msg1', 'phase': phase, 'text': 'public'}
+            for method in ('item/started', 'item/completed'):
+                self.assertEqual(browser_event({'method': method, 'params': {'item': item}}),
+                                 {'t': 'text_phase', 'id': 'msg1', 'phase': phase})
+        self.assertEqual(browser_event({'method': 'item/agentMessage/delta', 'params': {'itemId': 'msg1', 'delta': 'hello'}}),
+                         {'t': 'text', 'id': 'msg1', 'text': 'hello'})
+
     def test_tool_lifecycle_and_failure(self):
         item = {'type': 'mcpToolCall', 'id': 'call1', 'tool': 'overview', 'arguments': {}}
         self.assertEqual(browser_event({'method': 'item/started', 'params': {'item': item}})['name'], 'overview')
@@ -57,65 +66,75 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(AgentError, 'working directory'):
             await client.history('owned')
 
-    async def test_handshake_rpc_errors_stream_and_permission_denial(self):
-        # A real child process exercises framing and the reader without a login or network.
+    async def test_official_sdk_transport_streams_and_denies_native_approval(self):
+        from openai_codex.client import CodexClient as RealClient
+        from openai_codex import CodexConfig
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder) / 'fake_codex.py'
             script.write_text('''import sys,json
-def out(m):print(json.dumps(m),flush=True)
 for line in sys.stdin:
- m=json.loads(line);method=m.get('method');i=m.get('id')
- if method=='initialize':out({'id':i,'result':{}})
- elif method=='echo':out({'id':i,'result':m['params']})
- elif method=='fail':out({'id':i,'error':{'code':-1,'message':'expected error'}})
- elif method=='turn/interrupt':
-  out({'id':i,'result':{}})
-  out({'method':'item/agentMessage/delta','params':{'delta':'interrupted'}})
- elif method=='events':
-  out({'method':'item/agentMessage/delta','params':{'delta':'hello'}})
+ m=json.loads(line); method=m.get('method'); i=m.get('id')
+ def out(v): print(json.dumps(v),flush=True)
+ if method=='initialize': out({'id':i,'result':{'serverInfo':{'version':'0.163.0'}}})
+ elif method=='model/list':
   out({'id':'approval','method':'item/commandExecution/requestApproval','params':{}})
-  out({'id':i,'result':{}})
- elif i=='approval':out({'method':'item/agentMessage/delta','params':{'delta':m['result']['decision']}})
- elif method=='exit':sys.exit(0)
+  out({'id':i,'result':{'data':[],'nextCursor':None}})
+ elif i=='approval': out({'method':'item/agentMessage/delta','params':{'delta':m['result']['decision']}})
+ elif method=='thread/read': out({'id':i,'error':{'code':-1,'message':'expected error'}})
+ elif method=='turn/interrupt': out({'id':i,'result':{}})
+ elif method=='turn/start':
+  turn={'id':'turn1','items':[],'status':'inProgress','error':None}
+  out({'method':'item/agentMessage/delta','params':{'threadId':'owned','turnId':'turn1','itemId':'text1','delta':'early turn text'}})
+  out({'id':i,'result':{'turn':turn}})
+  out({'method':'item/agentMessage/delta','params':{'threadId':'owned','turnId':'turn1','itemId':'text1','delta':' later text'}})
+  turn['status']='completed'
+  out({'method':'turn/completed','params':{'threadId':'owned','turn':turn}})
 ''', encoding='utf-8')
-            spawn = asyncio.create_subprocess_exec
-
-            async def fake_spawn(*args, **kwargs):
-                return await spawn(sys.executable, str(script), **kwargs)
-
-            queue = asyncio.Queue()
-            client = CodexClient(folder, queue)
-            with patch('codex_agent.asyncio.create_subprocess_exec', fake_spawn), patch.dict(os.environ, {'EXPLORER_CODEX_BIN': sys.executable}):
+            def factory(config, approval_handler):
+                self.assertIsNone(config.codex_bin)
+                return RealClient(CodexConfig(launch_args_override=(sys.executable, str(script)), cwd=folder),
+                                  approval_handler=approval_handler)
+            client = CodexClient(folder, asyncio.Queue())
+            with patch('codex_agent.SdkClient', factory), patch.dict(os.environ, {}, clear=True):
                 try:
                     await client.start()
-                    self.assertEqual(await client.call('echo', {'a': 2}), {'a': 2})
+                    self.assertEqual((await client.call('model/list', {}))['data'], [])
+                    kind, event = await asyncio.wait_for(client.queue.get(), 5)
+                    self.assertEqual(event, {'t': 'text', 'text': 'decline'})
                     with self.assertRaisesRegex(AgentError, 'expected error'):
-                        await client.call('fail', {})
-                    await client.call('events', {})
-                    values = []
-                    while 'decline' not in values:
-                        kind, event = await asyncio.wait_for(queue.get(), 3)
-                        if kind == 'event' and event['t'] == 'text':
-                            values.append(event['text'])
-                    self.assertEqual(values, ['hello', 'decline'])
-                    with self.assertRaisesRegex(AgentError, 'stopped unexpectedly'):
-                        await client.call('exit', {})
+                        await client.call('thread/read', {'threadId': 'owned'})
+                    await client.call('turn/start', {'threadId':'owned','input':[{'type':'text','text':'hello'}]})
+                    events = []
+                    while not events or events[-1].get('t') != 'done':
+                        kind, event = await asyncio.wait_for(client.queue.get(), 5)
+                        self.assertEqual(kind, 'event')
+                        events.append(event)
+                    self.assertEqual([e['text'] for e in events if e['t'] == 'text'], ['early turn text', ' later text'])
+                    self.assertEqual(events[-1]['status'], 'completed')
+                    client.turn = None
                 finally:
                     await client.close()
-            self.assertIsNotNone(client.proc.returncode)
+            self.assertFalse(client.alive)
 
-            # Graceful close interrupts a running turn before shutting down stdio.
-            client = CodexClient(folder, asyncio.Queue())
-            with patch('codex_agent.asyncio.create_subprocess_exec', fake_spawn), patch.dict(os.environ, {'EXPLORER_CODEX_BIN': sys.executable}):
-                await client.start()
-                client.thread, client.turn = 'owned-thread', 'active-turn'
-                await client.close()
-            events = []
-            while not client.queue.empty():
-                kind, event = client.queue.get_nowait()
-                if kind == 'event': events.append(event)
-            self.assertIn({'t': 'text', 'text': 'interrupted'}, events)
+    async def test_timeout_closes_connection_and_does_not_replay(self):
+        from unittest.mock import Mock
+        import threading
+        from openai_codex import CodexError
+        stopped = threading.Event()
+        def request(*args, **kwargs):
+            stopped.wait(3)
+            raise CodexError('closed')
+        sdk = Mock(request=request, close=Mock(side_effect=stopped.set))
+        client = CodexClient('.', asyncio.Queue())
+        client.sdk = sdk
+        with self.assertRaisesRegex(AgentError, 'outcome may be unknown'):
+            await client.call('model/list', {}, timeout=.02)
+        sdk.close.assert_called_once()
+        self.assertIsNone(client.sdk)
 
-
-if __name__ == '__main__':
-    unittest.main()
+    def test_all_native_client_requests_fail_closed(self):
+        client = CodexClient('.', asyncio.Queue())
+        self.assertEqual(client._approval('item/permissions/requestApproval', {}), {'permissions': {}, 'scope': 'turn'})
+        self.assertEqual(client._approval('item/tool/requestUserInput', {}), {'answers': {}})
+        with self.assertRaises(AgentError):
+            client._approval('new/unknownApproval', {})

@@ -35,11 +35,13 @@ Official references: [assistant-ui Base UI compatibility](https://www.assistant-
 
 ## Workspace and navigation
 
-The workbench has a dedicated Assistant on the left, a model canvas in the center and one Explorer tools
+The workspace has a dedicated Assistant on the left, a model canvas in the center and a Workbench
 panel on the right. This lets a person read an answer while inspecting its evidence. The assistant belongs
 to the investigation rather than one neuron. A floating assistant modal would cover the scientific workspace.
 
-The global header owns model identity, Go to unit and panel visibility. Canvas controls own Map/Embeddings,
+The global header owns model identity and Go to unit. Closed panels have floating openers at the scene edges
+below the toolbar; their headers contain collapse controls. Visibility is remembered across refreshes.
+Canvas controls own Map/Embeddings,
 actual layer scope, camera reset and Display options. Search, Analyze, Inspect and Cache are explicit tasks;
 only Inspect has contextual Overview, Experiment and Saved examples views. Local Qwen comparisons are called
 Experiment to distinguish them from the assistant conversation.
@@ -66,8 +68,10 @@ Runtime problems and pending approvals use conditional notices instead of a perm
 | Conversation | Official styled Thread, with user/assistant messages, composer, latest-turn actions, tool groups and scroll controls. |
 | Attachments | AttachmentUI and a local AttachmentAdapter connected to real upload IDs; selection, paste/drop, progress, removal and attachment-only submission are supported. |
 | History | Searchable ThreadList connected through ExternalStoreThreadListAdapter to persisted conversations. |
-| Response text | MarkdownText with GFM tables and code copying. A remark AST plugin links valid unit references in prose while preserving existing links and code. |
-| Waiting and recovery | Thread's built-in pulse, ErrorState, ConnectionState and MessageQueue connected to actual waiting, retry, reconnect and queued-turn operations. Pending approvals hide the waiting pulse. |
+| Find in conversation | Official ConversationSearch with literal, case-insensitive public text matching, highlighted result previews and message navigation. Search excludes tool payloads and marked commentary. Enter/Shift+Enter step through matches; Escape returns focus to the trigger. Ctrl/Cmd+F opens search while focus is in the assistant. Query state resets with the conversation runtime. |
+| Response text | The official MarkdownTextPrimitive provides smooth streaming and GFM formatting, with no custom word-animation layer. Official Shiki registry components highlight settled code and skip tokenization while streaming. The base source preserves whitespace rather than trimming research code. A remark AST plugin links valid neuron references while preserving existing links and code. |
+| Waiting state | The official registry TypingIndicator (bare variant) appears only before the first content arrives. Once a tool or text part exists, its own presentation takes over. |
+| Run activity and recovery | Official RunActivity groups tools and explicitly marked public commentary. Answers, unclassified text, findings, failures and approvals remain visible. Empty runs use TypingIndicator. ErrorState, ConnectionState and MessageQueue use real retry, replay and queue operations. Stopped responses keep their Markdown and offer Retry response on the latest idle turn. |
 | Assistant model | Compact ComposerModelTrigger, ComposerMenu and ComposerModelItem using the backend catalog and actual model ID. Unsupported prices, context limits and other metadata are omitted. |
 | Dictation | Thread microphone/ComposerVoice controls backed by WebSpeechDictationAdapter where supported. |
 | Settings | Dialog, Field, Select and RadioGroup for assistant choice and file scope; a standard gear TooltipIconButton opens it. Model choice stays in the composer. |
@@ -135,6 +139,14 @@ The local model's synchronized three-dose comparison remains a scientific view, 
 
 ## Styling and component updates
 
+IBM Plex Sans and IBM Plex Mono are bundled through Fontsource and served locally, with `font-display: swap`.
+`frontend/src/main.tsx` imports the faces; Tailwind's shared `--font-sans` and `--font-mono` tokens own the stacks,
+and legacy explorer styles use those same tokens. System fallbacks cover scripts outside the bundled fonts.
+Ligatures are disabled and tables use tabular numerals. Canvas layer labels repaint once the mono face loads.
+Font license notices are included in `frontend/public/licenses/` and copied into the build.
+Scrollbar sizing and colors live in the shared base layer so Explorer, chat, code blocks and portalled controls
+use the same thin native scrollbars. Older WebKit uses an 8 px fallback; forced-color mode retains system colors.
+
 Official components own control appearance, focus treatment and ordinary message layout. Scientific sign
 colors, heatmaps, canvas rendering and experiment grids are intentional application-specific presentation.
 Do not add a second focus outline or globally suppress accessible focus indicators.
@@ -150,3 +162,9 @@ canvas movement uses grab/grabbing. Standard defaults remain in place elsewhere.
 with their real loading, empty, error, keyboard and narrow-layout states, not just installed from a catalog.
 
 For serving commands, tests and known limitations, use the [development guide](development.md#react-frontend).
+
+## Run presentation
+
+Codex agent-message item IDs and explicit `commentary` / `final_answer` phases are preserved in durable events, including phase notifications arriving after text. Missing or unknown phases are never inferred. Claude public text remains visible; private reasoning is excluded. Consecutive text from distinct provider items stays in distinct parts. RunActivity uses those stable part IDs, keeps errors/cancellations and scientific findings outside its disclosure, and locks the viewport while expansion changes. Explicit user expansion persists through completion.
+
+New journal records carry server timestamps. Settled durations derive from persisted first assistant-event and completion times, never mount time; imported transcripts without original timestamps omit durations. Approval decisions are journaled before granting execution so their receipts survive refresh. A cancelled, interrupted or failed provider completion cannot become a successful completion just because streaming stopped. Recovery regenerates the latest turn, not the exact cut-off prefix. Individual-tool retry and discard are not offered without their backing operations.

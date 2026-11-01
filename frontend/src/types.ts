@@ -174,6 +174,7 @@ export interface ChatControls {
   dose?: number;
 }
 export interface SelectionOptions {
+  preservePanels?: boolean;
   agent?: boolean;
   push?: boolean;
   fly?: boolean;
@@ -281,6 +282,7 @@ export interface PendingFile {
   id: string | null;
 }
 export interface ApprovalRequest {
+  kind?: "shell" | "file_write";
   id: string;
   command: string;
   cwd?: string;
@@ -301,6 +303,9 @@ export interface MessageMetadata extends Record<string, unknown> {
   approvals?: ApprovalRequest[];
   error?: string;
   stopped?: boolean;
+  textPhases?: Record<string, "commentary" | "final_answer">;
+  startedAt?: number;
+  endedAt?: number;
 }
 export type MessagePart = Exclude<ThreadMessageLike["content"], string>[number];
 export interface AssistantMessage extends Omit<
@@ -312,7 +317,7 @@ export interface AssistantMessage extends Omit<
   status?: ThreadMessageLike["status"];
   metadata: { custom: MessageMetadata };
 }
-type EventBase = { seq?: number };
+type EventBase = { seq?: number; at?: number | null };
 export type JournalEvent = EventBase &
   (
     | {
@@ -322,7 +327,8 @@ export type JournalEvent = EventBase &
         shown?: string;
         attachments?: PendingFile[];
       }
-    | { t: "text"; text: string }
+    | { t: "text"; text: string; id?: string }
+    | { t: "text_phase"; id: string; phase?: string | null }
     | {
         t: "tool";
         id?: string;
@@ -330,7 +336,14 @@ export type JournalEvent = EventBase &
         input?: Extract<MessagePart, { type: "tool-call" }>["args"];
       }
     | { t: "tool_result"; id: string; output?: unknown; error?: boolean }
-    | { t: "approval"; id: string; command: string; cwd?: string }
+    | { t: "approval_result"; id: string; state: "approved" | "denied" }
+    | {
+        t: "approval";
+        id: string;
+        command: string;
+        cwd?: string;
+        kind?: "shell" | "file_write";
+      }
     | { t: "stopped" }
     | { t: "error"; error: string }
     | { t: "done"; status?: string }

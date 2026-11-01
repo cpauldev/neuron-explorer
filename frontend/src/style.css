@@ -10,6 +10,33 @@
 @custom-variant data-horizontal (&:where([data-horizontal], [data-orientation="horizontal"]));
 @custom-variant data-vertical (&:where([data-vertical], [data-orientation="vertical"]));
 @layer base {
+  /* Shared by Explorer, assistant-ui, textareas and portalled menus/dialogs. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #50545a #101214;
+  }
+  @supports not (scrollbar-width: thin) {
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #101214;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #50545a;
+      border: 2px solid #101214;
+      border-radius: 8px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #70757d;
+    }
+  }
+  @media (forced-colors: active) {
+    * {
+      scrollbar-color: auto;
+    }
+  }
   html,
   body,
   #root {
@@ -21,6 +48,27 @@
     background: var(--background);
     color: var(--foreground);
     font-family: var(--font-sans);
+    font-variant-ligatures: none;
+  }
+}
+@theme {
+  --font-sans:
+    "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans",
+    Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji";
+  --font-mono:
+    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+@layer base {
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+  }
+  table {
+    font-variant-numeric: tabular-nums;
   }
 }
 /* Standard shadcn neutral dark tokens; component utilities own the styling. */
@@ -124,11 +172,6 @@
   background: var(--popover);
   box-shadow: 0 4px 16px #0003;
 }
-.workspace-actions {
-  display: flex;
-  align-items: center;
-  gap: 0.25rem;
-}
 .app-shell > main {
   position: relative;
   flex: 1;
@@ -145,6 +188,26 @@
   height: 3rem;
   padding: 0 0.75rem;
   border-bottom: 1px solid var(--border);
+}
+.canvas-toolbar {
+  flex-wrap: wrap;
+  height: auto;
+  min-height: 3rem;
+  padding-block: 0.375rem;
+}
+/* Only the floating controls intercept pointer input over the scene. */
+.scene-panel-openers {
+  position: absolute;
+  inset: 0.75rem 0.75rem auto;
+  z-index: 20;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  pointer-events: none;
+}
+.scene-panel-openers button {
+  pointer-events: auto;
+  box-shadow: 0 2px 8px #0003;
 }
 .workspace-notice,
 .assistant-status {
@@ -306,9 +369,6 @@
   }
   .app-identity p {
     max-width: 9rem;
-  }
-  .workspace-actions {
-    margin-left: auto;
   }
   .unit-navigation {
     order: 1;

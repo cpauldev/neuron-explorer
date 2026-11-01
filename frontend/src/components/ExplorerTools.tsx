@@ -16,7 +16,7 @@ export function ExplorerTools({ panelRef }: { panelRef?: Ref<HTMLElement> }) {
     <Tabs
       render={<aside ref={panelRef} />}
       id="tools-sidebar"
-      aria-label="Explorer tools"
+      aria-label="Workbench"
       value={s.workbenchTab}
       onValueChange={(tab) => a.openTool(tab as WorkbenchTab)}
       hidden={!layout.tools}
@@ -24,15 +24,15 @@ export function ExplorerTools({ panelRef }: { panelRef?: Ref<HTMLElement> }) {
       onFocusCapture={() => a.set({ activePanel: "tools" })}
     >
       <div className="workspace-panel-header justify-between">
-        <h2 className="text-sm font-medium">Explorer tools</h2>
+        <h2 className="text-sm font-medium">Workbench</h2>
         <TooltipIconButton
-          tooltip="Hide tools"
+          tooltip="Hide workbench"
           onClick={() => a.togglePanel("tools", true)}
         >
           <PanelRightCloseIcon />
         </TooltipIconButton>
       </div>
-      <TabsList variant="line" className="m-2" aria-label="Explorer tools">
+      <TabsList variant="line" className="m-2" aria-label="Workbench">
         {(
           [
             ["search", "Search"],

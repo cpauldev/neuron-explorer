@@ -1,14 +1,6 @@
 import { useState } from "react";
-import {
-  BrainCircuitIcon,
-  MessageSquareIcon,
-  PanelRightIcon,
-  SearchIcon,
-  Loader2Icon,
-  CircleAlertIcon,
-} from "lucide-react";
+import { BrainCircuitIcon, SearchIcon } from "lucide-react";
 import { useExplorer } from "../context";
-import { useWorkspaceLayout } from "../lib/workspace";
 import {
   InputGroup,
   InputGroupAddon,
@@ -20,8 +12,6 @@ import { useAssistantActivity } from "../assistant/activity";
 
 export function Toolbar() {
   const [s, a] = useExplorer(["index", "arch"]);
-  const layout = useWorkspaceLayout();
-  const activity = useAssistantActivity();
   const [unit, setUnit] = useState("");
   const [error, setError] = useState("");
   return (
@@ -104,44 +94,6 @@ export function Toolbar() {
           </p>
         ) : null}
       </form>
-      <nav className="workspace-actions" aria-label="Workspace panels">
-        <Button
-          variant={layout.assistant ? "secondary" : "ghost"}
-          size="sm"
-          aria-pressed={layout.assistant}
-          aria-controls="assistant-sidebar"
-          title={
-            activity === "approval"
-              ? "Command approval requested"
-              : activity === "working"
-                ? "Assistant is working"
-                : undefined
-          }
-          onClick={() => a.togglePanel("assistant", layout.assistant)}
-        >
-          {activity === "approval" ? (
-            <CircleAlertIcon aria-hidden="true" />
-          ) : activity === "working" ? (
-            <Loader2Icon
-              aria-hidden="true"
-              className="animate-spin motion-reduce:animate-none"
-            />
-          ) : (
-            <MessageSquareIcon aria-hidden="true" />
-          )}
-          Assistant
-        </Button>
-        <Button
-          variant={layout.tools ? "secondary" : "ghost"}
-          size="sm"
-          aria-pressed={layout.tools}
-          aria-controls="tools-sidebar"
-          onClick={() => a.togglePanel("tools", layout.tools)}
-        >
-          <PanelRightIcon aria-hidden="true" />
-          Tools
-        </Button>
-      </nav>
     </header>
   );
 }

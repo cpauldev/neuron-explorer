@@ -56,6 +56,60 @@ class FileScopeTests(unittest.TestCase):
 
 
 class ApprovalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expired_persisted_approval_cannot_be_granted(self):
+        from agent_store import AssistantStore
+        runner = AsyncMock()
+        with patch.object(server, 'run_shell', runner):
+            pending = asyncio.create_task(server.agent_shell(JsonRequest(chat='test-chat', command='echo expired')))
+            _, event = await asyncio.wait_for(self.queue.get(), 2)
+            AssistantStore(self.root).decide(event['id'], False)
+            response = await self.approve(JsonRequest(chat='test-chat', id=event['id'], allow=True))
+            self.assertEqual(response.status_code, 409)
+            self.assertIn('declined', (await pending)['error'])
+            runner.assert_not_called()
+
+    async def test_overwrite_requires_approval_and_rejects_changes_while_pending(self):
+        path = self.root / 'existing.txt'
+        path.write_text('original', encoding='utf-8')
+        body = JsonRequest(chat='test-chat', operation='write', path='existing.txt', content='replacement')
+        pending = asyncio.create_task(server.agent_files(body))
+        _, event = await asyncio.wait_for(self.queue.get(), 2)
+        self.assertEqual(event['kind'], 'file_write')
+        self.assertEqual(path.read_text(), 'original')
+        await self.approve(JsonRequest(chat='test-chat', id=event['id'], allow=False))
+        self.assertIn('declined', (await pending)['error'])
+        pending = asyncio.create_task(server.agent_files(body))
+        _, event = await asyncio.wait_for(self.queue.get(), 2)
+        path.write_text('changed elsewhere', encoding='utf-8')
+        await self.approve(JsonRequest(chat='test-chat', id=event['id'], allow=True))
+        self.assertEqual((await pending).status_code, 400)
+        self.assertEqual(path.read_text(), 'changed elsewhere')
+        pending = asyncio.create_task(server.agent_files(body))
+        _, event = await asyncio.wait_for(self.queue.get(), 2)
+        await self.approve(JsonRequest(chat='test-chat', id=event['id'], allow=True))
+        self.assertTrue((await pending)['written'])
+        self.assertEqual(path.read_text(), 'replacement')
+
+    async def approve(self, request):
+        response = await server.agent_approval(request)
+        if isinstance(response, dict) and response.get('ok') and 'journal' not in self.chat:
+            _, event = await asyncio.wait_for(self.queue.get(), 2)
+            self.assertEqual(event['t'], 'approval_result')
+        return response
+
+    async def test_approval_receipt_is_persisted_before_execution(self):
+        from agent_history import Journal
+        self.chat['journal'] = journal = Journal(self.root, 'test-chat')
+        async def execute(*args):
+            self.assertEqual(Journal(self.root, 'test-chat').events[-1]['state'], 'approved')
+            return {'output': 'ok'}
+        with patch.object(server, 'run_shell', side_effect=execute):
+            pending = asyncio.create_task(server.agent_shell(JsonRequest(chat='test-chat', command='echo test')))
+            _, event = await asyncio.wait_for(self.queue.get(), 2)
+            journal.append(event)
+            await self.approve(JsonRequest(chat='test-chat', id=event['id'], allow=True))
+            self.assertEqual((await pending)['output'], 'ok')
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -78,19 +132,23 @@ class ApprovalTests(unittest.IsolatedAsyncioTestCase):
             kind, event = await asyncio.wait_for(self.queue.get(), 2)
             self.assertEqual(event['t'], 'approval')
             runner.assert_not_called()
-            await server.agent_approval(JsonRequest(chat='test-chat', id=event['id'], allow=False))
+            await self.approve(JsonRequest(chat='test-chat', id=event['id'], allow=False))
             self.assertIn('declined', (await task)['error'])
             runner.assert_not_called()
             task = asyncio.create_task(server.agent_shell(JsonRequest(chat='test-chat', command='echo approved')))
             _, event = await self.queue.get()
-            await server.agent_approval(JsonRequest(chat='test-chat', id=event['id'], allow=True))
+            await self.approve(JsonRequest(chat='test-chat', id=event['id'], allow=True))
             self.assertEqual((await task)['output'], 'ok')
             runner.assert_awaited_once()
             self.assertEqual(runner.call_args.args[0], 'echo approved')
-            stale = await server.agent_approval(JsonRequest(chat='test-chat', id=event['id'], allow=True))
+            stale = await self.approve(JsonRequest(chat='test-chat', id=event['id'], allow=True))
             self.assertEqual(stale.status_code, 409)
 
     async def test_cancelled_approval_cannot_run_in_next_turn(self):
+        from agent_store import AssistantStore
+        store = AssistantStore(self.root)
+        store.reserve('old', 'test-chat', 'old-message', {}, {'t': 'user', 'text': 'old'})
+        self.chat['request_id'] = 'old'
         runner = AsyncMock()
         with patch.object(server, 'run_shell', runner):
             task = asyncio.create_task(server.agent_shell(JsonRequest(chat='test-chat', command='echo stale')))
@@ -99,9 +157,11 @@ class ApprovalTests(unittest.IsolatedAsyncioTestCase):
             self.cancel.set()
             pending.set_result(True)
             # Simulate a new turn replacing mutable state while the old request wakes.
-            self.chat.update(cancel=asyncio.Event(), approvals={})
+            store.reserve('new', 'test-chat', 'new-message', {}, {'t': 'user', 'text': 'new'})
+            self.chat.update(cancel=asyncio.Event(), approvals={}, request_id='new')
             self.assertIn('stopped', (await task)['error'])
             runner.assert_not_called()
+            self.assertEqual(store.receipt('new', 'new-message')['state'], 'queued')
 
     async def test_tool_cannot_choose_its_own_file_scope(self):
         outside = self.root.parent / 'outside-probe.txt'
@@ -156,14 +216,15 @@ class McpIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
                 async def send(id_, method, params):
-                    proc.stdin.write((json.dumps({'id': id_, 'method': method, 'params': params}) + '\n').encode())
+                    proc.stdin.write((json.dumps({'jsonrpc': '2.0', **({'id': id_} if id_ is not None else {}), 'method': method, 'params': params}) + '\n').encode())
                     await proc.stdin.drain()
 
                 async def receive():
                     return json.loads(await asyncio.wait_for(proc.stdout.readline(), 15))
 
-                await send(1, 'initialize', {'protocolVersion': '2025-06-18'})
+                await send(1, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name':'test','version':'1'}})
                 self.assertIn('result', await receive())
+                await send(None, 'notifications/initialized', {})
                 await send(2, 'tools/list', {})
                 names = {tool['name'] for tool in (await receive())['result']['tools']}
                 self.assertTrue({'read_file', 'write_file', 'list_files', 'run_shell'} <= names)

@@ -2,6 +2,7 @@ import type { ComponentProps } from "react";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectTrigger,
   SelectValue,
@@ -42,11 +43,13 @@ export function ChoiceSelect<T extends string | number>({
         alignItemWithTrigger={false}
         className="w-max min-w-(--anchor-width) max-w-[min(28rem,calc(100vw-2rem))]"
       >
-        {options.map((option) => (
-          <SelectItem key={option.value} value={option.value}>
-            {option.label}
-          </SelectItem>
-        ))}
+        <SelectGroup>
+          {options.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
+        </SelectGroup>
       </SelectContent>
     </Select>
   );

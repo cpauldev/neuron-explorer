@@ -12,15 +12,11 @@
   --link: var(--foreground);
   --sel: #ffffff;
   --font: var(--font-sans);
-  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --mono: var(--font-mono);
 }
 /* Legacy explorer rules stop at registry component surfaces, including portals. */
 @scope (:root) to (.assistant-surface, [data-ui], [data-assistant-ui]) {
-* { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: #50545a #101214; }
-::-webkit-scrollbar { width: 9px; height: 9px; }
-::-webkit-scrollbar-track { background: #101214; }
-::-webkit-scrollbar-thumb { background: #50545a; border: 2px solid #101214; border-radius: 8px; }
-::-webkit-scrollbar-thumb:hover { background: #70757d; }
+* { box-sizing: border-box; }
 [hidden] { display: none !important; }
 .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .dim { color: var(--dim); }

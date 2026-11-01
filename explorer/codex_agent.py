@@ -1,15 +1,17 @@
-"""Small, stdlib-only client for Codex CLI 0.164+ app-server over stdio.
+"""Explorer adapter over the pinned official Codex Python SDK.
 
 The explorer owns the browser protocol; this module translates Codex notifications
 without exposing Codex credentials or changing the user's global configuration.
 """
 import asyncio
-from collections import deque
 import json
 import os
 import re
-import shutil
-from agent_common import AgentError, explorer_mcp, process_options, stop_process, tool_output
+from agent_common import AgentError, explorer_mcp, tool_output
+from openai_codex import CodexConfig, CodexError
+from openai_codex.client import CodexClient as SdkClient
+from openai_codex.generated import v2_all as protocol
+from pydantic import BaseModel
 
 def thread_config(config, root, chat, port):
     """Disable inherited integrations; expose only this conversation's explorer."""
@@ -49,9 +51,11 @@ def browser_event(message):
     """Convert public app-server events to the explorer's NDJSON events."""
     method, p = message.get('method'), message.get('params') or {}
     if method == 'item/agentMessage/delta':
-        return {'t': 'text', 'text': p.get('delta', '')}
+        return {'t': 'text', 'text': p.get('delta', ''), **({'id': p['itemId']} if p.get('itemId') else {})}
     if method in ('item/started', 'item/completed'):
         item = p.get('item') or {}
+        if item.get('type') == 'agentMessage' and item.get('id'):
+            return {'t': 'text_phase', 'id': item['id'], 'phase': item.get('phase')}
         if item.get('type') == 'mcpToolCall':
             if method == 'item/started':
                 return {'t': 'tool', 'id': item['id'], 'name': item['tool'], 'input': item.get('arguments', {})}
@@ -75,31 +79,43 @@ def browser_event(message):
 class CodexClient:
     def __init__(self, cwd, queue):
         self.cwd, self.queue = cwd, queue
-        self.proc = None
-        self.pending = {}
-        self.serial = 0
-        self.stderr = deque(maxlen=30)
-        self.tasks = []
+        self.sdk = None
+        self.reader = None
+        self.turn_reader = None
         self.thread = self.turn = None
+        self.closing = False
 
     @property
     def alive(self):
-        return bool(self.proc and self.proc.returncode is None and self.tasks and all(not t.done() for t in self.tasks))
+        return bool(self.sdk and self.reader and not self.reader.done() and not self.closing)
+
+    def _approval(self, method, params):
+        # SDK callbacks run on its reader thread. Never use its permissive default.
+        if method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval'):
+            return {'decision': 'decline'}
+        if method == 'item/permissions/requestApproval':
+            return {'permissions': {}, 'scope': 'turn'}
+        if method in ('item/tool/requestUserInput', 'tool/requestUserInput'):
+            return {'answers': {}}
+        if method == 'mcpServer/elicitation/request':
+            return {'action': 'decline', 'content': None}
+        raise AgentError(f'Unsupported Codex client request: {method}')
 
     async def start(self):
-        binary = os.environ.get('EXPLORER_CODEX_BIN') or shutil.which('codex')
-        if not binary:
-            raise AgentError('Codex CLI not found. Install Codex CLI 0.164+ and run codex login.')
+        self.closing = False
+        self.sdk = SdkClient(CodexConfig(
+            codex_bin=os.environ.get('EXPLORER_CODEX_BIN') or None,
+            cwd=self.cwd, client_name='neuron_explorer', client_title='Neuron Explorer',
+            client_version='0.1.0', experimental_api=False), approval_handler=self._approval)
         try:
-            self.proc = await asyncio.create_subprocess_exec(
-                binary, 'app-server', '--listen', 'stdio://',
-                cwd=self.cwd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE, limit=1 << 24, **process_options())
-        except OSError as e:
-            raise AgentError(f'Cannot start Codex CLI: {e}') from e
-        self.tasks = [asyncio.create_task(self._read()), asyncio.create_task(self._stderr())]
-        await self.call('initialize', {'clientInfo': {'name': 'neuron_explorer', 'title': 'Neuron Explorer', 'version': '0.1.0'}})
-        await self.send({'method': 'initialized', 'params': {}})
+            await asyncio.wait_for(asyncio.to_thread(self.sdk.start), 30)
+            await asyncio.wait_for(asyncio.to_thread(self.sdk.initialize), 60)
+            self.reader = asyncio.create_task(self._read(self.sdk))
+        except BaseException as e:
+            await self.close()
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            raise AgentError(f'Could not start the Codex SDK runtime: {e}') from e
 
     async def history(self, thread):
         """Read only a server-owned thread and translate its public transcript items."""
@@ -117,74 +133,71 @@ class CodexClient:
                         text = text.split('\n\n', 1)[1]
                     events.append({'t': 'user', 'text': text})
                 elif kind == 'agentMessage':
-                    events.append({'t': 'text', 'text': item.get('text', '')})
+                    if item.get('id'):
+                        events.append({'t': 'text_phase', 'id': item['id'], 'phase': item.get('phase')})
+                    events.append({'t': 'text', 'text': item.get('text', ''), **({'id': item['id']} if item.get('id') else {})})
                 elif kind == 'mcpToolCall':
                     for method in ('item/started', 'item/completed'):
                         events.append(browser_event({'method': method, 'params': {'item': item}}))
             events.append({'t': 'done', 'status': turn.get('status')})
         return events
 
-    async def send(self, message):
-        self.proc.stdin.write((json.dumps(message) + '\n').encode())
-        await self.proc.stdin.drain()
-
     async def call(self, method, params, timeout=60):
-        self.serial += 1
-        id_ = self.serial
-        future = asyncio.get_running_loop().create_future()
-        self.pending[id_] = future
+        responses = {
+            'config/read': protocol.ConfigReadResponse,
+            'model/list': protocol.ModelListResponse,
+            'thread/start': protocol.ThreadStartResponse,
+            'thread/resume': protocol.ThreadResumeResponse,
+            'thread/read': protocol.ThreadReadResponse,
+            'thread/revert': protocol.ThreadRevertResponse,
+            'turn/start': protocol.TurnStartResponse,
+            'turn/interrupt': protocol.TurnInterruptResponse,
+        }
+        if method not in responses:
+            raise AgentError(f'Unsupported Codex operation: {method}')
         try:
-            await self.send({'id': id_, 'method': method, 'params': params})
-            return await asyncio.wait_for(future, timeout)
+            if method == 'turn/start':
+                # The SDK registers the subscription before releasing early turn events.
+                result = await asyncio.wait_for(asyncio.to_thread(
+                    self.sdk.turn_start, params['threadId'], params['input']), timeout)
+                self.turn = result.turn.id
+                self.turn_reader = asyncio.create_task(self._read(self.sdk, self.turn))
+            else:
+                result = await asyncio.wait_for(asyncio.to_thread(
+                    self.sdk.request, method, params, response_model=responses[method]), timeout)
+            return result.model_dump(mode='json', by_alias=True)
         except asyncio.TimeoutError as e:
-            raise AgentError(f'Codex timed out during {method}. Check CLI login and MCP startup.') from e
-        finally:
-            self.pending.pop(id_, None)
+            # A timed-out request may have reached the provider. Close; never replay it.
+            await self.close()
+            raise AgentError(f'Codex timed out during {method}; its outcome may be unknown. Reload the conversation before continuing.') from e
+        except (CodexError, ValueError, OSError) as e:
+            raise AgentError(str(e)) from e
 
-    async def _stderr(self):
-        async for line in self.proc.stderr:
-            self.stderr.append(line.decode(errors='replace').rstrip())
-
-    async def _read(self):
+    async def _read(self, sdk, turn=None):
+        failed = False
         try:
-            async for line in self.proc.stdout:
-                m = json.loads(line)
-                if 'id' in m and 'method' not in m:
-                    future = self.pending.get(m['id'])
-                    if future is not None and not future.done():
-                        if 'error' in m:
-                            future.set_exception(AgentError(m['error'].get('message', 'Codex request failed')))
-                        else:
-                            future.set_result(m.get('result', {}))
-                elif 'id' in m:
-                    # This panel cannot grant shell/file escalation or silently answer questions.
-                    method = m['method']
-                    if method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval'):
-                        result = {'decision': 'decline'}
-                    elif method == 'item/permissions/requestApproval':
-                        result = {'permissions': {}, 'scope': 'turn'}
-                    elif method in ('item/tool/requestUserInput', 'tool/requestUserInput'):
-                        result = {'answers': {}}
-                    elif method == 'mcpServer/elicitation/request':
-                        result = {'action': 'decline', 'content': None}
-                    else:
-                        await self.send({'id': m['id'], 'error': {'code': -32601, 'message': 'Unsupported explorer client request'}})
-                        continue
-                    await self.send({'id': m['id'], 'result': result})
-                    self.queue.put_nowait(('event', {'t': 'error', 'error': 'Use the shared explorer file tools and run_shell for research scripts. Shell requests can be approved in this panel.'}))
-                else:
-                    if m.get('method') == 'turn/started':
-                        self.turn = m['params']['turn']['id']
-                    event = browser_event(m)
-                    if event:
-                        self.queue.put_nowait(('event', event))
-        except (ValueError, OSError) as e:
-            self.stderr.append(str(e))
+            while True:
+                notification = await asyncio.to_thread(sdk.next_turn_notification, turn) if turn else await asyncio.to_thread(sdk.next_notification)
+                payload = notification.payload
+                params = payload.model_dump(mode='json', by_alias=True) if isinstance(payload, BaseModel) else payload.params
+                if notification.method == 'turn/started':
+                    self.turn = params['turn']['id']
+                event = browser_event({'method': notification.method, 'params': params})
+                if event:
+                    self.queue.put_nowait(('event', event))
+                    if turn and event['t'] == 'done':
+                        return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            failed = True
+            if not self.closing:
+                self.queue.put_nowait(('event', {'t': 'error', 'error': f'Codex connection closed: {e}'}))
         finally:
-            for future in self.pending.values():
-                if not future.done():
-                    future.set_exception(AgentError('Codex app-server stopped unexpectedly. Check codex login and CLI version.'))
-            self.queue.put_nowait(('closed', None))
+            if turn:
+                sdk.unregister_turn_notifications(turn)
+            if not self.closing and (not turn or failed):
+                self.queue.put_nowait(('closed', None))
 
     async def open_thread(self, root, chat, port, instructions, thread=None):
         effective = (await self.call('config/read', {'cwd': self.cwd, 'includeLayers': False})).get('config', {})
@@ -217,19 +230,21 @@ class CodexClient:
         return self.thread
 
     async def close(self):
-        if self.proc is None:
+        if self.closing:
             return
-        if self.proc.returncode is None and self.thread and self.turn:
-            try:
-                await self.call('turn/interrupt', {'threadId': self.thread, 'turnId': self.turn}, timeout=5)
-            except (AgentError, OSError):
-                pass
-        if self.proc.returncode is None:
-            self.proc.stdin.close()
-            try:
-                await asyncio.wait_for(self.proc.wait(), 5)
-            except asyncio.TimeoutError:
-                await stop_process(self.proc)
-        for task in self.tasks:
+        self.closing = True
+        sdk, self.sdk = self.sdk, None
+        if sdk is not None:
+            if self.thread and self.turn:
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(
+                        sdk.request, 'turn/interrupt', {'threadId': self.thread, 'turnId': self.turn},
+                        response_model=protocol.TurnInterruptResponse), 5)
+                except (Exception, asyncio.CancelledError):
+                    pass
+            await asyncio.to_thread(sdk.close)
+        tasks = [task for task in (self.reader, self.turn_reader) if task is not None]
+        for task in tasks:
             task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.reader = self.turn_reader = None

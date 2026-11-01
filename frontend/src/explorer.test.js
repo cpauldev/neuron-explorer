@@ -232,3 +232,47 @@ describe("React explorer actions and the acknowledged UI controller", () => {
     });
   });
 });
+
+it("restores collapsed panels and keeps focus restoration from opening Workbench", async () => {
+  explorer.actions.togglePanel("assistant", true);
+  explorer.actions.togglePanel("tools", true);
+  const restored = createExplorer(indexFixture);
+  try {
+    expect(restored.getSnapshot()).toMatchObject({
+      assistantOpen: false,
+      toolsOpen: false,
+      activePanel: null,
+    });
+    await restored.actions.select(7, 1870, "neuron", {
+      push: false,
+      preservePanels: true,
+    });
+    expect(restored.getSnapshot()).toMatchObject({
+      assistantOpen: false,
+      toolsOpen: false,
+      activePanel: null,
+    });
+    await restored.actions.select(8, 12);
+    expect(restored.getSnapshot()).toMatchObject({
+      toolsOpen: true,
+      activePanel: "tools",
+    });
+  } finally {
+    restored.actions.dispose();
+  }
+});
+
+it("opens Cache for an explicit build link even when Workbench was saved closed", () => {
+  explorer.actions.togglePanel("tools", true);
+  history.replaceState(null, "", "/?build");
+  const restored = createExplorer(indexFixture);
+  try {
+    expect(restored.getSnapshot()).toMatchObject({
+      toolsOpen: true,
+      activePanel: "tools",
+      workbenchTab: "cache",
+    });
+  } finally {
+    restored.actions.dispose();
+  }
+});

@@ -1,4 +1,13 @@
-import { SlidersHorizontalIcon, ScanIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  MessageSquareIcon,
+  WrenchIcon,
+  CircleAlertIcon,
+  Loader2Icon,
+  SlidersHorizontalIcon,
+  ScanIcon,
+} from "lucide-react";
 import { useExplorer } from "../context";
 import { TabsList, TabsTrigger } from "./ui/tabs";
 import { ChoiceSelect } from "./choice-select";
@@ -9,6 +18,7 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Switch } from "./ui/switch";
 import { TooltipIconButton } from "./tooltip-icon-button";
+import { useAssistantActivity } from "../assistant/activity";
 import { refLabel } from "../lib/store";
 
 export function CanvasControls() {
@@ -123,6 +133,64 @@ export function CanvasControls() {
         </div>
       )}
     </div>
+  );
+}
+
+export function ScenePanelOpeners() {
+  const [, a] = useExplorer([]);
+  const layout = useWorkspaceLayout();
+  const activity = useAssistantActivity();
+  return (
+    <nav className="scene-panel-openers" aria-label="Workspace panels">
+      <div>
+        {!layout.assistant && (
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label="Open assistant"
+            aria-expanded={false}
+            aria-controls="assistant-sidebar"
+            title={
+              activity === "approval"
+                ? "Command approval requested"
+                : activity === "working"
+                  ? "Assistant is working"
+                  : undefined
+            }
+            onClick={a.openAssistant}
+          >
+            {activity === "approval" ? (
+              <CircleAlertIcon aria-hidden="true" />
+            ) : activity === "working" ? (
+              <Loader2Icon
+                aria-hidden="true"
+                className="animate-spin motion-reduce:animate-none"
+              />
+            ) : (
+              <MessageSquareIcon aria-hidden="true" />
+            )}
+            Assistant
+            <ArrowRightIcon aria-hidden="true" />
+          </Button>
+        )}
+      </div>
+      <div>
+        {!layout.tools && (
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label="Open workbench"
+            aria-expanded={false}
+            aria-controls="tools-sidebar"
+            onClick={() => a.togglePanel("tools", false)}
+          >
+            <ArrowLeftIcon aria-hidden="true" />
+            Workbench
+            <WrenchIcon aria-hidden="true" />
+          </Button>
+        )}
+      </div>
+    </nav>
   );
 }
 

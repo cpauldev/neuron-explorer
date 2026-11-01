@@ -2,6 +2,7 @@ import React from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   cleanup,
+  act,
   fireEvent,
   render,
   screen,
@@ -19,6 +20,7 @@ import { CanvasControls } from "./CanvasControls";
 import { AssistantSidebar } from "./AssistantSidebar";
 import { ExplorerTools } from "./ExplorerTools";
 import { AssistantPanel } from "../assistant/AssistantPanel";
+import { ResearchToolResult } from "../assistant/ResearchToolResult";
 import { Tabs, TabsContent } from "./ui/tabs";
 
 let explorer, assistant;
@@ -58,6 +60,223 @@ function wrap(children) {
     </ExplorerContext.Provider>,
   );
 }
+it("searches the current conversation, steps through matches, and restores focus on Escape", async () => {
+  assistant.set({
+    messages: [
+      {
+        id: "first",
+        role: "user",
+        content: [{ type: "text", text: "Baseline question" }],
+        metadata: { custom: {} },
+      },
+      {
+        id: "second",
+        role: "assistant",
+        content: [
+          { type: "text", text: "Baseline answer and baseline comparison" },
+        ],
+        status: { type: "complete", reason: "stop" },
+        metadata: { custom: {} },
+      },
+    ],
+  });
+  const { container } = wrap(<AssistantPanel active />);
+  const trigger = screen.getByRole("button", { name: "Search conversation" });
+  fireEvent.click(trigger);
+  const input = screen.getByRole("textbox", { name: "Find in conversation" });
+  expect(document.activeElement).toBe(input);
+  fireEvent.change(input, { target: { value: "baseline" } });
+  expect(screen.getByText("1/3")).toBeTruthy();
+  expect(
+    container.querySelector('[data-slot="conversation-search"]'),
+  ).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Next match" }));
+  expect(screen.getByText("2/3")).toBeTruthy();
+  expect(
+    Element.prototype.scrollIntoView.mock.instances.at(-1).dataset.messageId,
+  ).toBe("second");
+  fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+  expect(screen.getByText("1/3")).toBeTruthy();
+  fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+  expect(screen.getByText("3/3")).toBeTruthy();
+  const previous = screen.getByRole("button", { name: "Previous match" });
+  previous.focus();
+  await userEvent.setup().keyboard("{Enter}");
+  expect(screen.getByText("2/3")).toBeTruthy();
+  fireEvent.change(input, { target: { value: "no match" } });
+  expect(screen.queryByRole("button", { name: "Next match" })).toBeNull();
+  expect(screen.getByText("0 matches")).toBeTruthy();
+  fireEvent.keyDown(input, { key: "Escape" });
+  expect(
+    screen.queryByRole("textbox", { name: "Find in conversation" }),
+  ).toBeNull();
+  expect(document.activeElement).toBe(trigger);
+  fireEvent.keyDown(
+    screen.getByRole("textbox", { name: "Assistant message" }),
+    { key: "f", ctrlKey: true },
+  );
+  expect(document.activeElement).toBe(
+    screen.getByRole("textbox", { name: "Find in conversation" }),
+  );
+  await act(async () =>
+    assistant.set({
+      revision: assistant.getSnapshot().revision + 1,
+      messages: [],
+    }),
+  );
+  expect(
+    screen.queryByRole("textbox", { name: "Find in conversation" }),
+  ).toBeNull();
+});
+it("replaces the official typing indicator with standard Markdown", async () => {
+  const message = {
+    id: "streaming-motion",
+    role: "assistant",
+    content: [],
+    status: { type: "running" },
+    metadata: { custom: {} },
+  };
+  assistant.set({ busy: true, messages: [message] });
+  const { container } = wrap(<AssistantPanel active />);
+  expect(
+    await screen.findByRole("status", { name: "Assistant is typing" }),
+  ).toBeTruthy();
+  expect(
+    container.querySelectorAll('[data-slot="typing-indicator"] > span'),
+  ).toHaveLength(3);
+  await act(async () =>
+    assistant.set({
+      messages: [
+        {
+          ...message,
+          content: [
+            {
+              type: "text",
+              text: "**Bold words** and `code`\n\n- First item\n- Second item",
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  await waitFor(() =>
+    expect(container.querySelector("strong")?.textContent).toBe("Bold words"),
+  );
+  expect(
+    screen.queryByRole("status", { name: "Assistant is typing" }),
+  ).toBeNull();
+  expect(container.querySelector(".assistant-stream-word")).toBeNull();
+  expect(container.querySelector("code .assistant-stream-word")).toBeNull();
+  await waitFor(() =>
+    expect(container.querySelectorAll(".aui-md li")).toHaveLength(2),
+  );
+});
+
+it("uses standard saved Markdown and tool activity without typing dots", async () => {
+  assistant.set({
+    messages: [
+      {
+        id: "saved",
+        role: "assistant",
+        content: [{ type: "text", text: "Previously saved answer" }],
+        status: { type: "complete", reason: "stop" },
+        metadata: { custom: {} },
+      },
+    ],
+  });
+  const { container } = wrap(<AssistantPanel active />);
+  await screen.findByText("Previously saved answer");
+  expect(container.querySelector(".assistant-stream-word")).toBeNull();
+  await act(async () =>
+    assistant.set({
+      busy: true,
+      messages: [
+        {
+          id: "active-tool",
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "overview",
+              toolName: "overview",
+              args: {},
+              argsText: "{}",
+            },
+          ],
+          status: { type: "running" },
+          metadata: { custom: {} },
+        },
+      ],
+    }),
+  );
+  expect(
+    screen.queryByRole("status", { name: "Assistant is typing" }),
+  ).toBeNull();
+  expect(await screen.findByRole("button", { name: "Working" })).toBeTruthy();
+});
+
+it.each(["complete", "running"])(
+  "preserves full Markdown semantics in a %s response",
+  async (state) => {
+    const text =
+      "# Formatting check\n\nA **bold** and *italic* paragraph with [a link](https://example.com) and `inline_code`.\n\n> A quoted passage.\n\n- First item\n- Second item\n\n| Name | Count |\n| --- | --- |\n| Alpha | 2 |\n\n```python\nprint('hello')\nprint('world')\n```";
+    assistant.set({
+      busy: state === "running",
+      messages: [
+        {
+          id: "markdown-check",
+          role: "assistant",
+          content: [{ type: "text", text }],
+          status:
+            state === "running"
+              ? { type: "running" }
+              : { type: "complete", reason: "stop" },
+          metadata: { custom: {} },
+        },
+      ],
+    });
+    const { container } = wrap(<AssistantPanel active />);
+    await waitFor(
+      () =>
+        expect(container.querySelector("pre code")?.textContent).toBe(
+          "print('hello')\nprint('world')\n",
+        ),
+      { timeout: 8000 },
+    );
+    const markdown = container.querySelector(".aui-md");
+    expect(markdown.querySelector("h1")?.textContent).toBe("Formatting check");
+    expect(markdown.querySelector("strong")?.textContent).toBe("bold");
+    expect(markdown.querySelector("em")?.textContent).toBe("italic");
+    expect(
+      markdown.querySelector('a[href="https://example.com"]')?.textContent,
+    ).toBe("a link");
+    expect(markdown.querySelector("blockquote")?.textContent).toContain(
+      "A quoted passage.",
+    );
+    expect(markdown.querySelectorAll("ul li")).toHaveLength(2);
+    expect(markdown.querySelectorAll("table tbody tr")).toHaveLength(1);
+    expect(markdown.querySelectorAll("table td")).toHaveLength(2);
+    expect(markdown.querySelector("pre code")?.textContent).toBe(
+      "print('hello')\nprint('world')\n",
+    );
+    expect(markdown.querySelector("code .assistant-stream-word")).toBeNull();
+  },
+);
+it("does not report a successful exit for a stopped command without a result", () => {
+  wrap(
+    <ResearchToolResult
+      toolName="run_shell"
+      args={{ command: "echo test" }}
+      result={undefined}
+      isError={false}
+      status={{ type: "incomplete", reason: "cancelled" }}
+    />,
+  );
+  expect(
+    screen.getByText("Command stopped; no execution result was received."),
+  ).toBeTruthy();
+  expect(screen.queryByText("exit 0")).toBeNull();
+});
 it("uses accessible toolbar tabs and supports keyboard navigation", async () => {
   // Avoid a network request for this tab-navigation test.
   explorer.actions.setView = (view) => explorer.set({ view });
@@ -423,7 +642,7 @@ it("renders official terminal/fallback components from the render-only toolkit",
     ],
   });
   const { container } = wrap(<AssistantPanel active />);
-  fireEvent.click(screen.getByRole("button", { name: "2 tool calls" }));
+  fireEvent.click(screen.getByRole("button", { name: "Completed" }));
   expect(await screen.findByText("echo sample")).toBeTruthy();
   expect(container.querySelector('[data-slot="terminal-block"]')).toBeTruthy();
   expect(
@@ -522,7 +741,7 @@ it("opens saved conversations through the official searchable thread list", asyn
   expect(assistant.getSnapshot().provider).toBe("claude");
   expect(screen.queryByRole("button", { name: "More options" })).toBe(null);
 });
-it("shows the official loader only before the first visible response", async () => {
+it("shows typing dots only before the first visible response", async () => {
   assistant.set({
     busy: true,
     messages: [
@@ -536,7 +755,7 @@ it("shows the official loader only before the first visible response", async () 
   });
   wrap(<AssistantPanel active />);
   expect(
-    screen.getByRole("status", { name: "Assistant is working" }),
+    screen.getByRole("status", { name: "Assistant is typing" }),
   ).toBeTruthy();
   assistant.set({
     messages: [
@@ -551,7 +770,7 @@ it("shows the official loader only before the first visible response", async () 
     ],
   });
   await waitFor(() =>
-    expect(screen.queryByRole("status", { name: "Assistant is working" })).toBe(
+    expect(screen.queryByRole("status", { name: "Assistant is typing" })).toBe(
       null,
     ),
   );
@@ -1011,7 +1230,7 @@ it("renders actual ranked-neuron and probability result schemas", async () => {
     ],
   });
   wrap(<AssistantPanel active />);
-  fireEvent.click(screen.getByRole("button", { name: "2 tool calls" }));
+  fireEvent.click(screen.getByRole("button", { name: "Completed" }));
   expect(await screen.findByText("writing")).toBeTruthy();
   expect(screen.getByText("20.0%")).toBeTruthy();
   expect(screen.getByText("40.0%")).toBeTruthy();
@@ -1073,8 +1292,75 @@ it("labels logit-lens fallback data accurately instead of claiming steering resu
     ],
   });
   wrap(<AssistantPanel active />);
-  fireEvent.click(screen.getByRole("button", { name: "1 tool call" }));
+  fireEvent.click(screen.getByRole("button", { name: "Completed" }));
   expect(await screen.findByText("Positive logit lens")).toBeTruthy();
   expect(screen.getByText("Negative logit lens")).toBeTruthy();
   expect(screen.queryByText("Positive steering lens")).toBe(null);
+});
+
+it("collapses explicit commentary while keeping answers, findings and failed tools visible", async () => {
+  assistant.set({
+    messages: [
+      {
+        id: "activity",
+        role: "assistant",
+        status: { type: "complete", reason: "stop" },
+        metadata: {
+          custom: {
+            textPhases: { progress: "commentary", answer: "final_answer" },
+            startedAt: 1000,
+            endedAt: 6000,
+          },
+        },
+        content: [
+          { type: "text", id: "progress", text: "Checking the model" },
+          {
+            type: "tool-call",
+            toolCallId: "bad",
+            toolName: "neuron",
+            args: {},
+            argsText: "{}",
+            result: "failure detail",
+            isError: true,
+          },
+          { type: "text", id: "answer", text: "**Verified answer**" },
+          {
+            type: "text",
+            id: "unknown",
+            text: "Unclassified text stays visible",
+          },
+        ],
+      },
+    ],
+  });
+  const { container } = wrap(<AssistantPanel active />);
+  expect(await screen.findByText("Verified answer")).toBeTruthy();
+  expect(screen.getByText("Unclassified text stays visible")).toBeTruthy();
+  expect(screen.queryByText("Checking the model")).toBeNull();
+  const failure = container.querySelector('[data-slot="tool-fallback-root"]');
+  expect(failure).toBeTruthy();
+  expect(failure.closest("[data-activity-kind]")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Completed 5s" }));
+  expect(await screen.findByText("Checking the model")).toBeTruthy();
+  expect(screen.getAllByText("Verified answer")).toHaveLength(1);
+});
+
+it("keeps stopped Markdown intact and offers retry only on the latest idle turn", async () => {
+  assistant.set({
+    messages: [
+      {
+        id: "stopped",
+        role: "assistant",
+        content: [{ type: "text", text: "**Partial answer**" }],
+        status: { type: "incomplete", reason: "cancelled" },
+        metadata: { custom: { stopped: true } },
+      },
+    ],
+  });
+  wrap(<AssistantPanel active />);
+  expect(await screen.findByText("Partial answer")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Retry response" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Continue" })).toBeNull();
+  await act(async () => assistant.set({ busy: true }));
+  expect(screen.queryByRole("button", { name: "Retry response" })).toBeNull();
 });

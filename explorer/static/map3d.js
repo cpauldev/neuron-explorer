@@ -297,14 +297,20 @@ export function createMap(canvas, labelsDiv, arch, cb) {
 
   // layer labels: text drawn in each layer's plane, just above the top-right corner of its neuron sheet
   const LABEL_H = Number(new URLSearchParams(location.search).get("labelsize")) || 0.2;
+  const labelFont = `600 64px ${getComputedStyle(canvas).getPropertyValue("--font-mono").trim() || "ui-monospace, Menlo, monospace"}`;
+  function drawLayerLabel(cv, layer) {
+    const ctx = cv.getContext("2d");
+    ctx.font = labelFont;
+    const width = Math.ceil(ctx.measureText(`L${layer}`).width) + 8;
+    cv.width = width; cv.height = 80;
+    ctx.font = labelFont; ctx.fillStyle = "#fff"; ctx.textBaseline = "middle";
+    ctx.fillText(`L${layer}`, 4, 42);
+    return LABEL_H * width / 80;
+  }
   const labels = [];
   for (let l = 0; l < L; l++) {
-    const cv = document.createElement("canvas"), ctx = cv.getContext("2d"), font = "600 64px ui-monospace, Menlo, monospace";
-    ctx.font = font; const tw = Math.ceil(ctx.measureText(`L${l}`).width) + 8;
-    cv.width = tw; cv.height = 80;
-    ctx.font = font; ctx.fillStyle = "#fff"; ctx.textBaseline = "middle"; ctx.fillText(`L${l}`, 4, 42);
+    const cv = document.createElement("canvas"), w = drawLayerLabel(cv, l);
     const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 8;
-    const w = LABEL_H * tw / 80;
     const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide, color: 0xc8d4da });
     mat.userData.base = 0.85;
     const m = new THREE.Mesh(new THREE.PlaneGeometry(w, LABEL_H), mat);
@@ -314,6 +320,17 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     m.userData = { layer: l };
     scene.add(m); labels.push(m);
   }
+  // Canvas textures do not repaint automatically when the local font loads.
+  document.fonts?.load(labelFont, "L0").then(() => {
+    if (disposed) return;
+    labels.forEach((mesh, layer) => {
+      const width = drawLayerLabel(mesh.material.map.image, layer);
+      mesh.scale.x = width / mesh.geometry.parameters.width;
+      mesh.position.z = -SHEET / 2 + width / 2;
+      mesh.material.map.needsUpdate = true;
+    });
+    render();
+  }).catch(() => {}); // Retain the system-font texture if font loading fails.
   const dataLayers = new Set();
   let unitsLayer = null;
 

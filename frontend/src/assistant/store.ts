@@ -318,6 +318,7 @@ export function createAssistant(explorer: ExplorerStore) {
     try {
       const s = get(),
         body = {
+          request_id: crypto.randomUUID(),
           browser: explorer.actions.browserId,
           provider: s.provider,
           model: s.model,

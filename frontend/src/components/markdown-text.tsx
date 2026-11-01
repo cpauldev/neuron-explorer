@@ -10,6 +10,7 @@ import {
   useIsMarkdownCodeBlock,
 } from "@assistant-ui/react-markdown";
 import remarkGfm from "remark-gfm";
+import { SyntaxHighlighter } from "./shiki-highlighter.aui";
 import { type FC, memo, useMemo, useRef } from "react";
 import type { TextMessagePartProps } from "@assistant-ui/react";
 import { CheckIcon, CopyIcon } from "lucide-react";
@@ -100,6 +101,7 @@ const CodeHeader: FC<CodeHeaderProps> = ({ language, code }) => {
 };
 
 const defaultComponents = memoizeMarkdownComponents({
+  SyntaxHighlighter,
   h1: ({ className, ...props }) => (
     <h1
       className={cn(

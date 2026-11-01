@@ -1,5 +1,5 @@
 """Stdio MCP server that gives the explorer's assistant chat its tools: read any neuron data through the explorer's HTTP API,
-run the live model (steered rollouts, activations) when it is loaded, and drive the map (select, highlight) in the browser that started the chat. Standard library only; started by
+run the live model (steered rollouts, activations) when it is loaded, and drive the map (select, highlight) in the browser that started the chat. Started by
 the selected CLI from server.py with EXPLORER_URL and EXPLORER_CHAT set.
 """
 import json
@@ -360,54 +360,42 @@ def call(name, a):
     raise ValueError(f"unknown tool {name}")
 
 
-def reply(id_, result=None, error=None):
-    msg = {"jsonrpc": "2.0", "id": id_}
-    msg.update({"error": error} if error else {"result": result})
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+async def serve():
+    """Let the official SDK own negotiation, framing, cancellation and dispatch."""
+    import asyncio
+    from jsonschema import validate
+    from mcp.server.lowlevel import Server
+    from mcp.server.stdio import stdio_server
+    from mcp import types
+
+    schemas = {tool['name']: tool['inputSchema'] for tool in TOOLS}
+
+    async def list_tools(context, params):
+        return types.ListToolsResult(tools=[types.Tool.model_validate(tool) for tool in TOOLS])
+
+    async def call_tool(context, params):
+        try:
+            if params.name not in schemas:
+                raise ValueError(f'unknown tool {params.name}')
+            arguments = params.arguments or {}
+            validate(arguments, schemas[params.name])
+            out = await asyncio.to_thread(call, params.name, arguments)
+            return types.CallToolResult(
+                content=[types.TextContent(type='text', text=json.dumps(out, ensure_ascii=False))],
+                is_error=bool(isinstance(out, dict) and out.get('error')))
+        except Exception as e:
+            return types.CallToolResult(content=[types.TextContent(type='text', text=f'error: {e}')], is_error=True)
+
+    server = Server('explorer', version='0.2.0', on_list_tools=list_tools, on_call_tool=call_tool,
+                    get_tool_input_schema=schemas.get)
+    async with stdio_server() as (reader, writer):
+        await server.run(reader, writer, server.create_initialization_options())
 
 
 def main():
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            m = json.loads(line)
-        except ValueError:
-            reply(None, error={"code": -32700, "message": "invalid JSON"})
-            continue
-        if not isinstance(m, dict):
-            reply(None, error={"code": -32600, "message": "request must be an object"})
-            continue
-        method, id_ = m.get("method"), m.get("id")
-        if id_ is None:
-            continue  # notifications
-        params = m.get("params", {})
-        if not isinstance(params, dict):
-            reply(id_, error={"code": -32602, "message": "params must be an object"})
-            continue
-        if method == "initialize":
-            reply(id_, {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
-                        "capabilities": {"tools": {}}, "serverInfo": {"name": "explorer", "version": "0.1"}})
-        elif method == "tools/list":
-            reply(id_, {"tools": TOOLS})
-        elif method in ("resources/list", "resources/templates/list"):
-            reply(id_, {"resources" if method == "resources/list" else "resourceTemplates": []})
-        elif method == "tools/call":
-            p = params
-            try:
-                if not isinstance(p.get("arguments", {}), dict):
-                    raise ValueError("tool arguments must be an object")
-                out = call(p["name"], p.get("arguments") or {})
-                reply(id_, {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}],
-                            "isError": bool(isinstance(out, dict) and out.get("error"))})
-            except Exception as e:  # tool errors go back to the model, not the protocol
-                reply(id_, {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True})
-        elif method == "ping":
-            reply(id_, {})
-        else:
-            reply(id_, error={"code": -32601, "message": f"method not found: {method}"})
+    import asyncio
+    asyncio.run(serve())
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

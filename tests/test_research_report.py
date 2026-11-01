@@ -22,14 +22,20 @@ class FindingsTests(unittest.TestCase):
     def test_stdio_accepts_utf8_findings_under_a_legacy_windows_encoding(self):
         report = copy.deepcopy(REPORT)
         report['evidence'][0]['text'] = '写作 · 目前 · café — observed'
-        request = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': 'present_findings', 'arguments': report}}
         explorer = str(Path(__file__).resolve().parents[1] / 'explorer')
         script = f'import sys; sys.path.insert(0, {explorer!r}); import agent_mcp; agent_mcp.get = lambda *a, **k: {{"arch": {ARCH!r}}}; agent_mcp.main()'
-        result = subprocess.run([sys.executable, '-c', script], input=(json.dumps(request, ensure_ascii=False) + '\n').encode('utf-8'),
-                                capture_output=True, timeout=10, env={**os.environ, 'PYTHONIOENCODING': 'cp1252'})
-        self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', errors='replace'))
-        reply = json.loads(result.stdout)
-        self.assertFalse(reply['result']['isError'])
+        import asyncio
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        async def run():
+            async with stdio_client(StdioServerParameters(command=sys.executable, args=['-c', script],
+                                    env={**os.environ, 'PYTHONIOENCODING':'cp1252'})) as (reader, writer):
+                async with ClientSession(reader, writer) as session:
+                    await session.initialize()
+                    return await session.call_tool('present_findings', report)
+        response = asyncio.run(run())
+        self.assertFalse(response.is_error)
+        reply = {'result': response.model_dump(mode='json', by_alias=True)}
         self.assertEqual(json.loads(reply['result']['content'][0]['text']), report)
 
     def test_presentation_tool_validates_against_the_explored_model_without_writes(self):

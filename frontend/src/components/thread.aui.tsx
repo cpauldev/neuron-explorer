@@ -9,6 +9,7 @@ import { File, getFileHref } from "@/components/file";
 import { ThreadFollowupSuggestions } from "@/components/follow-up-suggestions.aui";
 import { Image } from "@/components/image";
 import { MarkdownText } from "@/components/markdown-text";
+import { TypingIndicator } from "@/components/typing-indicator";
 import {
   Reasoning,
   ReasoningContent,
@@ -137,6 +138,7 @@ export type ThreadComponents = {
   ComposerContext?: ComponentType;
   UserMessageExtra?: ComponentType;
   MessageExtra?: ComponentType | undefined;
+  MessageBody?: ComponentType<PropsWithChildren> | undefined;
   Text?: TextMessagePartComponent;
   Footer?: ComponentType | undefined;
   canEdit?: (id: string) => boolean;
@@ -720,6 +722,10 @@ const MessageError: FC = () => {
   );
 };
 
+const MessageBodyWrapper: FC<
+  PropsWithChildren<{ body?: ComponentType<PropsWithChildren> }>
+> = ({ body: Body, children }) => (Body ? <Body>{children}</Body> : children);
+
 const AssistantMessage: FC = () => {
   const {
     ToolFallback: ToolFallbackComponent = ToolFallback,
@@ -727,12 +733,19 @@ const AssistantMessage: FC = () => {
     ReasoningGroup,
     TaskGroup: TaskGroupComponent,
     MessageExtra,
+    MessageBody,
     Text = MarkdownText,
   } = useContext(ThreadComponentsContext);
   const approvalPending = useAuiState((s) =>
     ((s.message.metadata.custom.approvals || []) as { state: string }[]).some(
       (a) => a.state === "request",
     ),
+  );
+  const waitingForContent = useAuiState(
+    (s) =>
+      !s.message.parts.some(
+        (part) => part.type !== "text" || part.text.trim().length > 0,
+      ),
   );
   const groupBy = TaskGroupComponent ? taskAwareGroupBy : messageGroupBy;
 
@@ -750,78 +763,78 @@ const AssistantMessage: FC = () => {
         data-slot="aui_assistant-message-content"
         className="text-foreground px-2 leading-relaxed wrap-break-word"
       >
-        <MessagePrimitive.GroupedParts groupBy={groupBy}>
-          {({ part, children }) => {
-            switch (part.type) {
-              case "group-chainOfThought":
-                return <div data-slot="aui_chain-of-thought">{children}</div>;
-              case "group-task":
-                return TaskGroupComponent ? (
-                  <TaskGroupComponent group={part} />
-                ) : null;
-              case "group-tool":
-                if (ToolGroup) {
-                  return <ToolGroup group={part}>{children}</ToolGroup>;
-                }
-                return (
-                  <DefaultToolGroup group={part}>{children}</DefaultToolGroup>
-                );
-              case "group-reasoning": {
-                if (ReasoningGroup) {
+        <MessageBodyWrapper body={MessageBody}>
+          <MessagePrimitive.GroupedParts groupBy={groupBy}>
+            {({ part, children }) => {
+              switch (part.type) {
+                case "group-chainOfThought":
+                  return <div data-slot="aui_chain-of-thought">{children}</div>;
+                case "group-task":
+                  return TaskGroupComponent ? (
+                    <TaskGroupComponent group={part} />
+                  ) : null;
+                case "group-tool":
+                  if (ToolGroup) {
+                    return <ToolGroup group={part}>{children}</ToolGroup>;
+                  }
                   return (
-                    <ReasoningGroup group={part}>{children}</ReasoningGroup>
+                    <DefaultToolGroup group={part}>{children}</DefaultToolGroup>
+                  );
+                case "group-reasoning": {
+                  if (ReasoningGroup) {
+                    return (
+                      <ReasoningGroup group={part}>{children}</ReasoningGroup>
+                    );
+                  }
+                  const running = part.status.type === "running";
+                  return (
+                    <ReasoningRoot streaming={running}>
+                      <ReasoningTrigger
+                        active={running}
+                        duration={reasoningDuration(part.timing)}
+                      />
+                      <ReasoningContent aria-busy={running}>
+                        <ReasoningText>{children}</ReasoningText>
+                      </ReasoningContent>
+                    </ReasoningRoot>
                   );
                 }
-                const running = part.status.type === "running";
-                return (
-                  <ReasoningRoot streaming={running}>
-                    <ReasoningTrigger
-                      active={running}
-                      duration={reasoningDuration(part.timing)}
-                    />
-                    <ReasoningContent aria-busy={running}>
-                      <ReasoningText>{children}</ReasoningText>
-                    </ReasoningContent>
-                  </ReasoningRoot>
-                );
+                case "text":
+                  return <Text {...part} />;
+                case "reasoning":
+                  return <Reasoning {...part} />;
+                case "tool-call":
+                  return part.toolUI ?? <ToolFallbackComponent {...part} />;
+                case "data":
+                  return part.dataRendererUI;
+                case "file":
+                  return (
+                    <div
+                      data-slot="aui_assistant-message-file"
+                      className="py-1"
+                    >
+                      <MessageFile {...part} />
+                    </div>
+                  );
+                case "image":
+                  return (
+                    <div
+                      data-slot="aui_assistant-message-image"
+                      className="py-1"
+                    >
+                      <Image {...part} />
+                    </div>
+                  );
+                case "indicator":
+                  return !approvalPending && waitingForContent ? (
+                    <TypingIndicator variant="bare" className="py-2" />
+                  ) : null;
+                default:
+                  return null;
               }
-              case "text":
-                return <Text {...part} />;
-              case "reasoning":
-                return <Reasoning {...part} />;
-              case "tool-call":
-                return part.toolUI ?? <ToolFallbackComponent {...part} />;
-              case "data":
-                return part.dataRendererUI;
-              case "file":
-                return (
-                  <div data-slot="aui_assistant-message-file" className="py-1">
-                    <MessageFile {...part} />
-                  </div>
-                );
-              case "image":
-                return (
-                  <div data-slot="aui_assistant-message-image" className="py-1">
-                    <Image {...part} />
-                  </div>
-                );
-              case "indicator":
-                if (approvalPending) return null;
-                return (
-                  <span
-                    data-slot="aui_assistant-message-indicator"
-                    className="animate-pulse font-sans"
-                    role="status"
-                    aria-label="Assistant is working"
-                  >
-                    {"●"}
-                  </span>
-                );
-              default:
-                return null;
-            }
-          }}
-        </MessagePrimitive.GroupedParts>
+            }}
+          </MessagePrimitive.GroupedParts>
+        </MessageBodyWrapper>
         {MessageExtra ? null : <MessageError />}
         {MessageExtra && <MessageExtra />}
       </div>

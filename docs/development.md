@@ -4,6 +4,13 @@ See the [README](../README.md#explorer) for setup and the [usage guide](usage.md
 file permissions, model selection and cache-job commands.
 This guide covers implementation boundaries, testing and integration decisions.
 
+## Python environments
+
+The README's `uv sync` setup installs the project's locked dependencies. If your environment has a custom
+CUDA build of PyTorch, an ordinary sync can replace those wheels. Launch with that environment's Python
+(`.venv/Scripts/python.exe explorer/server.py` on Windows), or use `uv run --no-sync python explorer/server.py`.
+Install any missing project dependencies into that environment deliberately before starting the server.
+
 ## Code organization
 
 | Module | Responsibility |
@@ -20,7 +27,7 @@ This guide covers implementation boundaries, testing and integration decisions.
 | `explorer/server.py` | HTTP endpoints, model integration and assistant turn orchestration. |
 | `explorer/agent_mcp.py` | Shared MCP schemas and routing for both providers. |
 | `explorer/agent_prompt.md`, `explorer/agent_methodology.md` | Assistant operating instructions and separate research methodology, combined when a turn starts. |
-| `explorer/codex_agent.py`, `explorer/claude_agent.py` | Provider protocols, transcript translation and session recovery. |
+| `explorer/codex_agent.py`, `explorer/claude_agent.py` | Official SDK adapters, public event translation and supported session operations. |
 | `explorer/agent_common.py` | Shared transport errors, MCP configuration, bounded client reuse and process-tree cleanup. |
 | `explorer/agent_history.py` | Ordered event journal, interrupted-write recovery and latest-turn rewind. |
 | `explorer/agent_attachments.py` | Upload validation and provider-specific attachment input. |
@@ -60,8 +67,8 @@ python tests/run_checks.py
 uv lock --check
 ```
 
-Install test dependencies with `uv sync --group dev`. If the environment has a custom CUDA PyTorch build,
-install the development dependencies without replacing it, then run checks with that environment's Python.
+Install test dependencies with `uv sync --group dev`. For custom CUDA PyTorch builds,
+follow [Python environments](#python-environments) and install the development dependencies without replacing those wheels.
 
 The runner checks Python syntax, discovers Python tests, checks the visualization/helper JavaScript syntax,
 executes the protocol suites, typechecks/builds the React app, and runs Vitest/React Testing Library tests. It does not
@@ -175,3 +182,31 @@ choices and integration contracts. Update current behavior in those guides inste
 review reports. Record notable changes in the [changelog](../CHANGELOG.md), and experimental observations
 in the [research log](../research_log.md). [Historical source notes](research/source-notes.md) are research
 background, not a description of the current UI. Assistant prompt/methodology files remain runtime inputs.
+
+
+## Assistant integration contract
+
+The Python backend owns a small provider adapter interface (`start`, `open_thread`, `call`, `history`,
+`close`, and Claude's `rewind`). Codex uses the public low-level official SDK client so raw RPC framing,
+notification parsing and process transport remain upstream. Its blocking calls run in worker threads;
+its approval handler explicitly declines native tools and unknown requests. Claude uses `ClaudeSDKClient`
+with a persistent worker that owns connection and cleanup. Both expose only the shared Explorer MCP tools.
+The MCP transport and protocol negotiation are provided by the official MCP SDK; the tool definitions and
+research functions remain Explorer-owned.
+
+`agent_store.py` stores session metadata, ordered events, submission receipts and approval records in SQLite.
+Turn acceptance commits the receipt, user event and session in one transaction; completion commits the terminal
+event and receipt state together. The journal imports legacy Explorer files once without modifying them.
+The HTTP server must run as a single process: live provider leases and UI connections are intentionally
+process-local. Adding multiple workers requires distributed ownership/leases before enabling concurrent execution.
+
+The browser supplies a UUID `request_id` to `/api/agent/send`. Retrying that exact submission returns its original
+chat and cursor. Reusing the ID with changed content is rejected. Server restart recovery expires approvals and
+marks unfinished receipts unknown; it never resubmits a provider turn. A displayed interrupted reply does not
+imply that its tools had no effect. Provider sessions are context state, not the authoritative display history.
+
+Do not edit provider transcript files or use private SDK transport fields. Claude edits use `fork_session` at a
+message UUID or create a fresh session for a first-turn edit. The SDK/runtime versions are pinned in `pyproject.toml`
+and `uv.lock`; upgrade them together after release checks plus authenticated smoke tests for both providers.
+The ordinary release tests use fake transports and do not consume provider inference. Authenticated streaming,
+attachments, cancellation and resume still require separate account-backed verification before release.

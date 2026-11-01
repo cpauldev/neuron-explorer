@@ -11,7 +11,11 @@ import {
 } from "./components/Toolbar";
 import { ExplorerTools } from "./components/ExplorerTools";
 import { AssistantSidebar } from "./components/AssistantSidebar";
-import { CanvasControls, CanvasStatus } from "./components/CanvasControls";
+import {
+  CanvasControls,
+  CanvasStatus,
+  ScenePanelOpeners,
+} from "./components/CanvasControls";
 import { Tooltip, Viewport } from "./components/Viewport";
 import { Workspace } from "./components/Workspace";
 import { Tabs } from "./components/ui/tabs";
@@ -69,6 +73,7 @@ function Explorer({
         >
           <CanvasControls />
           <div className="canvas-scene">
+            <ScenePanelOpeners />
             <Viewport mapRef={map} labelsRef={labels} scatterRef={scatter} />
           </div>
           <CanvasStatus />

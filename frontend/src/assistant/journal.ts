@@ -13,6 +13,7 @@ export function appendEvent(
       {
         id,
         role: "user",
+        ...(event.at ? { createdAt: new Date(event.at * 1000) } : {}),
         content: [{ type: "text", text: event.shown || event.text }],
         metadata: {
           custom: {
@@ -32,9 +33,15 @@ export function appendEvent(
     last = {
       id,
       role: "assistant",
+      ...(event.at ? { createdAt: new Date(event.at * 1000) } : {}),
       content: [],
       status: { type: "running" },
-      metadata: { custom: { approvals: [] } },
+      metadata: {
+        custom: {
+          approvals: [],
+          ...(event.at ? { startedAt: event.at * 1000 } : {}),
+        },
+      },
     };
     next.push(last);
   }
@@ -47,12 +54,16 @@ export function appendEvent(
   const meta = last.metadata.custom;
   if (event.t === "text") {
     const part = last.content.at(-1);
-    if (part?.type === "text")
+    if (part?.type === "text" && (!event.id || part.id === event.id))
       last.content[last.content.length - 1] = {
         ...part,
         text: part.text + event.text,
       };
-    else last.content.push({ type: "text", text: event.text });
+    else
+      last.content.push({ type: "text", text: event.text, id: event.id || id });
+  } else if (event.t === "text_phase") {
+    if (event.phase === "commentary" || event.phase === "final_answer")
+      meta.textPhases = { ...meta.textPhases, [event.id]: event.phase };
   } else if (event.t === "tool") {
     last.content.push({
       type: "tool-call",
@@ -76,14 +87,29 @@ export function appendEvent(
       ...(meta.approvals || []),
       { ...event, state: "request" },
     ];
-  else if (event.t === "stopped") {
+  else if (event.t === "approval_result") {
+    meta.approvals = (meta.approvals || []).map((approval) =>
+      approval.id === event.id ? { ...approval, state: event.state } : approval,
+    );
+  } else if (event.t === "stopped") {
     last.status = { type: "incomplete", reason: "cancelled" };
     meta.stopped = true;
   } else if (event.t === "error") {
     meta.error = event.error;
     last.status = { type: "incomplete", reason: "error", error: event.error };
   } else if (event.t === "done") {
-    if (!meta.stopped && !meta.error)
+    if (event.at) meta.endedAt = event.at * 1000;
+    if (
+      !meta.stopped &&
+      !meta.error &&
+      ["interrupted", "cancelled"].includes(event.status || "")
+    ) {
+      meta.stopped = true;
+      last.status = { type: "incomplete", reason: "cancelled" };
+    } else if (!meta.error && event.status === "failed") {
+      meta.error = "The provider could not complete the response.";
+      last.status = { type: "incomplete", reason: "error", error: meta.error };
+    } else if (!meta.stopped && !meta.error)
       last.status = { type: "complete", reason: "stop" };
     meta.approvals = (meta.approvals || []).map((a) =>
       a.state === "request" ? { ...a, state: "expired" } : a,

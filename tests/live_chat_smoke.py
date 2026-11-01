@@ -23,10 +23,12 @@ class Mcp:
         self.serial = 0
         self.rpc('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                                'clientInfo': {'name': 'chat-smoke', 'version': '1'}})
+        self.proc.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'notifications/initialized'}) + '\n')
+        self.proc.stdin.flush()
 
     def rpc(self, method, params):
         self.serial += 1
-        self.proc.stdin.write(json.dumps({'id': self.serial, 'method': method, 'params': params}) + '\n')
+        self.proc.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': self.serial, 'method': method, 'params': params}) + '\n')
         self.proc.stdin.flush()
         response = json.loads(self.proc.stdout.readline())
         assert response['id'] == self.serial, response

@@ -92,7 +92,7 @@ export function Workspace({
         </div>
       </ResizablePanel>
       <ResizableHandle
-        aria-label="Resize tools"
+        aria-label="Resize workbench"
         withHandle
         disabled={!layout.tools || layout.narrow}
         className={!layout.tools || layout.narrow ? "hidden" : undefined}

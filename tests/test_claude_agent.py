@@ -1,133 +1,154 @@
 import asyncio
-import json
 from pathlib import Path
+from types import SimpleNamespace
 import sys
-import tempfile
 import unittest
 from unittest.mock import patch
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'explorer'))
-from claude_agent import ClaudeClient, legacy_session
+from claude_agent import ClaudeClient, legacy_session, sdk_record
+from claude_agent_sdk import StreamEvent, ResultMessage, AssistantMessage, TextBlock, ToolUseBlock, ToolResultBlock, UserMessage
 from agent_common import AgentError
 
 
+def result(sid):
+    return ResultMessage(subtype='success', duration_ms=1, duration_api_ms=1,
+                         is_error=False, num_turns=1, session_id=sid)
+
+
+class FakeSDK:
+    instances = []
+    def __init__(self, options):
+        self.options, self.messages = options, asyncio.Queue()
+        self.connected_task = None
+        self.disconnected_task = None
+        self.sent = []
+        self.instances.append(self)
+    async def connect(self): self.connected_task = asyncio.current_task()
+    async def query(self, prompt):
+        async for m in prompt:
+            self.sent.append(m)
+            await self.messages.put(StreamEvent(uuid='event', session_id=self.options.session_id or self.options.resume,
+                event={'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': m['message']['content'][0]['text']}}))
+            await self.messages.put(result(self.options.session_id or self.options.resume))
+    async def receive_messages(self):
+        while True: yield await self.messages.get()
+    async def disconnect(self): self.disconnected_task = asyncio.current_task()
+
+
 class ClaudeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_two_turns_use_one_streaming_process(self):
-        with tempfile.TemporaryDirectory() as folder:
-            script = Path(folder) / 'fake_persistent_claude.py'
-            script.write_text('''import json,sys
-for line in sys.stdin:
- m=json.loads(line)
- text=m['message']['content'][0]['text']
- print(json.dumps({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':text}}}),flush=True)
- print(json.dumps({'type':'result','is_error':False}),flush=True)
-''', encoding='utf-8')
-            client = ClaudeClient(folder, asyncio.Queue())
-            with patch('claude_agent.claude_command', return_value=[sys.executable, str(script)]), patch('claude_agent.session_file', return_value=None):
-                try:
-                    await client.start()
-                    await client.open_thread(folder, str(uuid.uuid4()), 8791, 'research prompt')
-                    pid = None
-                    for prompt in ('first', 'second'):
-                        await client.call('turn/start', {'input': [{'type':'text','text':prompt}]})
-                        if pid is None: pid = client.proc.pid
-                        self.assertEqual(client.proc.pid, pid)
-                        text = ''
-                        while True:
-                            kind, event = await asyncio.wait_for(client.queue.get(), 3)
-                            self.assertEqual(kind, 'event')
-                            if event['t'] == 'text': text += event['text']
-                            if event['t'] == 'done': break
-                        self.assertEqual(text, prompt)
-                        self.assertTrue(client.alive)
-                        self.assertIsNone(client.turn)
-                finally: await client.close()
-            self.assertFalse(client.alive)
+    async def test_real_sdk_parses_stream_and_cleans_up_its_transport(self):
+        import json
+        from dataclasses import asdict
+        from claude_agent_sdk import ClaudeSDKClient as RealSDK
 
-    async def test_rewind_rejects_stale_text_and_keeps_malformed_lines(self):
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'session.jsonl'
-            records = [{'type': 'user', 'message': {'content': t}} for t in ['first', 'second']]
-            original = 'partial log line\nnull\n' + ''.join(json.dumps(m) + '\n' for m in records)
-            path.write_text(original, encoding='utf-8')
-            client = ClaudeClient(folder, asyncio.Queue())
-            with patch('claude_agent.session_file', return_value=path):
-                with self.assertRaisesRegex(AgentError, 'Latest Claude turn'):
-                    await client.rewind('first')
-                self.assertEqual(path.read_text(encoding='utf-8'), original)
-                self.assertEqual(list(Path(folder).glob('*.bak-*')), [])
-                await client.rewind('second')
-                self.assertIn('partial log line', path.read_text(encoding='utf-8'))
-                self.assertNotIn('second', path.read_text(encoding='utf-8'))
+        class Transport:
+            def __init__(self):
+                self.messages = asyncio.Queue()
+                self.closed = False
+            async def connect(self): pass
+            def is_ready(self): return not self.closed
+            async def end_input(self): pass
+            async def close(self): self.closed = True
+            async def write(self, data):
+                message = json.loads(data)
+                if message['type'] == 'control_request':
+                    await self.messages.put({'type': 'control_response', 'response': {
+                        'subtype': 'success', 'request_id': message['request_id'], 'response': {}}})
+                elif message['type'] == 'user':
+                    await self.messages.put({'type': 'stream_event', 'uuid': 'event', 'session_id': sid,
+                        'event': {'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': 'typed response'}}})
+                    await self.messages.put({'type': 'result', **asdict(result(sid))})
+            async def read_messages(self):
+                while True:
+                    yield await self.messages.get()
 
-    async def test_legacy_chat_import_requires_explorer_working_directory(self):
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'session.jsonl'
-            cid = str(uuid.uuid4())
-            entry = {'type': 'user', 'cwd': folder, 'message': {'content': '[The person has L22 N1 open in the explorer.]\n\nhello'}}
-            path.write_text(json.dumps(entry) + '\n', encoding='utf-8')
-            with patch('claude_agent.session_file', return_value=path):
-                self.assertIsNone(legacy_session(cid, str(Path(folder) / 'another-project')))
-                imported = legacy_session(cid, folder)
-                self.assertEqual(imported['provider'], 'claude')
-                self.assertEqual(imported['last_message'], 'hello')
-                client = ClaudeClient(folder, asyncio.Queue())
-                events = await client.history(cid)
-                self.assertEqual(events, [{'t': 'user', 'text': 'hello'}, {'t': 'done', 'status': 'completed'}])
-                client.cwd = str(Path(folder) / 'another-project')
-                with self.assertRaisesRegex(AgentError, 'working directory'):
-                    await client.history(cid)
+        sid = str(uuid.uuid4())
+        transport = Transport()
+        client = ClaudeClient('.', asyncio.Queue())
+        with patch('claude_agent.ClaudeSDKClient', side_effect=lambda options: RealSDK(options, transport=transport)):
+            await client.open_thread('.', sid, 8791, 'research')
+            try:
+                await client.call('turn/start', {'input': [{'type': 'text', 'text': 'hello'}]})
+                _, event = await asyncio.wait_for(client.queue.get(), 3)
+                self.assertEqual(event['text'], 'typed response')
+                _, event = await asyncio.wait_for(client.queue.get(), 3)
+                self.assertEqual(event['status'], 'completed')
+            finally:
+                await client.close()
+        self.assertTrue(transport.closed)
 
-    async def test_cli_transport_uses_shared_tools_and_streaming(self):
-        with tempfile.TemporaryDirectory() as folder:
-            script = Path(folder) / 'fake_claude.py'
-            script.write_text('''import json,sys
-m=json.loads(sys.stdin.readline())
-def out(m):print(json.dumps(m),flush=True)
-out({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'hello'}}})
-out({'type':'assistant','message':{'content':[{'type':'tool_use','id':'call1','name':'mcp__explorer__overview','input':{}}]}})
-out({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'call1','content':'metadata'}]}})
-out({'type':'result','is_error':False,'total_cost_usd':0.01})
-''', encoding='utf-8')
-            queue = asyncio.Queue()
-            client = ClaudeClient(folder, queue)
-            with patch('claude_agent.claude_command', return_value=[sys.executable, str(script)]), patch('claude_agent.session_file', return_value=None):
-                try:
-                    await client.start()
-                    cid = str(uuid.uuid4())
-                    await client.open_thread(folder, cid, 8791, 'research prompt')
-                    self.assertEqual(client.args[client.args.index('--tools') + 1], '')
-                    self.assertIn('--strict-mcp-config', client.args)
-                    self.assertNotIn('--add-dir', client.args)
-                    self.assertEqual(client.args[client.args.index('--setting-sources') + 1], '')
-                    self.assertEqual((Path(folder) / f'system_prompt-{cid}-claude.md').read_text(encoding='utf-8'), 'research prompt')
-                    await client.call('turn/start', {'input': [{'type': 'text', 'text': 'hello'}]})
+    async def test_two_turns_share_client_and_cleanup_in_owner_task(self):
+        client = ClaudeClient('.', asyncio.Queue())
+        with patch('claude_agent.ClaudeSDKClient', FakeSDK):
+            await client.open_thread('.', str(uuid.uuid4()), 8791, 'research')
+            self.assertEqual(client.options.tools, [])
+            self.assertTrue(client.options.strict_mcp_config)
+            self.assertEqual(client.options.setting_sources, [])
+            self.assertTrue(client.options.verbatim_prompts)
+            self.assertEqual((await client._permission('Bash', {}, None)).behavior, 'deny')
+            self.assertEqual((await client._permission('mcp__explorer__overview', {}, None)).behavior, 'allow')
+            try:
+                for text in ('first', 'second'):
+                    await client.call('turn/start', {'input': [{'type': 'text', 'text': text}]})
                     events = []
                     while not events or events[-1]['t'] != 'done':
-                        kind, event = await asyncio.wait_for(queue.get(), 3)
-                        if kind == 'event': events.append(event)
-                    self.assertEqual([e['t'] for e in events], ['text', 'tool', 'tool_result', 'done'])
-                    self.assertEqual(events[1]['name'], 'overview')
-                finally:
-                    await client.close()
-            self.assertIsNotNone(client.proc.returncode)
+                        _, event = await asyncio.wait_for(client.queue.get(), 2)
+                        events.append(event)
+                    self.assertEqual(events[0]['text'], text)
+                    client.turn = None
+                sdk = client.sdk
+                self.assertEqual(len(sdk.sent), 2)
+            finally:
+                await client.close()
+            self.assertIs(sdk.connected_task, sdk.disconnected_task)
+            self.assertFalse(client.alive)
 
-    async def test_rewind_backs_up_history_and_removes_only_latest_turn(self):
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'session.jsonl'
-            messages = [{'type': 'user', 'message': {'content': [{'type': 'text', 'text': t}]}} for t in ['first', 'second']]
-            path.write_text(''.join(json.dumps(m) + '\n' for m in messages), encoding='utf-8')
-            client = ClaudeClient(folder, asyncio.Queue())
-            client.thread = str(uuid.uuid4())
-            with patch('claude_agent.session_file', return_value=path):
-                await client.rewind('second')
-                self.assertIn('first', path.read_text())
-                self.assertNotIn('second', path.read_text())
-                self.assertEqual(len(list(Path(folder).glob('*.bak-*'))), 1)
+    async def test_sdk_failure_is_reported_and_client_is_not_reused(self):
+        class BrokenSDK(FakeSDK):
+            async def receive_messages(self):
+                yield await self.messages.get()
+                raise RuntimeError('connection failed')
+        client = ClaudeClient('.', asyncio.Queue())
+        with patch('claude_agent.ClaudeSDKClient', BrokenSDK):
+            await client.open_thread('.', str(uuid.uuid4()), 8791, 'research')
+            await client.call('turn/start', {'input': [{'type':'text','text':'hello'}]})
+            await asyncio.sleep(.02)
+            self.assertFalse(client.alive)
+            self.assertTrue(any(e and 'connection failed' in e.get('error','') for _, e in list(client.queue._queue)))
+            await client.close()
+
+    async def test_rewind_forks_at_previous_message_and_rejects_stale_text(self):
+        client = ClaudeClient('.', asyncio.Queue())
+        client.thread = str(uuid.uuid4())
+        original = client.thread
+        messages = [SimpleNamespace(type='user', uuid='u1', message={'content':'first'}),
+                    SimpleNamespace(type='assistant', uuid='a1', message={'content':[{'type':'text','text':'answer'}]}),
+                    SimpleNamespace(type='user', uuid='u2', message={'content':'second'})]
+        with patch('claude_agent.session_messages', return_value=messages), patch('claude_agent.fork_session', return_value=SimpleNamespace(session_id='branched')) as fork:
+            with self.assertRaisesRegex(AgentError, 'changed'):
                 await client.rewind('first')
-                self.assertFalse(path.exists())
+            fork.assert_not_called()
+            self.assertEqual(await client.rewind('second'), 'branched')
+            fork.assert_called_once_with(original, directory='.', up_to_message_id='a1')
+            self.assertEqual(client.thread, 'branched')
+        with patch('claude_agent.session_messages', return_value=messages[:1]):
+            self.assertIsNone(await client.rewind('first'))
 
+    async def test_history_and_legacy_import_check_ownership_via_sdk(self):
+        sid = str(uuid.uuid4())
+        messages = [SimpleNamespace(type='user', uuid='u', message={'content':'hello'})]
+        with patch('claude_agent.get_session_info', return_value=SimpleNamespace(cwd=str(Path.cwd()))), patch('claude_agent.get_session_messages', return_value=messages):
+            self.assertEqual(legacy_session(sid, str(Path.cwd()))['last_message'], 'hello')
+            self.assertIsNone(legacy_session(sid, str(Path.cwd().parent)))
+            client = ClaudeClient(str(Path.cwd()), asyncio.Queue())
+            self.assertEqual((await client.history(sid))[0], {'t':'user','text':'hello'})
 
-if __name__ == '__main__':
-    unittest.main()
+    def test_typed_tool_blocks_keep_the_existing_browser_contract(self):
+        from claude_agent import browser_events
+        assistant = AssistantMessage(content=[TextBlock('hello'), ToolUseBlock('call','mcp__explorer__overview',{})], model='test')
+        event = list(browser_events(sdk_record(assistant)))
+        self.assertEqual(event[0]['name'], 'overview')
+        user = UserMessage(content=[ToolResultBlock('call', 'metadata')])
+        self.assertEqual(list(browser_events(sdk_record(user)))[0]['output'], 'metadata')

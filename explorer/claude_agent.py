@@ -1,51 +1,19 @@
-"""Claude CLI adapter for the same browser event protocol used by Codex."""
+"""Claude Agent SDK adapter for Explorer's provider-neutral event stream."""
 import asyncio
-from collections import deque
-import json
+from dataclasses import asdict
 import os
-from pathlib import Path
-import shutil
 import uuid
 
-from agent_common import AgentError, explorer_mcp, process_options, stop_process, tool_output
-
-
-def claude_command():
-    binary = os.environ.get('EXPLORER_CLAUDE_BIN') or shutil.which('claude')
-    if not binary:
-        raise AgentError('Claude CLI not found. Install Claude Code and sign in, or choose Codex.')
-    path = Path(binary)
-    if os.name == 'nt' and path.suffix.lower() in ('.cmd', '.bat', '.ps1'):
-        # Execute the npm installation directly, without interpolating arguments into cmd.exe.
-        package = path.parent / 'node_modules' / '@anthropic-ai' / 'claude-code'
-        native = package / 'bin' / 'claude.exe'
-        if native.exists():
-            return [str(native)]
-        script = package / 'cli.js'
-        node = shutil.which('node')
-        if script.exists() and node:
-            return [node, str(script)]
-        raise AgentError('Set EXPLORER_CLAUDE_BIN to the Claude executable; this launcher cannot be run directly.')
-    return [binary]
-
-
-def session_file(sid):
-    # Caller supplies only an explorer-owned session UUID.
-    uuid.UUID(sid)
-    return next((Path.home() / '.claude' / 'projects').glob(f'*/{sid}.jsonl'), None)
-
-
-def session_record(line):
-    """Ignore incomplete/non-record lines without rewriting the original log."""
-    try:
-        value = json.loads(line)
-        return value if isinstance(value, dict) else {}
-    except ValueError:
-        return {}
+from anyio import CancelScope
+from claude_agent_sdk import (
+    ClaudeAgentOptions, ClaudeSDKClient, AssistantMessage, UserMessage,
+    SystemMessage, ResultMessage, StreamEvent, PermissionResultDeny, PermissionResultAllow,
+    get_session_info, get_session_messages, fork_session,
+)
+from agent_common import AgentError, explorer_mcp, tool_output
 
 
 def user_text(message):
-    """Get a real user turn, excluding metadata and tool-result messages."""
     if message.get('type') != 'user' or message.get('isMeta'):
         return None
     body = message.get('message')
@@ -55,26 +23,26 @@ def user_text(message):
     if isinstance(content, list):
         if any(isinstance(c, dict) and c.get('type') == 'tool_result' for c in content):
             return None
-        content = next((c.get('text', '') for c in content if isinstance(c, dict) and c.get('type') == 'text'), '')
+        content = '\n'.join(c.get('text', '') for c in content if isinstance(c, dict) and c.get('type') == 'text')
     return content if isinstance(content, str) else None
 
 
+def session_messages(sid, cwd):
+    uuid.UUID(sid)
+    info = get_session_info(sid, directory=cwd)
+    if not info or not info.cwd or os.path.normcase(os.path.abspath(info.cwd)) != os.path.normcase(os.path.abspath(cwd)):
+        raise AgentError('This conversation does not belong to the explorer working directory.')
+    return get_session_messages(sid, directory=cwd)
+
+
 def legacy_session(sid, cwd):
-    """Recover old explorer chats only when Claude's log confirms their working directory."""
-    path = session_file(sid)
-    if path is None:
+    """Import explorer-owned sessions through the supported SDK, never internal files."""
+    try:
+        messages = session_messages(sid, cwd)
+    except (AgentError, ValueError):
         return None
-    owned, latest = False, None
-    with path.open(encoding='utf-8') as f:
-        for line in f:
-            message = session_record(line)
-            if message.get('cwd') and os.path.normcase(os.path.abspath(message['cwd'])) == os.path.normcase(os.path.abspath(cwd)):
-                owned = True
-            content = user_text(message)
-            if content is not None:
-                latest = content
-    if not owned:
-        return None
+    latest = next((user_text({'type': m.type, 'message': m.message}) for m in reversed(messages)
+                   if user_text({'type': m.type, 'message': m.message}) is not None), None)
     result = {'provider': 'claude', 'thread': sid}
     if latest is not None:
         if latest.startswith('[The person has ') and '\n\n' in latest:
@@ -109,134 +77,161 @@ def browser_events(message):
         yield {'t': 'done', 'status': 'failed' if message.get('is_error') else 'completed', 'cost': message.get('total_cost_usd')}
 
 
+def sdk_record(message):
+    """Convert public SDK dataclasses; reasoning blocks are deliberately excluded."""
+    if isinstance(message, StreamEvent):
+        return {'type': 'stream_event', 'event': message.event}
+    if isinstance(message, (AssistantMessage, UserMessage)):
+        blocks = []
+        for block in message.content if isinstance(message.content, list) else []:
+            value = asdict(block)
+            kind = type(block).__name__
+            tag = {'TextBlock': 'text', 'ToolUseBlock': 'tool_use', 'ToolResultBlock': 'tool_result'}.get(kind)
+            if tag:
+                blocks.append({'type': tag, **value})
+        return {'type': 'assistant' if isinstance(message, AssistantMessage) else 'user',
+                'message': {'content': blocks}}
+    if isinstance(message, ResultMessage):
+        return {'type': 'result', 'is_error': message.is_error,
+                'result': message.result or '; '.join(message.errors or []),
+                'total_cost_usd': message.total_cost_usd}
+    return {}
+
+
 class ClaudeClient:
     def __init__(self, cwd, queue):
         self.cwd, self.queue = cwd, queue
-        self.proc = None
-        self.tasks = []
-        self.stderr = deque(maxlen=30)
+        self.sdk = self.worker = None
         self.thread = self.turn = None
-        self.finished = True
+        self.ready = None
+        self.closing = False
 
     @property
     def alive(self):
-        return bool(self.proc and self.proc.returncode is None and self.tasks and all(not t.done() for t in self.tasks))
+        return bool(self.sdk and self.worker and not self.worker.done() and not self.closing)
 
     async def start(self):
-        self.command = claude_command()
+        pass  # The worker owns SDK connect/disconnect in the same AnyIO task.
 
     async def history(self, thread):
-        def read():
-            if not legacy_session(thread, self.cwd):
-                raise AgentError('This conversation does not belong to the explorer working directory.')
-            events = []
-            with session_file(thread).open(encoding='utf-8') as f:
-                for line in f:
-                    record = session_record(line)
-                    text = user_text(record)
-                    if text is not None:
-                        if text.startswith('[The person has ') and '\n\n' in text:
-                            text = text.split('\n\n', 1)[1]
-                        events.append({'t': 'user', 'text': text})
-                    elif record.get('type') == 'assistant':
-                        for block in record.get('message', {}).get('content', []):
-                            if block.get('type') == 'text':
-                                events.append({'t': 'text', 'text': block.get('text', '')})
-                    events.extend(browser_events(record))
-            if events:
-                events.append({'t': 'done', 'status': 'completed'})
-            return events
-        return await asyncio.to_thread(read)
+        messages = await asyncio.to_thread(session_messages, thread, self.cwd)
+        events = []
+        for m in messages:
+            record = {'type': m.type, 'message': m.message}
+            text = user_text(record)
+            if text is not None:
+                if text.startswith('[The person has ') and '\n\n' in text:
+                    text = text.split('\n\n', 1)[1]
+                events.append({'t': 'user', 'text': text})
+            elif m.type == 'assistant':
+                for block in m.message.get('content', []):
+                    if block.get('type') == 'text':
+                        events.append({'t': 'text', 'text': block.get('text', '')})
+            events.extend(browser_events(record))
+        if events:
+            events.append({'t': 'done', 'status': 'completed'})
+        return events
+
+    async def _permission(self, name, arguments, context):
+        if name in self.tool_names:
+            return PermissionResultAllow(updated_input=arguments)
+        return PermissionResultDeny(message='Use the shared Explorer tools. Shell commands require approval in the panel.')
 
     async def open_thread(self, root, chat, port, instructions, thread=None):
         self.thread, self.chat = thread or chat, chat
-        prompt = Path(self.cwd) / f'system_prompt-{chat}-claude.md'
-        prompt.write_text(instructions, encoding='utf-8')
-        mcp = {'mcpServers': {'explorer': explorer_mcp(root, chat, port)}}
-        self.args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-                     '--include-partial-messages', '--system-prompt-file', str(prompt),
-                     '--mcp-config', json.dumps(mcp), '--strict-mcp-config', '--tools', '',
-                     '--allowedTools', 'mcp__explorer', '--setting-sources', '',
-                     '--settings', json.dumps({'enabledPlugins': {}})]
-        model = getattr(self, 'model', None) or os.environ.get('EXPLORER_CLAUDE_MODEL') or 'default'
-        if model:
-            self.args += ['--model', model]
+        self.tool_names = {'mcp__explorer__' + tool['name'] for tool in self._tools()}
+        self.options = ClaudeAgentOptions(
+            cwd=self.cwd, system_prompt=instructions, tools=[],
+            mcp_servers={'explorer': explorer_mcp(root, chat, port)}, strict_mcp_config=True,
+            setting_sources=[], settings='{"enabledPlugins":{}}',
+            can_use_tool=self._permission, include_partial_messages=True, verbatim_prompts=True,
+            model=getattr(self, 'model', None) or os.environ.get('EXPLORER_CLAUDE_MODEL') or 'default',
+            cli_path=os.environ.get('EXPLORER_CLAUDE_BIN') or None,
+            resume=thread, session_id=None if thread else self.thread,
+        )
         return self.thread
+
+    @staticmethod
+    def _tools():
+        # One authoritative tool list for both providers.
+        from agent_mcp import TOOLS
+        return TOOLS
 
     async def call(self, method, params):
         if method != 'turn/start':
             raise AgentError(f'Unsupported Claude operation: {method}')
         if self.turn:
             raise AgentError('This Claude conversation is already running.')
-        if not self.alive:
-            resume = ['--resume', self.thread] if session_file(self.thread) else ['--session-id', self.thread]
-            try:
-                self.proc = await asyncio.create_subprocess_exec(
-                    *self.command, *self.args, *resume, cwd=self.cwd,
-                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE, limit=1 << 24, **process_options())
-            except OSError as e:
-                raise AgentError(f'Cannot start Claude CLI: {e}. Check your Claude installation or choose Codex.') from e
-            self.tasks = [asyncio.create_task(self._read()), asyncio.create_task(self._stderr())]
-        self.turn = str(uuid.uuid4())
-        self.finished = False
-        self.proc.stdin.write((json.dumps({'type': 'user', 'message': {'role': 'user', 'content': params['input']}}) + '\n').encode())
-        await self.proc.stdin.drain()
-        return {'turn': {'id': self.turn}}
-
-    async def _stderr(self):
-        async for line in self.proc.stderr:
-            self.stderr.append(line.decode(errors='replace').rstrip())
-
-    async def _read(self):
+        self.turn = turn = str(uuid.uuid4())
         try:
-            async for line in self.proc.stdout:
-                try:
-                    message = json.loads(line)
-                except ValueError:
-                    continue
-                for event in browser_events(message):
-                    if event['t'] == 'done':
-                        self.finished = True
-                        self.turn = None
+            if not self.alive:
+                self.closing = False
+                self.ready = asyncio.get_running_loop().create_future()
+                self.worker = asyncio.create_task(self._run())
+                await asyncio.wait_for(asyncio.shield(self.ready), 75)
+            async def prompt():
+                yield {'type': 'user', 'uuid': turn,
+                       'message': {'role': 'user', 'content': params['input']}}
+            if not self.sdk or self.worker.done():
+                raise AgentError('Claude connection closed before the turn was sent.')
+            await self.sdk.query(prompt())
+            return {'turn': {'id': turn}}
+        except BaseException as e:
+            await self.close()
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            raise AgentError(f'Claude could not start the turn: {e}') from e
+
+    async def _run(self):
+        sdk = ClaudeSDKClient(self.options)
+        self.sdk = sdk
+        try:
+            await sdk.connect()
+            if not self.ready.done():
+                self.ready.set_result(True)
+            async for message in sdk.receive_messages():
+                if isinstance(message, SystemMessage) and message.subtype == 'init':
+                    reported = message.data.get('session_id')
+                    if reported and reported != self.thread:
+                        raise AgentError('Claude returned an unexpected session ID.')
+                for event in browser_events(sdk_record(message)):
                     self.queue.put_nowait(('event', event))
-            code = await self.proc.wait()
-            if not self.finished:
-                await self.tasks[1]  # collect diagnostics before reporting an early CLI exit
-                self.queue.put_nowait(('event', {'t': 'error', 'error': '\n'.join(self.stderr)[-600:] or f'Claude exited {code} without a result'}))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if not self.ready.done():
+                self.ready.set_exception(AgentError(str(e)))
+            elif not self.closing:
+                self.queue.put_nowait(('event', {'t': 'error', 'error': f'Claude connection closed: {e}'}))
         finally:
-            self.queue.put_nowait(('closed', None))
+            with CancelScope(shield=True):
+                await sdk.disconnect()
+            self.sdk = None
+            if not self.closing:
+                self.queue.put_nowait(('closed', None))
 
     async def rewind(self, text):
-        """Claude has no public revert endpoint; back up and trim its latest user turn."""
-        path = session_file(self.thread)
-        if path is None:
-            raise AgentError('Claude session not found; start a new conversation.')
-        lines = path.read_text(encoding='utf-8').splitlines(True)
-        at = None
-        for i in range(len(lines) - 1, -1, -1):
-            content = user_text(session_record(lines[i]))
-            if content is None:
-                continue
-            if content.strip() == text.strip() or content.strip().endswith('\n\n' + text.strip()):
-                at = i
-            break  # never trim an earlier match after a newer user turn
+        """Branch through the SDK; the original provider session stays intact."""
+        messages = await asyncio.to_thread(session_messages, self.thread, self.cwd)
+        at = next((i for i in range(len(messages) - 1, -1, -1)
+                   if user_text({'type': messages[i].type, 'message': messages[i].message}) is not None), None)
         if at is None:
             raise AgentError('Latest Claude turn not found; reload the conversation before editing.')
-        shutil.copy2(path, path.with_name(path.name + f'.bak-{uuid.uuid4().hex[:8]}'))
-        keep = lines[:at]
-        if any(user_text(session_record(line)) is not None for line in keep):
-            path.write_text(''.join(keep), encoding='utf-8')
-        else:
-            path.unlink()  # a fresh --session-id is needed after reverting the first turn
+        latest = user_text({'type': messages[at].type, 'message': messages[at].message}).strip()
+        if latest != text.strip() and not latest.endswith('\n\n' + text.strip()):
+            raise AgentError('Latest Claude turn changed; reload the conversation before editing.')
+        if at == 0:
+            self.thread = str(uuid.uuid4())
+            return None  # Next turn creates a fresh provider session.
+        forked = await asyncio.to_thread(fork_session, self.thread, directory=self.cwd,
+                                        up_to_message_id=messages[at - 1].uuid)
+        self.thread = forked.session_id
+        return self.thread
 
     async def close(self):
-        if self.proc is not None and self.proc.returncode is None:
-            self.proc.stdin.close()
-            try:
-                await asyncio.wait_for(self.proc.wait(), .25)
-            except asyncio.TimeoutError:
-                await stop_process(self.proc)
-        for task in self.tasks:
-            task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.closing = True
+        if self.worker:
+            self.worker.cancel()
+            await asyncio.gather(self.worker, return_exceptions=True)
+            self.worker = None
+        self.turn = None

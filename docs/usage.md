@@ -4,7 +4,7 @@ See the [README](../README.md#explorer) for installation and the main explorer v
 
 ## Working in the explorer
 
-The Assistant is a dedicated left panel. The model canvas is in the center, and **Tools** opens one scientific panel on the right:
+The Assistant is a dedicated left panel. The model canvas is in the center, and **Workbench** opens one scientific panel on the right:
 
 - **Search** finds neurons from token associations across all layers, or browses saved examples for a layer.
 - **Analyze** measures a passage after you press **Analyze text**. Select a resulting token to focus its activity; advanced filters live under **Filter activations**.
@@ -13,7 +13,7 @@ The Assistant is a dedicated left panel. The model canvas is in the center, and 
 
 The global **Go to unit** field accepts IDs such as `L7 N1870` and `L7 h3`. Map/Embeddings, layer selection, camera reset and **Display** options belong to the canvas toolbar. Display settings do not change the active scientific tool. The map layer selector reflects All layers or the focused layer; Reset restores the original overview angle and fits the current canvas.
 
-Use the header's **Assistant** and **Tools** buttons to show or hide panels. On wide screens both can stay open and their dividers can be resized. Compact screens show one sidebar at a time; on phones it fills the work area. Closing it returns to the map. Conversations and tool drafts survive switching between these areas.
+Use the floating **Assistant** and **Workbench** buttons below the canvas toolbar to open closed panels, and the collapse control in each panel header to close them. Panel visibility is remembered across refreshes. On wide screens both can stay open and their dividers can be resized. Compact screens show one sidebar at a time; on phones it fills the work area. Closing it returns to the map. Conversations and tool drafts survive switching between these areas.
 
 The Assistant toggle indicates background work. A **Review command approval** action appears only when an actual pending approval exists; opening it does not grant permission.
 
@@ -23,8 +23,18 @@ Byte fragment badges represent tokens containing incomplete character bytes. Hov
 
 ## Assistant configuration
 
-Install and sign in to Codex CLI (0.164.0+) or Claude Code CLI before selecting it in **Assistant settings** (the gear button).
-Restart the explorer after installing or updating a CLI. The explorer reuses your existing login.
+Install dependencies with `uv sync`, then choose a provider in **Assistant settings** (the gear button).
+The official SDKs use their bundled runtimes by default: `openai-codex==0.163.0`,
+`claude-agent-sdk==0.2.176`, and `mcp==2.3.0`. Restart the explorer after dependency changes.
+Codex uses its existing authentication (for example, `codex login`). For Claude, use the
+[Agent SDK's supported authentication](https://code.claude.com/docs/en/agent-sdk/quickstart), such as
+`ANTHROPIC_API_KEY`. Do not assume a Claude subscription is available to a third-party application;
+Anthropic documents that offering subscription login requires prior approval.
+
+`EXPLORER_CODEX_BIN` and `EXPLORER_CLAUDE_BIN` are optional escape hatches for a tested executable,
+not required setup. An override must support the pinned SDK's protocol; arbitrary newer or older
+CLI versions are not a compatibility guarantee. Claude overrides must point to an executable,
+not an npm `.cmd`/`.ps1` launcher.
 
 | Setting | Purpose |
 | --- | --- |
@@ -46,6 +56,8 @@ File tools reject paths and symlinks outside the selected roots. Narrowing acces
 it cannot remove content already sent to the assistant.
 
 Every shell command requires approval in the panel, which shows the command and starting directory.
+Overwriting an existing file requires a separate approval showing its new contents. If the file changes
+while approval is pending, the write is rejected so the assistant can read it again.
 An approved command has your OS account's permissions; its starting directory is not a sandbox.
 Commands time out after at most five minutes, output is capped at 64 KB, and file-tool text is capped at 256 KB.
 Stop cancels pending approvals and approved commands. Native CLI file/shell tools and unrelated integrations
@@ -59,8 +71,15 @@ Switching providers restores that provider's conversation, draft and attachments
 or press Stop before switching. **Past chats** lists saved conversations from either provider for the active model.
 
 Assistant replies continue through browser refreshes and disconnections. Restarting the server interrupts active
-replies but retains saved history. Assistant events live under `agent/` in the active model's cache, with drafts
-and attachment selections in browser storage. Only explorer-owned CLI transcripts can be imported.
+replies but retains saved history. Conversations, event history, request receipts, and approval records live in
+`agent/assistant.sqlite3` under the active model's cache; drafts and attachment selections remain in browser storage.
+Older Explorer session JSON and event JSONL files import automatically and are left intact.
+Only explorer-owned provider transcripts can be imported through supported provider APIs.
+
+Repeated sends with the same request ID return the existing turn instead of running it again. After a server
+restart, unfinished turns are marked interrupted with an unknown execution outcome; pending approvals expire.
+An operation that may already have executed is never replayed automatically. Editing the latest Claude prompt
+creates a supported session branch (or a fresh session for the first prompt), preserving the original provider history.
 
 Neuron experiments keep history per neuron while the page is open; reloading clears it. Avoid editing one assistant
 conversation in multiple tabs. Activation analysis is shared by the server, so analyzing another text can replace

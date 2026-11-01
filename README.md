@@ -7,71 +7,59 @@ Inspect local-model behavior on a 3D map alongside a research assistant.
 
 ## Explorer
 
-    uv sync
-    npm ci
-    npm run build
-    uv run python explorer/server.py        # http://localhost:8791
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/) and Node.js 22.12+.
+If you use a custom CUDA build of PyTorch, preserve your existing environment rather than running `uv sync`;
+see [Python environments](docs/development.md#python-environments).
 
-Loads Qwen3.5-4B locally on MPS, CUDA or CPU for steered chat and live analysis. Model weights download from
-Hugging Face on first use; they are separate from the analysis caches shipped in `explorer/cache/`.
-Sweep runs in `runs/` and per-layer stats in `stats/` supply rollout examples and rankings, produced by the sweep below.
-The server is accessible only from this machine.
+```sh
+uv sync
+npm ci
+npm run build
+uv run python explorer/server.py
+```
 
-If you have a custom CUDA build of PyTorch, launch with your environment's Python
-(`.venv/Scripts/python.exe explorer/server.py` on Windows), or use `uv run --no-sync`.
-An ordinary `uv sync` can replace custom wheels.
+Open [localhost:8791](http://localhost:8791). The server is accessible only from this machine.
+Qwen runs locally on MPS, CUDA or CPU; model weights download from Hugging Face on first use.
+The analysis caches in `explorer/cache/` are separate from the model weights.
 
-- **Assistant:** investigate neurons, attention heads and circuits with Codex or Claude in the left panel.
-- **Model canvas:** explore the 3D map or saved rollout embeddings. Select a neuron/head to inspect it;
-  Display controls layout and connections, and Reset restores the full-model overview.
-- **Search:** find token associations across layers or browse saved steering examples.
-- **Analyze:** explicitly run a passage through the local model, then inspect activity by token.
-- **Inspect:** view associations/connections, run a steering or activation experiment, or read saved examples.
-- **Cache:** identify the loaded model and monitor compatible build jobs with explicit pause/resume controls.
-
-The header's Assistant and Tools buttons control the side panels. See the [usage guide](docs/usage.md#working-in-the-explorer)
-for navigation, settings and experiment behavior.
+Use the map to explore neurons and attention heads, search their token associations, analyze passages,
+and compare baseline and steered generations. Saved rollout examples and rankings come from research sweeps.
+The optional Assistant helps investigate neurons and circuits alongside the scientific tools.
+See the [usage guide](docs/usage.md#working-in-the-explorer) for navigation and experiments.
 
 ## Assistant
 
-The optional Assistant requires an installed, signed-in CLI:
+Choose Codex or Claude in **Assistant settings**. Dependencies include their official SDKs and bundled runtimes.
 
-- **Codex:** Codex CLI 0.164.0 or newer; sign in with `codex login`.
-- **Claude:** Claude Code CLI, installed and signed in.
+- **Codex:** sign in with `codex login` if needed.
+- **Claude:** configure [supported Agent SDK authentication](docs/usage.md#assistant-configuration), such as `ANTHROPIC_API_KEY`.
 
-Choose the provider in Assistant settings (the gear button). Each provider keeps its own conversation, draft and attachments;
-**Past chats** opens saved conversations. Wait for a reply to finish or press Stop before switching providers.
-Qwen runs locally, while assistant messages, attachments and tool results go to the selected CLI's provider.
+Qwen inference stays local; assistant messages, attachments and tool results go to the selected provider.
+File access defaults to the project. Shell commands and existing-file overwrites require approval;
+approved shell commands run with your OS account's permissions.
 
-File access defaults to **Project only**; access to your home folder is opt-in. Every shell command requires
-approval and runs with your OS account's permissions, including access outside its starting directory.
-See the [usage guide](docs/usage.md#assistant-configuration) for configuration, attachments and history behavior.
+See [Assistant configuration](docs/usage.md#assistant-configuration) for authentication, model selection,
+file access, attachments and saved conversations.
 
 ## Other models
 
-Compatible dense Qwen3.5 text backbones can use separate model/revision-specific caches and live experiments, subject to
-available memory. MoE models, GGUF files and other architectures require additional support.
+Compatible dense Qwen3.5 text backbones can use their own model/revision-specific caches, subject to available memory.
+MoE models, GGUF files and other architectures need additional support.
+See [models and cache jobs](docs/usage.md#models-and-cache-jobs) for supported workflows and build commands.
 
-`explorer/cache_job.py` builds caches in the background with progress and pause/resume support. Each model needs
-its own caches; the shipped 4B data stays separate. See [models and cache jobs](docs/usage.md#models-and-cache-jobs)
-for commands and hardware considerations. Core cache builds do not include rollout sweeps or embeddings.
+## Research
 
-## Research and sweeps
-
-See [Running sweeps](docs/usage.md#running-sweeps) for calibration, rollout generation, analysis scripts and output formats.
-The [research log](research_log.md) contains experimental observations and reasoning;
-[historical source notes](docs/research/source-notes.md) record the original references and design inputs.
+- [Running sweeps](docs/usage.md#running-sweeps): calibration, rollout generation and analysis.
+- [Research log](research_log.md): experimental observations and reasoning.
+- [Historical source notes](docs/research/source-notes.md): original references and design inputs.
 
 ## Development
 
-The entire frontend uses React and TypeScript, built with Vite; FastAPI serves the compiled app and the existing API on the
-same origin. Node.js 22.12+ is required for frontend development and tests. After `npm ci`, use `npm run dev` to
-watch and rebuild the frontend, keep the Python server running, and reload the browser after changes.
-The Assistant uses assistant-ui with the existing Codex/Claude backends; no additional provider account is needed.
-Its prebuilt components and runtime choices are documented in the [integration guide](docs/assistant-ui.md).
+The frontend uses React, TypeScript and Vite; FastAPI serves the app and API on the same origin.
+Run `npm run dev` to watch and rebuild the frontend while the Python server runs, then reload the browser.
+Run `python tests/run_checks.py` from your configured Python environment for the release checks.
 
-With Node.js and the development dependencies installed, run `python tests/run_checks.py` from your configured
-Python environment. See the [development guide](docs/development.md) for setup, test coverage and known limitations,
-the [usage guide](docs/usage.md) for advanced operation, and the [changelog](CHANGELOG.md) for release changes.
+See the [development guide](docs/development.md) for architecture, testing and known limitations,
+[assistant-ui integration](docs/assistant-ui.md) for chat component ownership, and the [changelog](CHANGELOG.md) for changes.
 
 Based on [Lyra C's neuron explorer](https://github.com/lyramakesmusic/neuron-explorer).

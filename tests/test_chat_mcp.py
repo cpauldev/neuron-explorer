@@ -10,15 +10,21 @@ import agent_mcp
 
 
 class ChatMcpTests(unittest.TestCase):
-    def test_malformed_requests_do_not_stop_the_stdio_server(self):
-        requests = ['not JSON', '[]', json.dumps({'id': 1, 'method': 'ping', 'params': []}),
-                    json.dumps({'id': 2, 'method': 'initialize'}), json.dumps({'id': 3, 'method': 'ping'})]
-        result = subprocess.run([sys.executable, agent_mcp.__file__], input='\n'.join(requests) + '\n',
-                                text=True, encoding='utf-8', capture_output=True, timeout=10, check=True)
-        responses = [json.loads(line) for line in result.stdout.splitlines()]
-        self.assertEqual([r['error']['code'] for r in responses[:3]], [-32700, -32600, -32602])
-        self.assertEqual(responses[3]['result']['serverInfo']['name'], 'explorer')
-        self.assertEqual(responses[4], {'jsonrpc': '2.0', 'id': 3, 'result': {}})
+    def test_sdk_negotiation_and_invalid_tool_arguments(self):
+        import asyncio
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        async def run():
+            async with stdio_client(StdioServerParameters(command=sys.executable, args=[agent_mcp.__file__])) as (reader, writer):
+                async with ClientSession(reader, writer) as session:
+                    initialized = await session.initialize()
+                    self.assertEqual(initialized.server_info.name, 'explorer')
+                    tools = await session.list_tools()
+                    self.assertIn('overview', {t.name for t in tools.tools})
+                    failed = await session.call_tool('read_file', {})
+                    self.assertTrue(failed.is_error)
+                    self.assertIn('path', failed.content[0].text)
+        asyncio.run(run())
 
     def test_shared_tool_definitions_and_exact_payloads(self):
         names = {t['name'] for t in agent_mcp.TOOLS}

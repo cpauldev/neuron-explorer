@@ -229,22 +229,22 @@ export const ResearchToolResult: ToolCallMessagePartComponent = (props) => {
   const layer = typeof args.layer === "number" ? args.layer : undefined;
   if (isError || typeof data?.error === "string")
     return (
-      <div
-        className="my-2 rounded-lg border border-destructive/30 p-3 text-sm"
-        role="status"
-      >
-        <p className="text-destructive mb-1">{name} could not complete</p>
-        <ToolFallback
-          {...props}
-          status={{
-            type: "incomplete",
-            reason: "error",
-            error: data?.error || result,
-          }}
-        />
-      </div>
+      <ToolFallback
+        {...props}
+        status={{
+          type: "incomplete",
+          reason: "error",
+          error: data?.error || result,
+        }}
+      />
     );
   if (name === "run_shell") {
+    if (status.type === "incomplete" && result === undefined)
+      return (
+        <div className="my-2 rounded-lg border p-3 text-sm" role="status">
+          Command stopped; no execution result was received.
+        </div>
+      );
     const output =
       typeof data?.output === "string"
         ? data.output

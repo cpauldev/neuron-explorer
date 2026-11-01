@@ -56,6 +56,63 @@ class FakeClaude(FakeCodex):
 
 
 class RouteTests(unittest.TestCase):
+    def test_live_event_arrival_wakes_each_listener_and_disconnect_releases_it(self):
+        async def run():
+            cid = str(uuid.uuid4())
+            server.save_agent_session(cid, {'provider': 'codex'})
+            c = server._chats.setdefault(cid, {'lock': asyncio.Lock()})
+            journal = server.chat_journal(cid, c)
+            c['job'] = asyncio.create_task(asyncio.Event().wait())
+            streams = [(await server.agent_events(cid)).body_iterator for _ in range(2)]
+            pending = [asyncio.create_task(anext(stream)) for stream in streams]
+            try:
+                for _ in range(10):
+                    if len(c['event_listeners']) == 2:
+                        break
+                    await asyncio.sleep(0)
+                self.assertEqual(len(c['event_listeners']), 2)
+                journal.append({'t': 'text', 'text': 'immediate delta'})
+                lines = await asyncio.wait_for(asyncio.gather(*pending), 1)
+                self.assertTrue(all(json.loads(line)['text'] == 'immediate delta' for line in lines))
+            finally:
+                for task in pending:
+                    if not task.done(): task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for stream in streams:
+                    await stream.aclose()
+                c['job'].cancel()
+                await asyncio.gather(c['job'], return_exceptions=True)
+            self.assertEqual(c['event_listeners'], set())
+        asyncio.run(run())
+
+    def test_duplicate_submission_returns_original_receipt_without_running_again(self):
+        async def run():
+            body = {'provider': 'codex', 'message': 'only once', 'request_id': str(uuid.uuid4())}
+            first = await server.agent_send(JsonRequest(body))
+            await server._chats[first['chat']]['job']
+            duplicate = await server.agent_send(JsonRequest(body))
+            self.assertEqual(duplicate['chat'], first['chat'])
+            self.assertEqual(duplicate['cursor'], first['cursor'])
+            self.assertEqual(sum(method == 'turn/start' for method, _ in FakeCodex.calls), 1)
+            changed = await server.agent_send(JsonRequest({**body, 'message': 'different'}))
+            self.assertEqual(changed.status_code, 400)
+            server._chats.clear()
+            duplicate = await server.agent_send(JsonRequest(body))
+            self.assertEqual(duplicate['state'], 'completed')
+            self.assertEqual(sum(method == 'turn/start' for method, _ in FakeCodex.calls), 1)
+        asyncio.run(run())
+
+    def test_claude_branch_id_is_saved_for_the_next_turn(self):
+        async def rewind(client, text):
+            return 'branched-thread'
+        with patch.object(FakeClaude, 'rewind', rewind):
+            cid = self.chat(provider='claude')[0]['chat']
+            reply = self.client.post('/api/agent/rewind', json={'provider': 'claude', 'chat': cid, 'text': 'hello'})
+            self.assertEqual(reply.status_code, 200)
+            self.assertEqual(server.agent_session(cid)[1]['thread'], 'branched-thread')
+            self.chat(provider='claude', chat=cid)
+            self.assertIn(('resume', 'branched-thread'), FakeClaude.calls)
+
     def test_repeated_stop_and_caller_disconnect_do_not_cancel_cleanup_twice(self):
         async def run():
             entered, release = asyncio.Event(), asyncio.Event()
@@ -266,6 +323,8 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/agent/history/import', json={'chat': cid, 'messages': [{'t': 'html', 'text': '<script>'}]}).status_code, 400)
         messages = [{'t': 'user', 'text': 'old prompt'}, {'t': 'text', 'text': 'old answer'}]
         self.assertTrue(self.client.post('/api/agent/history/import', json={'chat': cid, 'messages': messages}).json()['ok'])
+        history = self.client.get('/api/agent/history', params={'chat': cid}).json()
+        self.assertTrue(all(event.get('at') is None for event in history['events']))
         self.assertEqual(self.client.post('/api/agent/history/import', json={'chat': cid, 'messages': messages}).status_code, 409)
         self.assertEqual(self.client.get('/api/agent/events', params={'chat': cid, 'after': -1}).status_code, 400)
         for patch_body in ({'message': ''}, {'message': 1}, {'attachment_names': [3]}, {'shown': {}}, {'layer': 32, 'head': 0}, {'layer': 0, 'head': -1}):

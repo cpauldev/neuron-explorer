@@ -56,7 +56,7 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
             claude = ClaudeClient(folder, asyncio.Queue())
             claude.model = 'sonnet'
             await claude.open_thread(folder, 'chat', 8791, 'instructions')
-            self.assertEqual(claude.args[-2:], ['--model', 'sonnet'])
+            self.assertEqual(claude.options.model, 'sonnet')
             self.assertEqual(os.environ['EXPLORER_CODEX_MODEL'], 'server-default')
 
     async def test_cli_default_is_explicit_when_resuming_after_an_override(self):
@@ -70,7 +70,7 @@ class ModelTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(codex.call.call_args.args[1]['model'], 'actual-default')
             claude = ClaudeClient(folder, asyncio.Queue())
             await claude.open_thread(folder, 'chat', 8791, 'instructions', 'owned')
-            self.assertEqual(claude.args[-2:], ['--model', 'default'])
+            self.assertEqual(claude.options.model, 'default')
 
     def test_model_identifier_rejects_flags_and_structured_values(self):
         for bad in ('--flag', '', {}, 4, 'a\nb', 'x' * 161):

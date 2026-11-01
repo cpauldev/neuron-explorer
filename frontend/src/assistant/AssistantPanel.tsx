@@ -1,4 +1,4 @@
-import { useContext, useEffect, useMemo, useState } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   AssistantRuntimeProvider,
   useExternalStoreRuntime,
@@ -24,6 +24,8 @@ import { AssistantSettings } from "./AssistantSettings";
 import { ComposerSelection, SentContext } from "./SelectionContext";
 import { latestFindings } from "./research";
 import { remarkUnitLinks } from "./unit-links";
+import { RunActivityBody } from "./RunActivityBody";
+import { ConversationSearchPanel } from "./ConversationSearchPanel";
 import { toolkit } from "./toolkit";
 import { attachmentAdapter } from "./attachments";
 import { MarkdownText } from "../components/markdown-text";
@@ -44,6 +46,7 @@ import {
   PlusIcon,
   SparklesIcon,
   PanelLeftCloseIcon,
+  SearchIcon,
 } from "lucide-react";
 import { refLabel } from "../lib/store";
 
@@ -92,6 +95,9 @@ const suggestions = [
       "Help me investigate a concept in this model. Ask which concept I want to explore, then explain how we can find and verify relevant neurons.",
   },
 ];
+function ResearchMessageBody({ children }: React.PropsWithChildren) {
+  return <RunActivityBody Text={ResearchMarkdown}>{children}</RunActivityBody>;
+}
 function ShellApproval({ request }: { request: ApprovalRequest }) {
   const [s, a] = useAssistant(["busy"]);
   const active = request.state === "request" && s.busy;
@@ -106,10 +112,22 @@ function ShellApproval({ request }: { request: ApprovalRequest }) {
   return (
     <ApprovalCard
       className="shell-approval"
-      title="Run this shell command?"
-      subtitle="Shell command approval"
+      title={
+        request.kind === "file_write"
+          ? "Overwrite this file?"
+          : "Run this shell command?"
+      }
+      subtitle={
+        request.kind === "file_write"
+          ? "File overwrite approval"
+          : "Shell command approval"
+      }
       command={request.command}
-      description="Runs with your user account. The starting directory does not restrict file or network access."
+      description={
+        request.kind === "file_write"
+          ? "Replaces the existing file with the contents shown below."
+          : "Runs with your user account. The starting directory does not restrict file or network access."
+      }
       details={[
         {
           label: "Starting directory",
@@ -123,7 +141,9 @@ function ShellApproval({ request }: { request: ApprovalRequest }) {
             ? "denied"
             : "done"
       }
-      allowOnceLabel="Run command"
+      allowOnceLabel={
+        request.kind === "file_write" ? "Overwrite file" : "Run command"
+      }
       denyLabel="Decline"
       statusLabel={request.error || label}
       onAllowOnce={
@@ -163,9 +183,20 @@ function MessageExtra() {
         <ShellApproval key={request.id} request={request} />
       ))}
       {meta.stopped ? (
-        <p role="status" className="text-muted-foreground text-sm">
-          Response stopped
-        </p>
+        <div className="flex items-center gap-2 text-sm">
+          <p role="status" className="text-muted-foreground">
+            Response stopped. Partial response kept.
+          </p>
+          {latest && !s.busy ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => a.safe(a.retryLatest())}
+            >
+              Retry response
+            </Button>
+          ) : null}
+        </div>
       ) : null}
     </>
   );
@@ -305,6 +336,13 @@ function AssistantContents({
   active: boolean;
   voiceError: string;
 }) {
+  const [searchOpen, setSearchOpen] = useState(false);
+  const transcript = useRef<HTMLDivElement>(null);
+  const searchTrigger = useRef<HTMLButtonElement>(null);
+  const closeSearch = () => {
+    setSearchOpen(false);
+    searchTrigger.current?.focus();
+  };
   const [, explorer] = useExplorer([]);
   const [s, a] = useAssistant([
     "provider",
@@ -322,6 +360,7 @@ function AssistantContents({
   const components = {
     Welcome,
     MessageExtra,
+    MessageBody: ResearchMessageBody,
     Footer,
     Text: ResearchMarkdown,
     ComposerExtra: ComposerModelPicker,
@@ -355,6 +394,27 @@ function AssistantContents({
   return (
     <div
       id="tab-agent"
+      ref={transcript}
+      onKeyDown={(event) => {
+        if (
+          !s.historyOpen &&
+          (event.ctrlKey || event.metaKey) &&
+          event.key.toLowerCase() === "f"
+        ) {
+          event.preventDefault();
+          setSearchOpen(true);
+          transcript.current
+            ?.querySelector<HTMLInputElement>(
+              '[aria-label="Find in conversation"]',
+            )
+            ?.select();
+        }
+        if (searchOpen && event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          closeSearch();
+        }
+      }}
       className={`tab assistant-surface dark${active ? " on" : ""}`}
     >
       <ComposerBridge />
@@ -366,6 +426,16 @@ function AssistantContents({
         <h2 className="text-sm font-medium">Assistant</h2>
         <div className="ml-auto flex items-center gap-1">
           <AssistantSettings locked={locked} />
+          {!s.historyOpen && (
+            <TooltipIconButton
+              tooltip="Search conversation"
+              ref={searchTrigger}
+              aria-expanded={searchOpen}
+              onClick={() => setSearchOpen((value) => !value)}
+            >
+              <SearchIcon />
+            </TooltipIconButton>
+          )}
           <TooltipIconButton
             tooltip="Past chats"
             aria-label="Past chats"
@@ -390,6 +460,12 @@ function AssistantContents({
           </TooltipIconButton>
         </div>
       </div>
+      {searchOpen && !s.historyOpen ? (
+        <ConversationSearchPanel
+          transcript={transcript}
+          onClose={closeSearch}
+        />
+      ) : null}
       {voiceError ? (
         <ErrorState
           title="Voice input unavailable"
