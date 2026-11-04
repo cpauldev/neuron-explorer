@@ -483,7 +483,7 @@ export function ComposerAttachButton({
   return (
     <button
       type="button"
-      aria-label="Add attachment"
+      aria-label="Add files"
       data-slot="composer-attach"
       disabled={!props.onClick}
       className={cn(
@@ -673,7 +673,7 @@ export function ComposerVoiceButton({
   return (
     <button
       type="button"
-      aria-label={active ? "Stop recording" : "Start voice input"}
+      aria-label={active ? "Stop recording" : "Dictate"}
       data-slot="composer-voice-button"
       className={cn(
         active

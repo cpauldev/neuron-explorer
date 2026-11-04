@@ -11,6 +11,7 @@ class Journal:
         self.notify = notify
         self.path = Path(root) / 'events' / f'{chat}.jsonl'  # read-only migration source
         with self.store.connect() as db:
+            self.store.check_not_deleted(db, chat)
             rows = list(db.execute('SELECT value FROM events WHERE chat=? ORDER BY seq', (chat,)))
             self.events = [json.loads(row[0]) for row in rows]
             # A marker prevents a deliberately emptied journal from importing again.
@@ -36,6 +37,7 @@ class Journal:
     def append(self, event, request_id=None):
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            self.store.check_not_deleted(db, self.chat)
             seq = db.execute('SELECT COALESCE(MAX(seq),0)+1 FROM events WHERE chat=?', (self.chat,)).fetchone()[0]
             event = {'at': time.time(), **event, 'seq': seq}
             db.execute('INSERT INTO events VALUES (?,?,?)', (self.chat, seq, json.dumps(event, ensure_ascii=False)))

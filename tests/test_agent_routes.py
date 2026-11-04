@@ -56,6 +56,31 @@ class FakeClaude(FakeCodex):
 
 
 class RouteTests(unittest.TestCase):
+    def test_delete_removes_only_owned_history_and_prevents_resuming_it(self):
+        chat = self.chat()[0]['chat']
+        self.assertEqual(self.client.post('/api/agent/delete', json={'chat': chat, 'provider': 'claude'}).status_code, 400)
+        response = self.client.post('/api/agent/delete', json={'chat': chat, 'provider': 'codex'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn(chat, [item['chat'] for item in self.client.get('/api/agent/chats').json()['chats']])
+        self.assertEqual(self.client.get('/api/agent/history', params={'chat': chat}).status_code, 400)
+        self.assertEqual(self.client.post('/api/agent/send', json={'chat': chat, 'provider': 'codex', 'message': 'again'}).status_code, 400)
+        self.assertEqual(self.client.post('/api/agent/delete', json={'chat': '../outside', 'provider': 'codex'}).status_code, 400)
+
+    def test_delete_rejects_running_chats(self):
+        async def run():
+            chat = str(uuid.uuid4())
+            server.save_agent_session(chat, {'provider': 'codex'})
+            task = asyncio.create_task(asyncio.Event().wait())
+            server._chats[chat] = {'lock': asyncio.Lock(), 'job': task}
+            try:
+                response = await server.agent_delete(JsonRequest(chat=chat, provider='codex'))
+                self.assertEqual(response.status_code, 409)
+                self.assertTrue(server.agent_session(chat)[1])
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        asyncio.run(run())
+
     def test_live_event_arrival_wakes_each_listener_and_disconnect_releases_it(self):
         async def run():
             cid = str(uuid.uuid4())

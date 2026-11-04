@@ -42,23 +42,23 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-it("defaults to dark, persists light, and restores it after remount", () => {
+it("defaults to light, persists dark, and restores it after remount", () => {
   const view = render(
     <ThemeProvider>
       <Controls />
     </ThemeProvider>,
   );
-  expect(document.documentElement.className).toBe("dark");
-  fireEvent.click(screen.getByRole("button", { name: "light" }));
   expect(document.documentElement.className).toBe("light");
-  expect(localStorage.getItem("neuron-explorer-theme")).toBe("light");
+  fireEvent.click(screen.getByRole("button", { name: "dark" }));
+  expect(document.documentElement.className).toBe("dark");
+  expect(localStorage.getItem("neuron-explorer-theme")).toBe("dark");
   view.unmount();
   render(
     <ThemeProvider>
       <Controls />
     </ThemeProvider>,
   );
-  expect(document.documentElement.className).toBe("light");
+  expect(document.documentElement.className).toBe("dark");
 });
 
 it("follows live system changes only while System is selected and cleans up", () => {
@@ -91,9 +91,9 @@ it("ignores invalid stored values and works when storage is unavailable", () => 
       <Controls />
     </ThemeProvider>,
   );
-  expect(document.documentElement.className).toBe("dark");
-  fireEvent.click(screen.getByRole("button", { name: "light" }));
   expect(document.documentElement.className).toBe("light");
+  fireEvent.click(screen.getByRole("button", { name: "dark" }));
+  expect(document.documentElement.className).toBe("dark");
 });
 
 it("syncs preference changes from another tab", () => {
@@ -106,13 +106,13 @@ it("syncs preference changes from another tab", () => {
     window.dispatchEvent(
       new StorageEvent("storage", {
         key: "neuron-explorer-theme",
-        newValue: "light",
+        newValue: "dark",
         storageArea: localStorage,
       }),
     ),
   );
-  expect(document.documentElement.className).toBe("light");
-  expect(screen.getByRole("status").textContent).toBe("light");
+  expect(document.documentElement.className).toBe("dark");
+  expect(screen.getByRole("status").textContent).toBe("dark");
 });
 
 it("renders the theme selector with its saved selection", () => {

@@ -4,6 +4,7 @@
 """
 import asyncio
 import builtins
+from contextlib import asynccontextmanager
 import glob
 from functools import wraps
 import json
@@ -50,7 +51,17 @@ def architecture(config):
         "linear_v_heads": _cfg.linear_num_value_heads}
 ARCH = architecture(_model_config)
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await start_agent_reaper()
+    try:
+        preload()
+        yield
+    finally:
+        await stop_agent_jobs()
+
+
+app = FastAPI(lifespan=lifespan)
 build_monitor = BuildMonitor(Path(ROOT) / "cache-jobs")
 
 
@@ -1444,7 +1455,9 @@ def agent_session(cid):
     import uuid
     if not isinstance(cid, str) or str(uuid.UUID(cid)) != cid:
         raise ValueError("invalid explorer chat id; start a new conversation")
-    return cid, AssistantStore(AGENT_DIR).session(cid)
+    store = AssistantStore(AGENT_DIR)
+    store.check_chat(cid)
+    return cid, store.session(cid)
 
 
 def save_agent_session(chat, session):
@@ -1570,6 +1583,7 @@ async def prepare_agent_turn(req, background=False):
                                                 sort_keys=True).encode()).hexdigest()
         store = AssistantStore(AGENT_DIR)
         if background and (receipt := store.receipt(request_id, fingerprint)):
+            store.check_chat(receipt["chat"])
             previous = store.session(receipt["chat"])
             return {**receipt, "provider": previous.get("provider", "codex")}
         cid = b.get("chat") or str(uuid.uuid4())
@@ -1602,6 +1616,7 @@ async def prepare_agent_turn(req, background=False):
             context = {"layer": b["layer"], "n": b.get("head", b.get("n")), "kind": "head" if b.get("head") is not None else "neuron"}
             content[0]["text"] = f"[The person has {selected} open in the explorer.]\n\n{original}"
         content += [await asyncio.to_thread(attachment_input, fid, provider) for fid in b.get("attachments") or []]
+        store.check_chat(cid)
     except (ValueError, KeyError, TypeError, OSError) as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     if background and (receipt := store.receipt(request_id, fingerprint)):
@@ -1792,6 +1807,31 @@ async def agent_history(chat: str):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
+@app.post('/api/agent/delete')
+async def agent_delete(req: Request):
+    """Delete Explorer-owned history; provider session files are outside this operation."""
+    try:
+        body = await req.json()
+        cid, session = agent_session(body['chat'])
+        if not session:
+            raise ValueError('Saved chat not found.')
+        agent_provider(body, session)
+    except (ValueError, KeyError, TypeError, OSError) as error:
+        return JSONResponse({'error': str(error)}, status_code=400)
+    c = _chats.setdefault(cid, {'lock': asyncio.Lock()})
+    if busy_chat(c) or c.get('recovering') or c['lock'].locked():
+        return JSONResponse({'error': 'Stop this chat before deleting it.'}, status_code=409)
+    async with c['lock']:
+        c['recovering'] = True
+        try:
+            await agent_pool.discard(cid)
+            AssistantStore(AGENT_DIR).delete(cid)
+            _chats.pop(cid, None)
+        finally:
+            c.pop('recovering', None)
+    return {'ok': True}
+
+
 @app.post("/api/agent/history/import")
 async def agent_import_history(req: Request):
     """Migrate old browser-only display history as text; never import HTML or CLI session IDs."""
@@ -1859,7 +1899,6 @@ async def agent_interrupt(req: Request):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
-@app.on_event("startup")
 async def start_agent_reaper():
     global agent_reaper
 
@@ -1871,7 +1910,6 @@ async def start_agent_reaper():
     agent_reaper = asyncio.create_task(reap())
 
 
-@app.on_event("shutdown")
 async def stop_agent_jobs():
     if agent_reaper:
         agent_reaper.cancel()
@@ -1966,7 +2004,6 @@ def frontend():
 
 app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static")), name="static")
 
-@app.on_event("startup")
 def preload():
     def go():
         try:

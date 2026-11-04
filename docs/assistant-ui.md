@@ -67,7 +67,7 @@ Runtime problems and pending approvals use conditional notices instead of a perm
 | --- | --- |
 | Conversation | Official styled Thread, with user/assistant messages, composer, latest-turn actions, tool groups and scroll controls. |
 | Attachments | AttachmentUI and a local AttachmentAdapter connected to real upload IDs; selection, paste/drop, progress, removal and attachment-only submission are supported. |
-| History | Searchable ThreadList connected through ExternalStoreThreadListAdapter to persisted conversations. |
+| History | Searchable ThreadList connected through ExternalStoreThreadListAdapter to persisted conversations. ThreadListItemPrimitive.Delete invokes the adapter's onDelete callback after an AlertDialog confirmation. Running chats cannot be deleted. |
 | Find in conversation | Official ConversationSearch with literal, case-insensitive public text matching, highlighted result previews and message navigation. Search excludes tool payloads and marked commentary. Enter/Shift+Enter step through matches; Escape returns focus to the trigger. Ctrl/Cmd+F opens search while focus is in the assistant. Query state resets with the conversation runtime. |
 | Response text | The official MarkdownTextPrimitive provides smooth streaming and GFM formatting, with no custom word-animation layer. Official Shiki registry components highlight settled code and skip tokenization while streaming. The base source preserves whitespace rather than trimming research code. A remark AST plugin links valid neuron references while preserving existing links and code. |
 | Waiting state | The official registry TypingIndicator (bare variant) appears only before the first content arrives. Once a tool or text part exists, its own presentation takes over. |
@@ -112,6 +112,12 @@ Replaying history only folds journal events into typed messages. It never repeat
 or shell approvals. Legacy HTML caches are imported as text only when the backend has no history. Tool cards
 are presentation-only; execution and permission enforcement remain on the server. Completed attachment-chip
 removal also updates persisted drafts because the runtime does not call upload removal for completed files.
+
+History deletion removes Explorer-owned session records, journal events, approvals, and legacy migration
+files. Deleted IDs and idempotency receipts remain to block legacy re-import and delayed retries; provider
+session files and shared attachments are not removed. The server validates ownership/provider and rejects
+active or recovering chats before releasing the idle client. The frontend removes saved draft pointers,
+keeps unrelated conversations intact, and opens a blank chat when the current one is deleted.
 
 The acknowledged browser protocol still accepts `chat/details/examples`, mapped to Inspect →
 Experiment/Overview/Saved examples. UI state reports actual responsive visibility; submitting a hidden
@@ -158,7 +164,7 @@ removal remain direct actions on a draft. Map/Embeddings, layer navigation and c
 
 Light/dark mode follows the official [shadcn Vite provider](https://ui.shadcn.com/docs/dark-mode/vite)
 and [CSS-variable theming](https://ui.shadcn.com/docs/theming) patterns. `ThemeProvider` wraps the app;
-the Appearance selector stores Light/Dark/System under `neuron-explorer-theme`, defaulting to Dark.
+the Appearance selector stores Light/Dark/System under `neuron-explorer-theme`, defaulting to Light.
 Light tokens live in `:root`, dark overrides in `.dark`, and `color-scheme` also drives native controls
 and Shiki's existing `light-dark()` syntax colors. Assistant panels and portals inherit the root theme.
 The head script applies the saved class before paint, as recommended by [Tailwind](https://tailwindcss.com/docs/dark-mode).

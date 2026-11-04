@@ -14,7 +14,7 @@ import "@fontsource/ibm-plex-mono/700.css";
 import "./style.css";
 
 createRoot(document.getElementById("root")!).render(
-  <ThemeProvider defaultTheme="dark">
+  <ThemeProvider>
     <App />
   </ThemeProvider>,
 );

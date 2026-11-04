@@ -1,14 +1,14 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en" class="light">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <meta name="theme-color" content="#000000">
+    <meta name="theme-color" content="#ffffff">
     <script>
       // Tailwind recommends applying the saved class in the head to avoid a theme flash.
       try {
         const saved = localStorage.getItem("neuron-explorer-theme");
-        const theme = saved === "light" || saved === "dark" || saved === "system" ? saved : "dark";
+        const theme = saved === "light" || saved === "dark" || saved === "system" ? saved : "light";
         const resolved = theme === "system" ? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light") : theme;
         document.documentElement.classList.remove("light", "dark");
         document.documentElement.classList.add(resolved);

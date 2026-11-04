@@ -17,6 +17,7 @@ class AssistantStore:
             db.execute('PRAGMA journal_mode=WAL')
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS sessions(chat TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS deleted_chats(chat TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS events(
                     chat TEXT NOT NULL, seq INTEGER NOT NULL, value TEXT NOT NULL,
                     PRIMARY KEY(chat, seq));
@@ -42,6 +43,8 @@ class AssistantStore:
 
     def session(self, chat):
         with self.connect() as db:
+            if db.execute('SELECT 1 FROM deleted_chats WHERE chat=?', (chat,)).fetchone():
+                return {}
             row = db.execute('SELECT value FROM sessions WHERE chat=?', (chat,)).fetchone()
         if row:
             return json.loads(row[0])
@@ -54,7 +57,33 @@ class AssistantStore:
 
     def save_session(self, chat, value):
         with self.connect() as db:
+            self.check_not_deleted(db, chat)
             db.execute('INSERT OR REPLACE INTO sessions VALUES (?,?)', (chat, json.dumps(value)))
+
+    @staticmethod
+    def check_not_deleted(db, chat):
+        if db.execute('SELECT 1 FROM deleted_chats WHERE chat=?', (chat,)).fetchone():
+            raise ValueError('This chat was deleted. Start a new conversation.')
+
+    def check_chat(self, chat):
+        with self.connect() as db:
+            self.check_not_deleted(db, chat)
+
+    def delete(self, chat):
+        """Remove local history; retain IDs and fingerprints to prevent re-import/retry."""
+        import uuid
+        if not isinstance(chat, str) or str(uuid.UUID(chat)) != chat:
+            raise ValueError('Invalid chat ID.')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('INSERT OR IGNORE INTO deleted_chats VALUES (?)', (chat,))
+            db.execute('DELETE FROM approvals WHERE request_id IN (SELECT request_id FROM turns WHERE chat=?)', (chat,))
+            db.execute('DELETE FROM events WHERE chat=?', (chat,))
+            db.execute('DELETE FROM sessions WHERE chat=?', (chat,))
+            # Retain idempotency receipts so a delayed submission cannot repeat a deleted turn.
+            db.execute("UPDATE turns SET state='deleted',provider_turn=NULL WHERE chat=?", (chat,))
+        for folder, suffix in (('sessions', '.json'), ('events', '.jsonl')):
+            (self.root / folder / f'{chat}{suffix}').unlink(missing_ok=True)
 
     def sessions(self):
         for path in (self.root / 'sessions').glob('*.json'):
@@ -81,6 +110,7 @@ class AssistantStore:
         """Commit the acceptance receipt, session and user event together before execution."""
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
+            self.check_not_deleted(db, chat)
             cursor = db.execute('SELECT COALESCE(MAX(seq),0) FROM events WHERE chat=?', (chat,)).fetchone()[0]
             db.execute('INSERT INTO turns VALUES (?,?,?,?,?,?,?)',
                        (request_id, chat, fingerprint, cursor, 'queued', None, time.time()))

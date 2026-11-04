@@ -396,6 +396,7 @@ export interface PastChat {
   running?: boolean;
 }
 export interface AssistantState {
+  deletingChat?: string | null;
   dictating?: boolean;
   provider: Provider;
   model: string | null;

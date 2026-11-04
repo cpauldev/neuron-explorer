@@ -644,6 +644,40 @@ export function createAssistant(explorer: ExplorerStore) {
     attachFiles,
     historyToggle,
     openHistory,
+    async deleteHistory(chat: string) {
+      const state = get();
+      if (state.deletingChat) return;
+      const provider =
+        state.history.find((item) => item.chat === chat)?.provider ??
+        (state.chat === chat ? state.provider : undefined);
+      if (!provider) throw new Error("Saved chat not found.");
+      if (
+        state.chat === chat &&
+        (state.busy || state.loading || state.dictating)
+      )
+        throw new Error("Stop this chat before deleting it.");
+      set({ deletingChat: chat, error: "" });
+      try {
+        await api("/api/agent/delete", { chat, provider });
+        if (disposed) return;
+        writeStorage(`explorer.draft.${chat}`, null);
+        for (const key of [
+          "explorer.agent",
+          ...["codex", "claude"].map((name) =>
+            explorer.actions.modelKey(`explorer.agent.${name}`),
+          ),
+        ]) {
+          if (readStorage<SavedDraft>(key)?.chat === chat)
+            writeStorage(key, null);
+        }
+        set((s) => ({
+          history: s.history.filter((item) => item.chat !== chat),
+        }));
+        if (get().chat === chat) await actions.newChat();
+      } finally {
+        if (!disposed) set({ deletingChat: null });
+      }
+    },
     interruptQueue,
     draft(draft: string) {
       set({ draft });

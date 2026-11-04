@@ -389,7 +389,7 @@ it("uploads with the native attachment control and sends backend-owned file IDs"
       new Response(JSON.stringify({ seq: 1, t: "done" }) + "\n"),
   });
   const { container } = wrap(<AssistantPanel active />);
-  fireEvent.click(screen.getByRole("button", { name: "Add Attachment" }));
+  fireEvent.click(screen.getByRole("button", { name: "Add files" }));
   const input = document.querySelector("input[type=file]");
   fireEvent.change(input, {
     target: {
@@ -471,8 +471,8 @@ it("uses browser dictation, shows recording UI and persists the transcript in th
   );
   assistant.set({ draft: "Typed before speech" });
   const { container } = wrap(<AssistantPanel active />);
-  fireEvent.click(screen.getByRole("button", { name: "Start voice input" }));
-  expect(screen.getByRole("status", { name: "Voice input" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Dictate" }));
+  expect(screen.getByRole("status", { name: "Dictation" })).toBeTruthy();
   expect(container.querySelector('[data-slot="composer-voice"]')).toBeTruthy();
   const result = new Event("result");
   Object.defineProperties(result, {
@@ -489,7 +489,7 @@ it("uses browser dictation, shows recording UI and persists the transcript in th
       "Typed before speech spoken words",
     ),
   );
-  fireEvent.click(screen.getByRole("button", { name: "Stop voice input" }));
+  fireEvent.click(screen.getByRole("button", { name: "Stop dictation" }));
   await waitFor(() =>
     expect(screen.getByLabelText("Assistant message").value).toBe(
       "Typed before speech spoken words",
@@ -533,14 +533,14 @@ it("reports denied dictation separately from model failure without resending a m
   );
   const fetcher = mockApi();
   wrap(<AssistantPanel active />);
-  fireEvent.click(screen.getByRole("button", { name: "Start voice input" }));
+  fireEvent.click(screen.getByRole("button", { name: "Dictate" }));
   const denied = new Event("error");
   Object.defineProperties(denied, {
     error: { value: "not-allowed" },
     message: { value: "permission denied" },
   });
   recognition.dispatchEvent(denied);
-  expect(await screen.findByText("Voice input unavailable")).toBeTruthy();
+  expect(await screen.findByText("Dictation unavailable")).toBeTruthy();
   expect(fetcher.mock.calls.some(([url]) => url === "/api/agent/send")).toBe(
     false,
   );

@@ -366,6 +366,7 @@ function AssistantContents({
     "historyLoading",
     "history",
     "messages",
+    "error",
   ]);
   const aui = useAui();
   const dictating = useAuiState((s) => s.composer.dictation !== undefined);
@@ -498,7 +499,7 @@ function AssistantContents({
       ) : null}
       {voiceError ? (
         <ErrorState
-          title="Voice input unavailable"
+          title="Dictation unavailable"
           detail={voiceError}
           retrying={false}
           className="m-3 w-auto max-w-none"
@@ -509,6 +510,11 @@ function AssistantContents({
           aria-label="Past chats"
           className="flex min-h-0 flex-1 flex-col overflow-auto p-3"
         >
+          {s.error && (
+            <p role="alert" className="p-2 text-sm text-destructive">
+              {s.error}
+            </p>
+          )}
           {s.historyLoading ? (
             <GenerationLoadingState label="Loading chats…" />
           ) : (
@@ -540,6 +546,7 @@ function RuntimePanel({ active }: { active: boolean }) {
       "history",
       "historyLoading",
       "chat",
+      "deletingChat",
     ]);
   const [voiceError, setVoiceError] = useState("");
   const [newChatPrompt, setNewChatPrompt] = useState(false);
@@ -549,6 +556,7 @@ function RuntimePanel({ active }: { active: boolean }) {
     messages: s.messages,
     convertMessage,
     isRunning: s.busy,
+    isDisabled: !!s.deletingChat,
     isLoading: s.loading,
     suggestions: s.messages.length
       ? (latestFindings(s.messages)?.next_steps || []).map((n) => ({
@@ -607,6 +615,10 @@ function RuntimePanel({ active }: { active: boolean }) {
           id: h.chat,
           title: h.title,
           status: "regular" as const,
+          custom: {
+            running: h.running || (h.chat === s.chat && s.busy),
+            deleting: h.chat === s.deletingChat,
+          },
         })),
         onSwitchToNewThread: async () => {
           const state = store.getSnapshot();
@@ -624,6 +636,9 @@ function RuntimePanel({ active }: { active: boolean }) {
         onSwitchToThread: async (id) => {
           const h = store.getSnapshot().history.find((h) => h.chat === id);
           if (h) await store.actions.openHistory(id, h.provider);
+        },
+        onDelete: async (id) => {
+          await store.actions.safe(store.actions.deleteHistory(id));
         },
       },
     },

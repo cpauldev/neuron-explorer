@@ -3,20 +3,27 @@
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogCancel,
+  AlertDialogAction,
+} from "./ui/alert-dialog";
 import { cn } from "@/lib/utils";
 import {
   AuiIf,
   ThreadListItemMorePrimitive,
   ThreadListItemPrimitive,
   ThreadListPrimitive,
-  useAui,
   useAuiState,
 } from "@assistant-ui/react";
 import {
-  ArchiveIcon,
   Loader2Icon,
   MoreHorizontalIcon,
-  PencilIcon,
   PlusIcon,
   SearchIcon,
   TrashIcon,
@@ -24,9 +31,7 @@ import {
 import {
   forwardRef,
   Fragment,
-  useEffect,
   useMemo,
-  useRef,
   useState,
   useSyncExternalStore,
   type ComponentPropsWithoutRef,
@@ -321,170 +326,85 @@ const ThreadListSkeleton: FC = () => {
 };
 
 export const ThreadListItem: FC = () => {
-  const isRunning = useAuiState((s) => s.threadListItem.isRunning);
-  const [isRenaming, setIsRenaming] = useState(false);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const restoreFocusRef = useRef(false);
-
-  useEffect(() => {
-    if (isRenaming || !restoreFocusRef.current) return;
-    restoreFocusRef.current = false;
-    triggerRef.current?.focus();
-  }, [isRenaming]);
-
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const title = useAuiState((s) => s.threadListItem.title) || "New chat";
+  const running = useAuiState(
+    (s) => s.threadListItem.isRunning || !!s.threadListItem.custom?.running,
+  );
+  const deleting = useAuiState((s) => !!s.threadListItem.custom?.deleting);
   return (
-    <ThreadListItemPrimitive.Root
-      data-slot="aui_thread-list-item"
-      className="group hover:bg-muted focus-visible:bg-muted data-active:bg-muted has-focus-visible:bg-muted has-data-[state=open]:bg-muted relative flex h-8 items-center rounded-md transition-colors focus-visible:outline-none"
-    >
-      {isRenaming ? (
-        <ThreadListItemRename
-          onDone={(restoreFocus) => {
-            restoreFocusRef.current = restoreFocus;
-            setIsRenaming(false);
-          }}
-        />
-      ) : (
+    <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+      <ThreadListItemPrimitive.Root
+        data-slot="aui_thread-list-item"
+        className="group hover:bg-muted focus-visible:bg-muted data-active:bg-muted has-focus-visible:bg-muted has-data-[state=open]:bg-muted relative flex h-8 items-center rounded-md transition-colors focus-visible:outline-none"
+      >
         <ThreadListItemPrimitive.Trigger
-          ref={triggerRef}
           data-slot="aui_thread-list-item-trigger"
           className="focus-visible:ring-ring/50 flex h-full min-w-0 flex-1 items-center rounded-md px-2.5 text-start text-sm outline-none group-hover:pe-9 group-has-focus-visible:pe-9 group-has-data-[state=open]:pe-9 group-data-active:pe-9 focus-visible:ring-1"
         >
-          {isRunning && (
+          {running && (
             <Loader2Icon
               aria-hidden
-              data-slot="aui_thread-list-item-running"
-              className="text-muted-foreground me-1.5 size-3.5 shrink-0 animate-spin"
+              className="text-muted-foreground me-1.5 size-3.5 shrink-0 animate-spin motion-reduce:animate-none"
             />
           )}
           <span
             data-slot="aui_thread-list-item-title"
             className="min-w-0 flex-1 truncate"
           >
-            <ThreadListItemPrimitive.Title fallback="New Chat" />
+            <ThreadListItemPrimitive.Title fallback="New chat" />
           </span>
-          {isRunning && <span className="sr-only">Running</span>}
+          {running && <span className="sr-only">Running</span>}
         </ThreadListItemPrimitive.Trigger>
-      )}
-      {/* This backend supports opening chats, but does not expose rename/archive/delete. */}
-    </ThreadListItemPrimitive.Root>
-  );
-};
-
-const ThreadListItemRename: FC<{
-  onDone: (restoreFocus: boolean) => void;
-}> = ({ onDone }) => {
-  const aui = useAui();
-  const title = useAuiState((s) => s.threadListItem.title) ?? "";
-  const [value, setValue] = useState(title);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const settledRef = useRef(false);
-
-  useEffect(() => {
-    inputRef.current?.select();
-  }, []);
-
-  const commit = (restoreFocus: boolean) => {
-    if (settledRef.current) return;
-    settledRef.current = true;
-
-    const next = value.trim();
-    if (!next || next === title) {
-      onDone(restoreFocus);
-      return;
-    }
-
-    // Deferred so a synchronous throw lands on the rejection path too.
-    Promise.resolve()
-      .then(() => aui.threadListItem.rename(next))
-      .then(
-        () => onDone(restoreFocus),
-        () => {
-          settledRef.current = false;
-          if (restoreFocus) inputRef.current?.focus();
-        },
-      );
-  };
-
-  const cancel = () => {
-    if (settledRef.current) return;
-    settledRef.current = true;
-    onDone(true);
-  };
-
-  return (
-    <Input
-      ref={inputRef}
-      autoFocus
-      data-slot="aui_thread-list-item-rename"
-      aria-label="Rename thread"
-      value={value}
-      className="h-7 min-w-0 flex-1 ps-2.5 pe-9 text-sm"
-      onChange={(event) => setValue(event.target.value)}
-      onBlur={() => commit(false)}
-      onKeyDown={(event) => {
-        if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229)
-          return;
-        if (event.key === "Enter") {
-          event.preventDefault();
-          commit(true);
-        } else if (event.key === "Escape") {
-          event.preventDefault();
-          cancel();
-        }
-      }}
-    />
-  );
-};
-
-const ThreadListItemMore: FC<{ onRename: () => void }> = ({ onRename }) => {
-  return (
-    <ThreadListItemMorePrimitive.Root sharedFocusGroup>
-      <ThreadListItemMorePrimitive.Trigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          data-slot="aui_thread-list-item-more"
-          className="data-[state=open]:bg-accent absolute end-1.5 top-1/2 size-6 -translate-y-1/2 p-0 opacity-0 group-hover:opacity-100 group-has-focus-visible:opacity-100 group-data-active:opacity-100 data-[state=open]:opacity-100"
-        >
-          <MoreHorizontalIcon className="size-3.5" />
-          <span className="sr-only">More options</span>
-        </Button>
-      </ThreadListItemMorePrimitive.Trigger>
-      <ThreadListItemMorePrimitive.Content
-        side="right"
-        align="start"
-        sideOffset={6}
-        data-slot="aui_thread-list-item-more-content"
-        className="bg-popover text-popover-foreground data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 data-[state=open]:animate-in data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=closed]:animate-out data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 min-w-32 overflow-hidden rounded-xl border p-1.5"
-      >
-        <ThreadListItemMorePrimitive.Item
-          data-slot="aui_thread-list-item-more-item"
-          className="hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none"
-          onSelect={onRename}
-        >
-          <PencilIcon className="size-4" />
-          Rename
-        </ThreadListItemMorePrimitive.Item>
-        <ThreadListItemPrimitive.Archive asChild>
-          <ThreadListItemMorePrimitive.Item
-            data-slot="aui_thread-list-item-more-item"
-            className="hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none"
+        <ThreadListItemMorePrimitive.Root sharedFocusGroup>
+          <ThreadListItemMorePrimitive.Trigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label={`More options for ${title}`}
+              className="data-[state=open]:bg-accent absolute end-1.5 top-1/2 size-6 -translate-y-1/2 p-0 opacity-0 group-hover:opacity-100 group-has-focus-visible:opacity-100 group-data-active:opacity-100 data-[state=open]:opacity-100"
+            >
+              <MoreHorizontalIcon className="size-3.5" />
+            </Button>
+          </ThreadListItemMorePrimitive.Trigger>
+          <ThreadListItemMorePrimitive.Content
+            side="right"
+            align="start"
+            sideOffset={6}
+            className="bg-popover text-popover-foreground z-50 min-w-32 rounded-xl border p-1.5 shadow-md"
           >
-            <ArchiveIcon className="size-4" />
-            Archive
-          </ThreadListItemMorePrimitive.Item>
-        </ThreadListItemPrimitive.Archive>
-        <ThreadListItemPrimitive.Delete asChild>
-          <ThreadListItemMorePrimitive.Item
-            data-slot="aui_thread-list-item-more-item"
-            className="text-destructive hover:bg-destructive/10 hover:text-destructive focus:bg-destructive/10 focus:text-destructive flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none"
-          >
-            <TrashIcon className="size-4" />
-            Delete
-          </ThreadListItemMorePrimitive.Item>
-        </ThreadListItemPrimitive.Delete>
-      </ThreadListItemMorePrimitive.Content>
-    </ThreadListItemMorePrimitive.Root>
+            <ThreadListItemMorePrimitive.Item
+              disabled={running || deleting}
+              onSelect={() => setDeleteOpen(true)}
+              className="text-destructive focus:bg-destructive/10 flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none data-disabled:opacity-50"
+            >
+              <TrashIcon className="size-4" />
+              Delete
+            </ThreadListItemMorePrimitive.Item>
+          </ThreadListItemMorePrimitive.Content>
+        </ThreadListItemMorePrimitive.Root>
+      </ThreadListItemPrimitive.Root>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Delete chat?</AlertDialogTitle>
+          <AlertDialogDescription>
+            “{title}” will be removed from Neuron Explorer. This can’t be
+            undone.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <ThreadListItemPrimitive.Delete asChild>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={deleting || running}
+              onClick={() => setDeleteOpen(false)}
+            >
+              Delete
+            </AlertDialogAction>
+          </ThreadListItemPrimitive.Delete>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
 };

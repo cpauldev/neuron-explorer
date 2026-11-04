@@ -39,6 +39,7 @@ import {
   ComposerPrimitive,
   ErrorPrimitive,
   groupPartByType,
+  MessagePartPrimitive,
   MessagePrimitive,
   SuggestionPrimitive,
   ThreadPrimitive,
@@ -361,7 +362,13 @@ const SpokenMessage: FC = () => {
           {role === "user" ? "You said" : "Assistant said"}
         </span>
         <div className="min-w-0 flex-1 wrap-break-word">
-          <MessagePrimitive.Parts components={{ Text: SpokenText }} />
+          <MessagePrimitive.Parts>
+            {({ part }) => {
+              if (part.type === "text") return <SpokenText {...part} />;
+              if (part.type === "image") return <MessagePartPrimitive.Image />;
+              return null;
+            }}
+          </MessagePrimitive.Parts>
           {isSpeaking && (
             <span
               data-slot="aui_spoken-message-indicator"
@@ -573,7 +580,7 @@ const DictationWaveform: FC = () => {
     return () => clearInterval(timer);
   }, [status]);
   return (
-    <div role="status" aria-label="Voice input">
+    <div role="status" aria-label="Dictation">
       {status === "starting" ? (
         <p className="text-muted-foreground px-3 py-2 text-sm">
           Waiting for microphone…
@@ -610,14 +617,13 @@ const ComposerAction: FC = () => {
           <AuiIf condition={(s) => s.composer.dictation == null}>
             <ComposerPrimitive.Dictate asChild>
               <TooltipIconButton
-                tooltip="Voice input"
+                tooltip="Dictate"
                 side="bottom"
                 type="button"
                 variant="ghost"
                 size="icon"
                 className="aui-composer-dictate text-muted-foreground hover:text-foreground size-7 rounded-full"
-                aria-label="Start voice input"
-                title="Dictate using your browser’s speech service"
+                aria-label="Dictate"
               >
                 <MicIcon className="aui-composer-dictate-icon size-4" />
               </TooltipIconButton>
@@ -632,7 +638,7 @@ const ComposerAction: FC = () => {
                 variant="ghost"
                 size="icon"
                 className="aui-composer-stop-dictation text-destructive size-7 rounded-full"
-                aria-label="Stop voice input"
+                aria-label="Stop dictation"
               >
                 <SquareIcon className="aui-composer-stop-dictation-icon size-3.5 animate-pulse fill-current" />
               </TooltipIconButton>
@@ -648,17 +654,15 @@ const ComposerAction: FC = () => {
           }
         >
           <ComposerPrimitive.Send asChild>
-            <TooltipIconButton
-              tooltip="Send message"
-              side="bottom"
+            <Button
               type="button"
               variant="default"
               size="icon"
-              className="aui-composer-send size-7 rounded-full"
+              className="aui-button-icon aui-composer-send size-7 rounded-full p-1 active:scale-90"
               aria-label="Send message"
             >
               <ArrowUpIcon className="aui-composer-send-icon size-4" />
-            </TooltipIconButton>
+            </Button>
           </ComposerPrimitive.Send>
         </AuiIf>
         <AuiIf condition={shouldShowComposerResume}>
@@ -993,9 +997,22 @@ const UserMessage: FC = () => {
 
       <div className="aui-user-message-content-wrapper relative col-start-2 min-w-0">
         <div className="aui-user-message-content peer bg-muted text-foreground rounded-(--composer-radius) px-4 py-2 wrap-break-word empty:hidden">
-          <MessagePrimitive.Parts
-            components={{ File: UserFilePart, Image: UserImagePart }}
-          />
+          <MessagePrimitive.Parts>
+            {({ part }) => {
+              if (part.type === "text")
+                return (
+                  <p style={{ whiteSpace: "pre-line" }}>
+                    <MessagePartPrimitive.Text />
+                    <MessagePartPrimitive.InProgress>
+                      <span style={{ fontFamily: "revert" }}> ●</span>
+                    </MessagePartPrimitive.InProgress>
+                  </p>
+                );
+              if (part.type === "file") return <UserFilePart {...part} />;
+              if (part.type === "image") return <UserImagePart {...part} />;
+              return null;
+            }}
+          </MessagePrimitive.Parts>
         </div>
         <div className="aui-user-action-bar-wrapper absolute start-0 top-1/2 -translate-x-full -translate-y-1/2 pe-2 peer-empty:hidden rtl:translate-x-full">
           <UserActionBar />

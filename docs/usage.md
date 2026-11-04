@@ -13,7 +13,7 @@ architecture and model-specific caches and conversations. Other open tabs refres
 the change. If loading fails, the previous model stays selected and is reloaded when possible.
 
 Open **Settings → Appearance** in the top toolbar to choose **Light**, **Dark**, or **System**.
-Dark is the initial default; your choice is saved in this browser. System follows
+Light is the initial default; your choice is saved in this browser. System follows
 your operating system's appearance, including changes while the app is open.
 
 In **Settings → Visualization → Scene colors**, use the color picker or edit the hex value directly
@@ -35,6 +35,10 @@ your control. Your network returns to full color when the turn finishes or stops
 tested group together. Large batches show their markers without adding an unreadable web for every unit.
 Refreshing reconnects to a running chat and restores its current activity; it does not submit the request again.
 Your Workbench and Inspect tabs are remembered.
+
+In **Past chats**, open a chat’s **More options → Delete** menu to remove it from Neuron Explorer.
+Deletion requires confirmation and cannot be undone. Stop a running chat first. Deleting the current
+chat opens a blank conversation. Provider-side conversation files are not deleted.
 
 Use the floating **Chat** and **Workbench** buttons below the canvas toolbar to open closed panels, and the collapse control in each panel header to close them. Panel visibility is remembered across refreshes. On wide screens both can stay open and their dividers can be resized. Compact screens show one sidebar at a time; on phones it fills the work area. Closing it returns to the map. Conversations and tool drafts survive switching between these areas.
 
