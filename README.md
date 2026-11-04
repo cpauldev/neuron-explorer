@@ -62,4 +62,4 @@ Run `python tests/run_checks.py` from your configured Python environment for the
 See the [development guide](docs/development.md) for architecture, testing and known limitations,
 [assistant-ui integration](docs/assistant-ui.md) for chat component ownership, and the [changelog](CHANGELOG.md) for changes.
 
-Based on [Lyra C's neuron explorer](https://github.com/lyramakesmusic/neuron-explorer).
+Fork of [Lyra C's neuron explorer](https://github.com/lyramakesmusic/neuron-explorer).
