@@ -54,6 +54,7 @@ export function createAssistant(explorer: ExplorerStore) {
       }
     })();
   const store = createStore<AssistantState>({
+    modelCatalogs: {},
     provider,
     model: null,
     includeSelection: readStorage("explorer.agent.includeSelection") !== false,
@@ -80,6 +81,10 @@ export function createAssistant(explorer: ExplorerStore) {
     explorer.getSnapshot().arch,
     explorer.actions.setChatActivity,
   );
+  const modelRequests = new Map<
+    Provider,
+    { controller: AbortController; promise: Promise<void> }
+  >();
   let ctl: AbortController | null = null,
     finished = Promise.resolve(),
     starting: Promise<{ chat: string; cursor: number }> | null = null,
@@ -692,18 +697,62 @@ export function createAssistant(explorer: ExplorerStore) {
     dropQueue(id: string) {
       set((s) => ({ queue: s.queue.filter((q) => q.id !== id) }));
     },
-    async switchProvider(provider: Provider) {
-      if (get().busy || get().dictating || get().pending.some((a) => !a.id))
+    loadModels(provider: Provider, refresh = false): Promise<void> {
+      const pending = modelRequests.get(provider);
+      if (pending) return pending.promise;
+      if (!refresh && get().modelCatalogs[provider]) return Promise.resolve();
+      const controller = new AbortController();
+      const promise = api<
+        NonNullable<AssistantState["modelCatalogs"][Provider]>
+      >(`/api/agent/models?provider=${provider}`, undefined, {
+        signal: controller.signal,
+      })
+        .then((catalog) => {
+          if (!disposed)
+            set((s) => ({
+              modelCatalogs: { ...s.modelCatalogs, [provider]: catalog },
+            }));
+        })
+        .catch((error) => {
+          if (!disposed && !controller.signal.aborted)
+            set((s) => ({
+              modelCatalogs: {
+                ...s.modelCatalogs,
+                [provider]: { models: [], warning: error.message },
+              },
+            }));
+        })
+        .finally(() => {
+          modelRequests.delete(provider);
+        });
+      modelRequests.set(provider, { controller, promise });
+      return promise;
+    },
+    async switchProvider(provider: Provider, model?: string | null) {
+      if (
+        get().busy ||
+        get().loading ||
+        get().deletingChat ||
+        get().dictating ||
+        get().pending.some((a) => !a.id)
+      )
         return;
+      if (provider === get().provider) {
+        if (model !== undefined) actions.model(model);
+        return;
+      }
       save();
       set({ provider });
       const old = load();
+      if (model !== undefined) set({ model });
       save();
-      await resume(old);
+      await resume(model === undefined ? old : { ...old, model });
     },
     model(model: string | null) {
       if (
         !get().busy &&
+        !get().loading &&
+        !get().deletingChat &&
         !get().dictating &&
         !get().pending.some((p) => !p.id)
       ) {
@@ -783,6 +832,7 @@ export function createAssistant(explorer: ExplorerStore) {
       if (!ctl) safe(resume(resumeAfter));
     },
     dispose() {
+      for (const request of modelRequests.values()) request.controller.abort();
       sceneActivity.clear();
       disposed = true;
       clearTimeout(flushTimer);

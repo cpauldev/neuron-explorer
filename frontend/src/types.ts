@@ -396,6 +396,15 @@ export interface PastChat {
   running?: boolean;
 }
 export interface AssistantState {
+  modelCatalogs: Partial<
+    Record<
+      Provider,
+      {
+        models: { id: string; name: string; description?: string }[];
+        warning?: string;
+      }
+    >
+  >;
   deletingChat?: string | null;
   dictating?: boolean;
   provider: Provider;

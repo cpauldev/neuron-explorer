@@ -21,6 +21,7 @@ import {
   useExplorer,
   useStore,
 } from "../context";
+import { ComposerModelPicker } from "./ComposerModelPicker";
 import { ComposerSelection, SentContext } from "./SelectionContext";
 import { latestFindings } from "./research";
 import { remarkUnitLinks } from "./unit-links";
@@ -386,6 +387,7 @@ function AssistantContents({
       Footer,
       Text: ResearchMarkdown,
       ComposerContext: ComposerSelection,
+      ComposerExtra: ComposerModelPicker,
       UserMessageExtra: SentContext,
       ComposerInputProps: {
         onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) =>
