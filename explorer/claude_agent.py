@@ -2,6 +2,10 @@
 import asyncio
 from dataclasses import asdict
 import os
+import logging
+from pathlib import Path
+import re
+import tempfile
 import uuid
 
 from anyio import CancelScope
@@ -11,6 +15,32 @@ from claude_agent_sdk import (
     get_session_info, get_session_messages, fork_session,
 )
 from agent_common import AgentError, explorer_mcp, tool_output
+
+logger = logging.getLogger(__name__)
+
+
+def claude_error(error, *, code=None):
+    """Classify provider failures without mistaking launch failures for sign-in failures."""
+    text = str(error)
+    lower = text.lower()
+    if code == 'authentication_failed' or any(marker in lower for marker in (
+            'not logged in', 'please run /login', 'authentication_failed',
+            'invalid api key', 'authentication failed', 'failed to authenticate',
+            'oauth session expired', 'please run claude auth login')):
+        return ('Claude needs authentication. Run `claude auth login` in a terminal on the '
+                'machine running Neuron Explorer, then retry. If you use an API key or cloud '
+                'provider, check that configuration instead.')
+    if 'claude code not found at:' in lower:
+        path = re.split('claude code not found at:', text, flags=re.IGNORECASE)[-1].strip()
+        if Path(path).is_file():
+            return ('Claude Code could not launch, although its executable exists. Check the '
+                    'server logs for the underlying process error. If needed, set '
+                    'EXPLORER_CLAUDE_BIN to a working Claude executable and restart the server.')
+        return ('Claude Code executable was not found. Repair the Claude Agent SDK installation '
+                'or set EXPLORER_CLAUDE_BIN to a working Claude executable, then restart the server.')
+    if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+        return 'Claude took too long to start. Check the server logs and your connection, then retry.'
+    return f'Claude request failed: {text[:600]}'
 
 
 def user_text(message):
@@ -53,6 +83,9 @@ def legacy_session(sid, cwd):
 
 def browser_events(message):
     kind = message.get('type')
+    if kind == 'provider_error':
+        yield {'t': 'error', 'error': claude_error(message.get('error', ''), code=message.get('code'))}
+        return
     if kind == 'stream_event':
         event = message.get('event', {})
         if event.get('type') == 'content_block_delta' and event.get('delta', {}).get('type') == 'text_delta':
@@ -73,7 +106,7 @@ def browser_events(message):
                        'output': tool_output(output)}
     elif kind == 'result':
         if message.get('is_error'):
-            yield {'t': 'error', 'error': str(message.get('result') or 'Claude request failed')[:600]}
+            yield {'t': 'error', 'error': claude_error(message.get('result') or 'Unknown provider error')}
         yield {'t': 'done', 'status': 'failed' if message.get('is_error') else 'completed', 'cost': message.get('total_cost_usd')}
 
 
@@ -82,6 +115,9 @@ def sdk_record(message):
     if isinstance(message, StreamEvent):
         return {'type': 'stream_event', 'event': message.event}
     if isinstance(message, (AssistantMessage, UserMessage)):
+        if isinstance(message, AssistantMessage) and getattr(message, 'error', None):
+            return {'type': 'provider_error', 'code': message.error,
+                    'error': '; '.join(block.text for block in message.content if hasattr(block, 'text'))}
         blocks = []
         for block in message.content if isinstance(message.content, list) else []:
             value = asdict(block)
@@ -105,6 +141,7 @@ class ClaudeClient:
         self.thread = self.turn = None
         self.ready = None
         self.closing = False
+        self.prompt_file = None
 
     @property
     def alive(self):
@@ -140,8 +177,13 @@ class ClaudeClient:
     async def open_thread(self, root, chat, port, instructions, thread=None):
         self.thread, self.chat = thread or chat, chat
         self.tool_names = {'mcp__explorer__' + tool['name'] for tool in self._tools()}
+        # Keep the methodology out of argv: Windows limits process command length.
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.md',
+                                         prefix='explorer-claude-', delete=False) as prompt:
+            prompt.write(instructions)
+            self.prompt_file = prompt.name
         self.options = ClaudeAgentOptions(
-            cwd=self.cwd, system_prompt=instructions, tools=[],
+            cwd=self.cwd, system_prompt={'type': 'file', 'path': self.prompt_file}, tools=[],
             mcp_servers={'explorer': explorer_mcp(root, chat, port)}, strict_mcp_config=True,
             setting_sources=[], settings='{"enabledPlugins":{}}',
             can_use_tool=self._permission, include_partial_messages=True, verbatim_prompts=True,
@@ -180,7 +222,8 @@ class ClaudeClient:
             await self.close()
             if isinstance(e, asyncio.CancelledError):
                 raise
-            raise AgentError(f'Claude could not start the turn: {e}') from e
+            logger.exception('Claude turn startup failed')
+            raise AgentError(claude_error(e)) from e
 
     async def _run(self):
         sdk = ClaudeSDKClient(self.options)
@@ -189,20 +232,28 @@ class ClaudeClient:
             await sdk.connect()
             if not self.ready.done():
                 self.ready.set_result(True)
+            last_error = None
             async for message in sdk.receive_messages():
                 if isinstance(message, SystemMessage) and message.subtype == 'init':
                     reported = message.data.get('session_id')
                     if reported and reported != self.thread:
                         raise AgentError('Claude returned an unexpected session ID.')
                 for event in browser_events(sdk_record(message)):
+                    if event['t'] == 'error':
+                        if event['error'] == last_error:
+                            continue
+                        last_error = event['error']
+                    elif event['t'] == 'done':
+                        last_error = None
                     self.queue.put_nowait(('event', event))
         except asyncio.CancelledError:
             raise
         except Exception as e:
             if not self.ready.done():
-                self.ready.set_exception(AgentError(str(e)))
+                self.ready.set_exception(e)
             elif not self.closing:
-                self.queue.put_nowait(('event', {'t': 'error', 'error': f'Claude connection closed: {e}'}))
+                logger.exception('Claude connection failed')
+                self.queue.put_nowait(('event', {'t': 'error', 'error': claude_error(e)}))
         finally:
             with CancelScope(shield=True):
                 await sdk.disconnect()
@@ -235,3 +286,6 @@ class ClaudeClient:
             await asyncio.gather(self.worker, return_exceptions=True)
             self.worker = None
         self.turn = None
+        if self.prompt_file:
+            Path(self.prompt_file).unlink(missing_ok=True)
+            self.prompt_file = None

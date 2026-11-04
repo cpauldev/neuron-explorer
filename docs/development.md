@@ -17,6 +17,7 @@ Install any missing project dependencies into that environment deliberately befo
 | --- | --- |
 | `explorer/token_display.py` | Lossless labels for isolated vocabulary tokens; display caches stay separate from raw analysis data. |
 | `explorer/runtime.py` | Local Qwen inference, interventions, weight analysis and attention reconstruction. |
+| `explorer/local_models.py` | Local checkpoint discovery, switch lifecycle and model-generation request gating. |
 | `explorer/model_config.py` | Model identity, architecture checks, isolated paths and Safetensors access. |
 | `explorer/cache_job.py` | Job lifecycle, progress, resume policy and command-line controls. |
 | `explorer/cache_progress.py` | Optional desktop progress window using the same cache-job controls. |
@@ -40,6 +41,9 @@ Install any missing project dependencies into that environment deliberately befo
 | `frontend/src/assistant/` | assistant-ui runtime, structured journal conversion, provider/draft lifecycle and research tool renderers. |
 | `frontend/src/context.tsx`, `frontend/src/lib/store.ts` | Typed selective React store subscriptions and shared HTTP/storage/stream helpers. |
 | `explorer/static/map3d.js`, `explorer/static/scatter.js` | Visualization and interaction. |
+| `explorer/static/scene-colors.js`, `map-palette.js` | Validated theme palettes and derived scene colors. |
+| `explorer/static/scene-materials.js`, `scene-web.js` | Shared rendering materials and signed connection geometry. |
+| `frontend/src/assistant/scene-activity.ts`, `explorer/static/chat-scene-focus.js` | Live tool subjects and temporary scene presentation. |
 | `vite.config.mjs`, `frontend/index.html` | Vite entry and same-origin compiled assets in `explorer/static/dist/`. |
 
 The small assistant modules separate persistence, process control and permission boundaries. Keep provider
@@ -57,6 +61,33 @@ complete responsibility with explicit dependencies, rather than adding generic h
 functions merely to reduce the number of files.
 
 ## Tests
+
+For changes to the research assistant's instructions, also run a live explanation evaluation against a
+running local app with its model loaded and the Codex CLI authenticated:
+
+```sh
+.venv/Scripts/python.exe scripts/evaluate_neuron_explanation.py trial-name --layer 19 --neuron 8930
+```
+
+This creates a fresh chat and saves prompt snapshots, the event history, and a summary under
+`output/evaluations/trial-name/`. It never approves shell/file actions. A timeout, pending approval,
+provider failure, or missing completed findings report returns a failing exit status. The script uses
+the app's CLI-default assistant model; it does not change the user's provider/model settings.
+
+For browser-submitted trials, use `--chat CHAT_ID` to observe that fresh trial without sending another
+message. Submit through the composer first; use a new output label per trial. `turn_seconds` measures
+the full turn, while `seconds` measures only the observer's elapsed time.
+
+Use `--prompt "YOUR BENIGN RESEARCH REQUEST"` for discovery/comparison evaluations rather than the
+default single-neuron explanation. Review retrieval coverage separately from live comparison coverage;
+check that ranked claims use comparable validation and that degeneration is not scored as success.
+
+Review the evidence, not just the confidence label or tool count. A useful comparison checks whether
+the assistant tested competing interpretations, used matched and fresh controls, checked the claimed
+output effect, answered the central question before suggesting extensions, and stopped when the
+available evidence did not distinguish the alternatives. Include an ambiguous case; an honest bounded
+non-result is preferable to inventing a common meaning. Save failed runs as failed, and do not count
+provider outages or usage limits as evidence about explanation quality.
 
 Run from the configured environment with Node.js available:
 

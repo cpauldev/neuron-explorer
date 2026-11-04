@@ -26,7 +26,9 @@ import {
 import { TooltipIconButton } from "@/components/tooltip-icon-button";
 import { ComposerVoice } from "@/components/composer";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
+import { GenerationLoadingState } from "./loading-state";
+import { findingsMessageMarkdown } from "../assistant/research";
+import { useCopyToClipboard } from "../hooks/use-copy-to-clipboard";
 import { cn } from "@/lib/utils";
 import {
   ActionBarMorePrimitive,
@@ -80,10 +82,9 @@ import {
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
-const DefaultToolGroup: FC<PropsWithChildren<{ group: ThreadGroupPart }>> = ({
-  group,
-  children,
-}) => {
+export const DefaultToolGroup: FC<
+  PropsWithChildren<{ group: ThreadGroupPart }>
+> = ({ group, children }) => {
   const [open, setOpen] = useState(false);
 
   return (
@@ -138,21 +139,25 @@ export type ThreadComponents = {
   ComposerContext?: ComponentType;
   UserMessageExtra?: ComponentType;
   MessageExtra?: ComponentType | undefined;
-  MessageBody?: ComponentType<PropsWithChildren> | undefined;
+  MessageParts?: ComponentType | undefined;
   Text?: TextMessagePartComponent;
   Footer?: ComponentType | undefined;
   canEdit?: (id: string) => boolean;
   canReload?: (id: string) => boolean;
 };
 
-const messageGroupBy = groupPartByType({
+export const messageGroupBy = groupPartByType({
   reasoning: ["group-chainOfThought", "group-reasoning"],
   "tool-call": ["group-chainOfThought", "group-tool"],
   "standalone-tool-call": [],
 });
 
 type ThreadGroupKey =
-  "group-chainOfThought" | "group-reasoning" | "group-tool" | "group-task";
+  | "group-chainOfThought"
+  | "group-reasoning"
+  | "group-tool"
+  | "group-task"
+  | "group-activity";
 
 const TASK_GROUP_PATH: readonly ThreadGroupKey[] = [
   "group-chainOfThought",
@@ -195,25 +200,8 @@ const isHistoryLoadingView = (s: AssistantState) =>
   !s.thread.isDisabled &&
   !s.threads.isLoading;
 
-const ThreadHistorySkeleton: FC = () => (
-  <div
-    data-slot="aui_thread-history-skeleton"
-    role="status"
-    className="animate-in fade-in fill-mode-both flex flex-col gap-y-6 [animation-delay:150ms] [animation-duration:200ms]"
-  >
-    <span className="sr-only">Loading conversation</span>
-    <Skeleton className="ml-auto h-9 w-2/5 rounded-xl motion-reduce:animate-none" />
-    <div className="flex flex-col gap-y-2">
-      <Skeleton className="h-4 w-11/12 motion-reduce:animate-none" />
-      <Skeleton className="h-4 w-4/5 motion-reduce:animate-none" />
-      <Skeleton className="h-4 w-3/5 motion-reduce:animate-none" />
-    </div>
-    <Skeleton className="ml-auto h-9 w-1/3 rounded-xl motion-reduce:animate-none" />
-    <div className="flex flex-col gap-y-2">
-      <Skeleton className="h-4 w-10/12 motion-reduce:animate-none" />
-      <Skeleton className="h-4 w-2/3 motion-reduce:animate-none" />
-    </div>
-  </div>
+const ThreadHistoryLoading: FC = () => (
+  <GenerationLoadingState label="Loading conversation…" />
 );
 
 export const Thread: FC<ThreadProps> = ({
@@ -263,7 +251,7 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
             <Welcome />
           </AuiIf>
           <AuiIf condition={isHistoryLoadingView}>
-            <ThreadHistorySkeleton />
+            <ThreadHistoryLoading />
           </AuiIf>
 
           <ThreadLoadEarlier />
@@ -722,18 +710,24 @@ const MessageError: FC = () => {
   );
 };
 
-const MessageBodyWrapper: FC<
-  PropsWithChildren<{ body?: ComponentType<PropsWithChildren> }>
-> = ({ body: Body, children }) => (Body ? <Body>{children}</Body> : children);
+export type ThreadPartGroupBy = (
+  part: Parameters<typeof messageGroupBy>[0],
+  context?: Parameters<typeof messageGroupBy>[1],
+) => readonly ThreadGroupKey[];
 
-const AssistantMessage: FC = () => {
+/** Shared leaf and group renderers for every assistant message. */
+export function ThreadMessageParts({
+  groupBy: customGroupBy,
+  ActivityGroup,
+}: {
+  groupBy?: ThreadPartGroupBy;
+  ActivityGroup?: ComponentType<PropsWithChildren<{ group: ThreadGroupPart }>>;
+} = {}) {
   const {
     ToolFallback: ToolFallbackComponent = ToolFallback,
     ToolGroup,
     ReasoningGroup,
     TaskGroup: TaskGroupComponent,
-    MessageExtra,
-    MessageBody,
     Text = MarkdownText,
   } = useContext(ThreadComponentsContext);
   const approvalPending = useAuiState((s) =>
@@ -747,8 +741,83 @@ const AssistantMessage: FC = () => {
         (part) => part.type !== "text" || part.text.trim().length > 0,
       ),
   );
-  const groupBy = TaskGroupComponent ? taskAwareGroupBy : messageGroupBy;
+  const groupBy =
+    customGroupBy ?? (TaskGroupComponent ? taskAwareGroupBy : messageGroupBy);
 
+  return (
+    <MessagePrimitive.GroupedParts groupBy={groupBy}>
+      {({ part, children }) => {
+        switch (part.type) {
+          case "group-activity":
+            return ActivityGroup ? (
+              <ActivityGroup group={part}>{children}</ActivityGroup>
+            ) : (
+              <>{children}</>
+            );
+          case "group-chainOfThought":
+            return <div data-slot="aui_chain-of-thought">{children}</div>;
+          case "group-task":
+            return TaskGroupComponent ? (
+              <TaskGroupComponent group={part} />
+            ) : null;
+          case "group-tool":
+            if (ToolGroup) {
+              return <ToolGroup group={part}>{children}</ToolGroup>;
+            }
+            return <DefaultToolGroup group={part}>{children}</DefaultToolGroup>;
+          case "group-reasoning": {
+            if (ReasoningGroup) {
+              return <ReasoningGroup group={part}>{children}</ReasoningGroup>;
+            }
+            const running = part.status.type === "running";
+            return (
+              <ReasoningRoot streaming={running}>
+                <ReasoningTrigger
+                  active={running}
+                  duration={reasoningDuration(part.timing)}
+                />
+                <ReasoningContent aria-busy={running}>
+                  <ReasoningText>{children}</ReasoningText>
+                </ReasoningContent>
+              </ReasoningRoot>
+            );
+          }
+          case "text":
+            return <Text {...part} />;
+          case "reasoning":
+            return <Reasoning {...part} />;
+          case "tool-call":
+            return part.toolUI ?? <ToolFallbackComponent {...part} />;
+          case "data":
+            return part.dataRendererUI;
+          case "file":
+            return (
+              <div data-slot="aui_assistant-message-file" className="py-1">
+                <MessageFile {...part} />
+              </div>
+            );
+          case "image":
+            return (
+              <div data-slot="aui_assistant-message-image" className="py-1">
+                <Image {...part} />
+              </div>
+            );
+          case "indicator":
+            return !approvalPending && waitingForContent ? (
+              <TypingIndicator variant="bare" className="py-2" />
+            ) : null;
+          default:
+            return null;
+        }
+      }}
+    </MessagePrimitive.GroupedParts>
+  );
+}
+
+const AssistantMessage: FC = () => {
+  const { MessageExtra, MessageParts = ThreadMessageParts } = useContext(
+    ThreadComponentsContext,
+  );
   const ACTION_BAR_PT = "pt-1.5";
   // Keep the action bar inside the contained root's paint box, then cancel its reserved space in flow.
   const ACTION_BAR_HEIGHT = `min-h-7.5 ${ACTION_BAR_PT}`;
@@ -763,78 +832,7 @@ const AssistantMessage: FC = () => {
         data-slot="aui_assistant-message-content"
         className="text-foreground px-2 leading-relaxed wrap-break-word"
       >
-        <MessageBodyWrapper body={MessageBody}>
-          <MessagePrimitive.GroupedParts groupBy={groupBy}>
-            {({ part, children }) => {
-              switch (part.type) {
-                case "group-chainOfThought":
-                  return <div data-slot="aui_chain-of-thought">{children}</div>;
-                case "group-task":
-                  return TaskGroupComponent ? (
-                    <TaskGroupComponent group={part} />
-                  ) : null;
-                case "group-tool":
-                  if (ToolGroup) {
-                    return <ToolGroup group={part}>{children}</ToolGroup>;
-                  }
-                  return (
-                    <DefaultToolGroup group={part}>{children}</DefaultToolGroup>
-                  );
-                case "group-reasoning": {
-                  if (ReasoningGroup) {
-                    return (
-                      <ReasoningGroup group={part}>{children}</ReasoningGroup>
-                    );
-                  }
-                  const running = part.status.type === "running";
-                  return (
-                    <ReasoningRoot streaming={running}>
-                      <ReasoningTrigger
-                        active={running}
-                        duration={reasoningDuration(part.timing)}
-                      />
-                      <ReasoningContent aria-busy={running}>
-                        <ReasoningText>{children}</ReasoningText>
-                      </ReasoningContent>
-                    </ReasoningRoot>
-                  );
-                }
-                case "text":
-                  return <Text {...part} />;
-                case "reasoning":
-                  return <Reasoning {...part} />;
-                case "tool-call":
-                  return part.toolUI ?? <ToolFallbackComponent {...part} />;
-                case "data":
-                  return part.dataRendererUI;
-                case "file":
-                  return (
-                    <div
-                      data-slot="aui_assistant-message-file"
-                      className="py-1"
-                    >
-                      <MessageFile {...part} />
-                    </div>
-                  );
-                case "image":
-                  return (
-                    <div
-                      data-slot="aui_assistant-message-image"
-                      className="py-1"
-                    >
-                      <Image {...part} />
-                    </div>
-                  );
-                case "indicator":
-                  return !approvalPending && waitingForContent ? (
-                    <TypingIndicator variant="bare" className="py-2" />
-                  ) : null;
-                default:
-                  return null;
-              }
-            }}
-          </MessagePrimitive.GroupedParts>
-        </MessageBodyWrapper>
+        <MessageParts />
         {MessageExtra ? null : <MessageError />}
         {MessageExtra && <MessageExtra />}
       </div>
@@ -853,22 +851,35 @@ const AssistantMessage: FC = () => {
 const AssistantActionBar: FC = () => {
   const { canReload } = useContext(ThreadComponentsContext);
   const id = useAuiState((s) => s.message.id);
+  const findingsText = useAuiState((s) =>
+    findingsMessageMarkdown(s.message.parts),
+  );
+  const { isCopied, copyToClipboard } = useCopyToClipboard();
   return (
     <ActionBarPrimitive.Root
       hideWhenRunning
       autohide="not-last"
       className="aui-assistant-action-bar-root text-muted-foreground animate-in fade-in col-start-3 row-start-2 -ms-1 flex gap-1 duration-200"
     >
-      <ActionBarPrimitive.Copy asChild>
-        <TooltipIconButton tooltip="Copy">
-          <AuiIf condition={(s) => s.message.isCopied}>
-            <CheckIcon className="animate-in zoom-in-50 fade-in duration-200 ease-out" />
-          </AuiIf>
-          <AuiIf condition={(s) => !s.message.isCopied}>
-            <CopyIcon className="animate-in zoom-in-75 fade-in duration-150" />
-          </AuiIf>
+      {findingsText !== null ? (
+        <TooltipIconButton
+          tooltip="Copy"
+          onClick={() => copyToClipboard(findingsText)}
+        >
+          {isCopied ? <CheckIcon /> : <CopyIcon />}
         </TooltipIconButton>
-      </ActionBarPrimitive.Copy>
+      ) : (
+        <ActionBarPrimitive.Copy asChild>
+          <TooltipIconButton tooltip="Copy">
+            <AuiIf condition={(s) => s.message.isCopied}>
+              <CheckIcon className="animate-in zoom-in-50 fade-in duration-200 ease-out" />
+            </AuiIf>
+            <AuiIf condition={(s) => !s.message.isCopied}>
+              <CopyIcon className="animate-in zoom-in-75 fade-in duration-150" />
+            </AuiIf>
+          </TooltipIconButton>
+        </ActionBarPrimitive.Copy>
+      )}
       <AuiIf condition={(s) => s.thread.capabilities.feedback}>
         <ActionBarPrimitive.FeedbackPositive asChild>
           <TooltipIconButton
@@ -889,7 +900,7 @@ const AssistantActionBar: FC = () => {
       </AuiIf>
       {(!canReload || canReload(id)) && (
         <ActionBarPrimitive.Reload asChild>
-          <TooltipIconButton tooltip="Refresh">
+          <TooltipIconButton tooltip="Regenerate">
             <RefreshCwIcon />
           </TooltipIconButton>
         </ActionBarPrimitive.Reload>
@@ -909,12 +920,33 @@ const AssistantActionBar: FC = () => {
           sideOffset={6}
           className="aui-action-bar-more-content bg-popover text-popover-foreground data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 data-[state=open]:animate-in data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=closed]:animate-out data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 min-w-[8rem] overflow-hidden rounded-xl border p-1.5"
         >
-          <ActionBarPrimitive.ExportMarkdown asChild>
-            <ActionBarMorePrimitive.Item className="aui-action-bar-more-item hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none">
+          {findingsText !== null ? (
+            <ActionBarMorePrimitive.Item
+              className="aui-action-bar-more-item hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none"
+              onSelect={() => {
+                const url = URL.createObjectURL(
+                  new Blob([findingsText], { type: "text/markdown" }),
+                );
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = "neuron-findings.md";
+                document.body.append(link);
+                link.click();
+                link.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 40_000);
+              }}
+            >
               <DownloadIcon className="size-4" />
               Export as Markdown
             </ActionBarMorePrimitive.Item>
-          </ActionBarPrimitive.ExportMarkdown>
+          ) : (
+            <ActionBarPrimitive.ExportMarkdown asChild>
+              <ActionBarMorePrimitive.Item className="aui-action-bar-more-item hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none">
+                <DownloadIcon className="size-4" />
+                Export as Markdown
+              </ActionBarMorePrimitive.Item>
+            </ActionBarPrimitive.ExportMarkdown>
+          )}
         </ActionBarMorePrimitive.Content>
       </ActionBarMorePrimitive.Root>
     </ActionBarPrimitive.Root>

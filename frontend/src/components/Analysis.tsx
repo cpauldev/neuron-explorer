@@ -1,5 +1,6 @@
 import type { Lens, HeadInfo, SearchResults, SelectionKind } from "../types";
-import { Loader2Icon, SearchIcon } from "lucide-react";
+import { SearchIcon } from "lucide-react";
+import { GenerationLoadingState } from "./loading-state";
 import { useExplorer } from "../context";
 import { ROLE_COL, ROLE_LABEL } from "../explorer";
 import { Segmented, Slot, Tokens } from "./explorer-ui";
@@ -159,6 +160,7 @@ export function ResultRows({
     "statusText",
     "lensQuery",
     "analysisText",
+    "index",
   ]);
   const select = (
     layer: number,
@@ -189,23 +191,18 @@ export function ResultRows({
       </div>
     );
   if (results && !results.ready)
-    return (
-      <Slot>
-        <span className="flex items-center gap-2">
-          {results.loading ? (
-            <Loader2Icon
-              aria-hidden="true"
-              className="size-4 animate-spin motion-reduce:animate-none"
-            />
-          ) : null}
-          {results.loading
-            ? results.fires
-              ? "Analyzing text…"
-              : "Searching…"
-            : s.statusText || "Analysis is not ready yet."}
-        </span>
-      </Slot>
-    );
+    if (results.loading)
+      return (
+        <GenerationLoadingState
+          label={results.fires ? "Analyzing text…" : "Searching…"}
+        />
+      );
+    else
+      return (
+        <Slot>
+          {results.message || s.statusText || "Analysis is not ready yet."}
+        </Slot>
+      );
   if (results)
     return (
       <div className="results-region">
@@ -254,11 +251,7 @@ export function ResultRows({
             </li>
           ))}
         </ol>
-        {!results.results?.length ? (
-          <Slot>
-            No neurons match. Try another query or adjust the filters.
-          </Slot>
-        ) : null}
+        {!results.results?.length ? <Slot>No matching neurons.</Slot> : null}
       </div>
     );
   const query = s.filter.trim().toLowerCase();
@@ -306,7 +299,9 @@ export function ResultRows({
         <li className="head">
           {query
             ? "No saved features match this filter."
-            : `No saved examples for L${s.layer}. Search token associations across the model, or select a unit on the map to inspect it live.`}
+            : Object.keys(s.index.layers).length
+              ? `No saved examples for L${s.layer}. Search token associations or select a unit on the map.`
+              : "Search token associations or select a neuron on the map."}
         </li>
       )}
     </ol>
@@ -331,7 +326,7 @@ export function SearchPanel() {
         <div>
           <h3 className="text-sm font-medium">Find neurons</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            Search weight-based token associations across all layers.
+            Weight-based associations · all layers
           </p>
         </div>
         <form
@@ -370,7 +365,7 @@ export function SearchPanel() {
           >
             Clear search
           </Button>
-        ) : (
+        ) : Object.keys(s.index.layers).length ? (
           <>
             <div className="flex items-center justify-between gap-2">
               <label
@@ -415,7 +410,7 @@ export function SearchPanel() {
               </>
             ) : null}
           </>
-        )}
+        ) : null}
       </div>
       {s.lensQuery.trim().length === 1 ? (
         <Slot>Enter at least two characters to search.</Slot>
@@ -452,15 +447,15 @@ export function ActivationPanel() {
       >
         <div>
           <h3 className="text-sm font-medium">Analyze text</h3>
-          <p className="mt-1 text-xs text-muted-foreground">
-            Find which neurons respond to a passage, then select a token to
-            inspect its activity.
-          </p>
+          {s.inf.tokens.length > 0 && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              Select a token to inspect its activity.
+            </p>
+          )}
         </div>
         <Textarea
           id="inf-text"
           name="analysis-text"
-          rows={4}
           aria-label="Text to analyze"
           value={s.analysisText}
           onChange={(event) => a.set({ analysisText: event.target.value })}
@@ -477,8 +472,7 @@ export function ActivationPanel() {
         </Button>
         {s.inf.text && s.analysisText.trim() !== s.inf.text ? (
           <p className="text-xs text-muted-foreground">
-            Results below are for the previously analyzed passage. Run again to
-            apply your changes.
+            Text changed. Analyze again to update results.
           </p>
         ) : null}
       </form>
@@ -583,7 +577,7 @@ export function ActivationPanel() {
       {s.fireResults ? (
         <ResultRows id="activation-results" results={s.fireResults} />
       ) : (
-        <Slot>Paste a passage above to explore token-by-token activity.</Slot>
+        <Slot>Analyze a passage to see token activity.</Slot>
       )}
     </div>
   );

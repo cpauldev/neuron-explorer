@@ -1,6 +1,7 @@
 // Fold the server-owned journal into assistant-ui message parts. This function
 // has no UI side effects: replaying history must never execute explorer commands.
 import type { AssistantMessage, JournalEvent } from "../types";
+import { readFindings } from "./research";
 export function appendEvent(
   messages: AssistantMessage[],
   event: JournalEvent,
@@ -39,7 +40,9 @@ export function appendEvent(
       metadata: {
         custom: {
           approvals: [],
-          ...(event.at ? { startedAt: event.at * 1000 } : {}),
+          ...(last?.createdAt || event.at
+            ? { startedAt: last?.createdAt?.getTime() ?? event.at! * 1000 }
+            : {}),
         },
       },
     };
@@ -64,7 +67,18 @@ export function appendEvent(
   } else if (event.t === "text_phase") {
     if (event.phase === "commentary" || event.phase === "final_answer")
       meta.textPhases = { ...meta.textPhases, [event.id]: event.phase };
+    if (
+      event.phase === "final_answer" &&
+      event.at &&
+      meta.workEndedAt === undefined
+    )
+      meta.workEndedAt = event.at * 1000;
   } else if (event.t === "tool") {
+    // Providers without phase markers still expose public pre-tool text as updates.
+    meta.textPhases = { ...meta.textPhases };
+    for (const part of last.content)
+      if (part.type === "text" && part.id && !meta.textPhases[part.id])
+        meta.textPhases[part.id] = "commentary";
     last.content.push({
       type: "tool-call",
       toolCallId: event.id || id,
@@ -73,6 +87,18 @@ export function appendEvent(
       argsText: JSON.stringify(event.input || {}),
     });
   } else if (event.t === "tool_result") {
+    const call = last.content.find(
+      (part) => part.type === "tool-call" && part.toolCallId === event.id,
+    );
+    if (
+      call?.type === "tool-call" &&
+      call.toolName.split("__").at(-1) === "present_findings" &&
+      !event.error &&
+      readFindings(event.output) &&
+      event.at &&
+      meta.workEndedAt === undefined
+    )
+      meta.workEndedAt = event.at * 1000;
     last.content = last.content.map((part) =>
       part.type === "tool-call" && part.toolCallId === event.id
         ? {
@@ -92,9 +118,11 @@ export function appendEvent(
       approval.id === event.id ? { ...approval, state: event.state } : approval,
     );
   } else if (event.t === "stopped") {
+    if (event.at) meta.endedAt = event.at * 1000;
     last.status = { type: "incomplete", reason: "cancelled" };
     meta.stopped = true;
   } else if (event.t === "error") {
+    if (event.at) meta.endedAt = event.at * 1000;
     meta.error = event.error;
     last.status = { type: "incomplete", reason: "error", error: event.error };
   } else if (event.t === "done") {

@@ -9,6 +9,7 @@ import {
   ThreadListPrimitive,
 } from "@assistant-ui/react";
 import type { ThreadMessageLike } from "@assistant-ui/react";
+import { GenerationLoadingState } from "../components/loading-state";
 import type {
   ApprovalRequest,
   MessageMetadata,
@@ -20,11 +21,10 @@ import {
   useExplorer,
   useStore,
 } from "../context";
-import { AssistantSettings } from "./AssistantSettings";
 import { ComposerSelection, SentContext } from "./SelectionContext";
 import { latestFindings } from "./research";
 import { remarkUnitLinks } from "./unit-links";
-import { RunActivityBody } from "./RunActivityBody";
+import { ResearchMessageParts } from "./ResearchMessageParts";
 import { ConversationSearchPanel } from "./ConversationSearchPanel";
 import { toolkit } from "./toolkit";
 import { attachmentAdapter } from "./attachments";
@@ -40,13 +40,13 @@ import { ConnectionState } from "../components/connection-state";
 import { MessageQueue } from "../components/message-queue";
 import { browserDictation } from "./dictation";
 import { ConfirmDialog } from "../components/confirm-dialog";
-import { ComposerModelPicker } from "./ComposerModelPicker";
 import {
   HistoryIcon,
   PlusIcon,
   SparklesIcon,
   PanelLeftCloseIcon,
   SearchIcon,
+  ArrowLeftIcon,
 } from "lucide-react";
 import { refLabel } from "../lib/store";
 
@@ -95,9 +95,6 @@ const suggestions = [
       "Help me investigate a concept in this model. Ask which concept I want to explore, then explain how we can find and verify relevant neurons.",
   },
 ];
-function ResearchMessageBody({ children }: React.PropsWithChildren) {
-  return <RunActivityBody Text={ResearchMarkdown}>{children}</RunActivityBody>;
-}
 function ShellApproval({ request }: { request: ApprovalRequest }) {
   const [s, a] = useAssistant(["busy"]);
   const active = request.state === "request" && s.busy;
@@ -207,8 +204,7 @@ function Welcome() {
       <SparklesIcon className="text-muted-foreground mb-5 size-6" aria-hidden />
       <h2 className="text-2xl font-medium tracking-tight">Explore the model</h2>
       <p className="text-muted-foreground mt-2 text-sm leading-relaxed">
-        Ask about neurons, attention heads, or circuits. Select a unit to
-        investigate it together.
+        Ask about neurons, attention heads, or circuits.
       </p>
     </div>
   );
@@ -225,16 +221,15 @@ function Footer() {
   ]);
   const [e] = useExplorer(["focus"]);
   const lastUser = s.messages.findLast((m) => m.role === "user");
-  const report = latestFindings(s.messages);
-  const hasRelevantNextSteps =
-    report?.next_steps.length &&
-    report.references.some(
+  const hasRelevantReport = s.messages.some((message) =>
+    latestFindings([message])?.references.some(
       (unit) =>
         e.focus &&
         unit.layer === e.focus.layer &&
         unit.n === e.focus.n &&
         unit.kind === e.focus.kind,
-    );
+    ),
+  );
   return (
     <>
       {s.connection ? (
@@ -276,16 +271,16 @@ function Footer() {
         </Button>
       ) : null}
       {!s.busy &&
-      !hasRelevantNextSteps &&
+      !hasRelevantReport &&
       e.focus &&
       ["neuron", "head"].includes(e.focus.kind) ? (
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" size="sm" onClick={a.explain}>
-            Explain selection
+            Explain this {e.focus.kind === "head" ? "head" : "neuron"}
           </Button>
           {e.focus.kind === "neuron" ? (
             <Button variant="outline" size="sm" onClick={a.explainWeb}>
-              Explore its circuit
+              Investigate connections
             </Button>
           ) : null}
         </div>
@@ -296,7 +291,25 @@ function Footer() {
 function ComposerBridge() {
   const store = useContext(AssistantContext)!,
     aui = useAui();
-  const [s] = useAssistant(["draft"]);
+  const [s] = useAssistant(["draft", "model"]);
+  const dictating = useAuiState(
+    (state) => state.composer.dictation !== undefined,
+  );
+  useEffect(() => {
+    store.set({ dictating });
+    return () => {
+      store.set({ dictating: false });
+    };
+  }, [store, dictating]);
+  useEffect(
+    () =>
+      aui.modelContext.register({
+        getModelContext: () => ({
+          config: s.model ? { modelName: s.model } : {},
+        }),
+      }),
+    [aui, s.model],
+  );
   useEffect(() => {
     const composer = aui.composer;
     const initial = store.getSnapshot();
@@ -357,40 +370,46 @@ function AssistantContents({
   const aui = useAui();
   const dictating = useAuiState((s) => s.composer.dictation !== undefined);
   const locked = s.busy || dictating || s.pending.some((p) => !p.id);
-  const components = {
-    Welcome,
-    MessageExtra,
-    MessageBody: ResearchMessageBody,
-    Footer,
-    Text: ResearchMarkdown,
-    ComposerExtra: ComposerModelPicker,
-    ComposerContext: ComposerSelection,
-    UserMessageExtra: SentContext,
-    ComposerInputProps: {
-      onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) =>
-        a.draft(e.target.value),
-      onKeyDownCapture: (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-        if (
-          !s.busy ||
-          e.key !== "Enter" ||
-          e.shiftKey ||
-          e.nativeEvent.isComposing
-        )
-          return;
-        e.preventDefault();
-        e.stopPropagation();
-        if (a.send(aui.composer.getState().text)) {
-          aui.composer.setText("");
-          void aui.composer.clearAttachments();
-          if (!(e.ctrlKey || e.metaKey)) a.safe(a.interruptQueue());
-        }
+  const editableId = s.messages.findLast((m) => m.role === "user")?.id;
+  const latestAssistant = s.messages.findLast((m) => m.role === "assistant");
+  const regeneratableId =
+    latestAssistant?.metadata.custom.error ||
+    latestAssistant?.metadata.custom.stopped
+      ? undefined
+      : latestAssistant?.id;
+  const components = useMemo(
+    () => ({
+      Welcome,
+      MessageExtra,
+      MessageParts: ResearchMessageParts,
+      Footer,
+      Text: ResearchMarkdown,
+      ComposerContext: ComposerSelection,
+      UserMessageExtra: SentContext,
+      ComposerInputProps: {
+        onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) =>
+          a.draft(e.target.value),
+        onKeyDownCapture: (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+          if (
+            !s.busy ||
+            e.key !== "Enter" ||
+            e.shiftKey ||
+            e.nativeEvent.isComposing
+          )
+            return;
+          e.preventDefault();
+          e.stopPropagation();
+          if (a.send(aui.composer.getState().text)) {
+            aui.composer.setText("");
+            void aui.composer.clearAttachments();
+          }
+        },
       },
-    },
-    canEdit: (id: string) =>
-      id === s.messages.findLast((m) => m.role === "user")?.id,
-    canReload: (id: string) =>
-      id === s.messages.findLast((m) => m.role === "assistant")?.id,
-  };
+      canEdit: (id: string) => id === editableId,
+      canReload: (id: string) => id === regeneratableId,
+    }),
+    [a, aui, s.busy, editableId, regeneratableId],
+  );
   return (
     <div
       id="tab-agent"
@@ -415,17 +434,26 @@ function AssistantContents({
           closeSearch();
         }
       }}
-      className={`tab assistant-surface dark${active ? " on" : ""}`}
+      className={`tab assistant-surface${active ? " on" : ""}`}
     >
       <ComposerBridge />
       <div
         role="group"
-        aria-label="Assistant controls"
+        aria-label="Chat controls"
         className="assistant-toolbar workspace-panel-header"
       >
-        <h2 className="text-sm font-medium">Assistant</h2>
+        {s.historyOpen && (
+          <TooltipIconButton
+            tooltip="Back to chat"
+            onClick={() => a.safe(a.historyToggle())}
+          >
+            <ArrowLeftIcon />
+          </TooltipIconButton>
+        )}
+        <h2 className="text-sm font-medium">
+          {s.historyOpen ? "Past chats" : "Chat"}
+        </h2>
         <div className="ml-auto flex items-center gap-1">
-          <AssistantSettings locked={locked} />
           {!s.historyOpen && (
             <TooltipIconButton
               tooltip="Search conversation"
@@ -436,15 +464,17 @@ function AssistantContents({
               <SearchIcon />
             </TooltipIconButton>
           )}
-          <TooltipIconButton
-            tooltip="Past chats"
-            aria-label="Past chats"
-            aria-expanded={s.historyOpen}
-            disabled={locked}
-            onClick={() => a.safe(a.historyToggle())}
-          >
-            <HistoryIcon />
-          </TooltipIconButton>
+          {!s.historyOpen && (
+            <TooltipIconButton
+              tooltip="Past chats"
+              aria-label="Past chats"
+              aria-expanded={s.historyOpen}
+              disabled={locked}
+              onClick={() => a.safe(a.historyToggle())}
+            >
+              <HistoryIcon />
+            </TooltipIconButton>
+          )}
           {!s.historyOpen && (
             <ThreadListPrimitive.New asChild>
               <TooltipIconButton tooltip="New chat" disabled={locked}>
@@ -453,7 +483,7 @@ function AssistantContents({
             </ThreadListPrimitive.New>
           )}
           <TooltipIconButton
-            tooltip="Hide assistant"
+            tooltip="Hide chat"
             onClick={() => explorer.togglePanel("assistant", true)}
           >
             <PanelLeftCloseIcon />
@@ -477,16 +507,16 @@ function AssistantContents({
       {s.historyOpen ? (
         <section
           aria-label="Past chats"
-          className="min-h-0 flex-1 overflow-auto p-3"
+          className="flex min-h-0 flex-1 flex-col overflow-auto p-3"
         >
           {s.historyLoading ? (
-            <p role="status">Loading conversations…</p>
+            <GenerationLoadingState label="Loading chats…" />
           ) : (
             <>
               <ThreadList />
               {!s.history.length ? (
                 <p className="text-muted-foreground p-2 text-sm">
-                  No saved conversations yet.
+                  No saved chats yet.
                 </p>
               ) : null}
             </>

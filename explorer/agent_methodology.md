@@ -4,7 +4,7 @@ A working method for explaining a single MLP neuron, built from hands-on investi
 
 ## Mindset
 
-- **A neuron is a target, not a word list.** Every input makes a small judgement, and the strongest firing is where they all agree. Name the neuron from its strongest firings; weaker firings are usually the same idea seen from further away (Cammarata, *Neural Networks Are Already Clean*: neurons are analogizers, "Titanic-ish" rather than "Titanic facts").
+- **A neuron is not a word list.** Strong activations are useful starting points, but their interpretation needs matched controls and fresh examples. Do not assume weaker or contradictory activations share a hidden meaning.
 - **Think in situations and distinctions.** Good labels describe a moment in text and what the neuron does there: "a line style comes next", "eggs as a counted ingredient", "we're comparing something, but HOW?". Noun categories ("hazard words", "graspable objects") are usually too literal.
 - **Read the input and output as a pair.** "Already knows X → writes Y" is the most productive single move. `L20 N7531` is fed by `compare`, `either`, `comparison`, `corresponding` and writes `first/second`, `upper/lower`, `smaller/larger`: given that a comparison is happening, it supplies how to tell the items apart.
 - **The strange part is the pointer.** When one view disagrees with the others, that disagreement is where the next test goes.
@@ -12,22 +12,34 @@ A working method for explaining a single MLP neuron, built from hands-on investi
 
 ## Workflow
 
-1. **Read `neuron` and `web_summary`.** Note `fed_by` / `held_by` (input), steer lens with KL (direct effect), `toward` / `away` and the strongest `writes_into` (downstream). Form a guess from the input/output pair.
-2. **Steer on an open prompt** ("Tell me about your weekend.", "Write a short poem about the ocean.") at dose 0.6–0.8, then 1.5–2. Steering finds the axis faster than test sentences, especially for neurons that seldom fire. Read both rows: a meaningful negative pole writes something recognisable; a meaningless one just loops or breaks.
-3. **Find where it fires hard.** Use `compare` with matched sets: target texts, near misses that share the vocabulary but not the situation, and distant controls. Raise the target until something exceeds the neuron's `act_max`. If nothing does, sweep 25–50 varied snippets (news, code, recipes, chat, fiction, maths, Chinese) with `compare` (24 texts per call) and read off the peaks.
-4. **Check that the peak is real, then explain it from upstream.** At the peak token, zero candidate upstream neurons (`mode: mul, dose: 0`), whole MLP layers (`{layer, all: true, dose: 0}`) and attention per layer and per head, and measure the drop. Group the drivers by meaning.
-5. **Break the hypothesis on purpose.** Write the test that would falsify it and run it: same frame with the key word swapped (prices vs customs differ; `def scale` vs `def process`), same word without the situation ("What color is bleach?").
-6. **Run a blind maximum.** Write one sentence from the label alone. If it beats every example found so far, the label is near the center (`L20 N7531`: 2.44 from "The ratio of prices between the two regions differs by a factor of three", above its 0.93 dataset max).
-7. **Close with logprobs.** `logprobs` with the neuron zeroed or pushed shows exactly which next tokens it moves and by how much. This is the final word on what the neuron does to the output.
+For a broad “explain this neuron” request, do a bounded investigation, not just reconnaissance.
+The goal is the strongest useful conclusion the evidence supports, not a confident-sounding label or an exhaustive circuit reconstruction.
 
-## Finding a lever for a behaviour ("make Qwen want X")
+1. **Establish the evidence.** Read `overview`, `neuron` and `web_summary`; reuse results already present for this model. Identify which data are cached and whether live tests are available. Lens tokens and weight links generate hypotheses, not conclusions.
+2. **Compare alternatives.** Write two or three competing explanations, including a simple lexical/context explanation. Use a compact `compare` batch (typically 12–24 texts) with matched targets, near misses, and unrelated controls. Look at peak-token positions, signs, and raw activations rather than peak scores alone. A dataset maximum is a sample statistic, not a goal or proof of interpretation.
+3. **Resolve the main ambiguity now.** Pick the test whose possible outcomes would actually distinguish the leading alternatives. Run a second, focused contrast batch, with fresh wording and at least one held-out domain/frame. If two poles seem related, vary the proposed factors independently: include each combination and controls outside both patterns, rather than only collecting separate examples. Choose those factors from this neuron's actual results.
+4. **Check the output contribution.** Use `logprobs` with ablation (`mode: mul, dose: 0`) on at least two relevant contexts for a causal output claim, including a matched control. Report absolute baseline/intervened probabilities. Add a moderate-dose `steer` comparison if useful, preferably on two different prompts before generalizing behavior. Loops at large doses are disruption, not proof of a natural function. If ablation is negligible, report that natural contribution was small in those contexts; do not rescue the claim by increasing the dose.
+5. **Choose a conclusion and stop.** Review the decision rule below. Only if a specific remaining ambiguity could change the headline, run one final targeted round. Do not descend into upstream ablations unless the user asked for a circuit, or that one experiment is necessary to distinguish the leading explanations.
 
-1. **Separate the stance from the topic.** Neurons for a subject (beer: brewing, styles, history) differ from neurons for the stance toward it (craving, wanting, enjoying). Contrast matched texts: the target ("I'm dying for a cold beer right now"), the same topic without the stance ("Beer is brewed from malted barley"), and the same stance on another object ("I'm dying for a cold lemonade"). Keep neurons that fire on the first and not the other two. Run the contrast by script over 6–10 sentence triples, collecting `fires` at the key tokens.
-2. **Look at the right token.** Topic neurons peak on the noun; stance and mood neurons peak at summary positions (end of clause, `.`, `\n`, `</think>`) and on the token before the object ("dying for a **cold**…").
-3. **Steer every candidate on unrelated prompts** ("Tell me about your weekend.", "What should I do this afternoon?", "Describe a sunset.") at 0.6, 1.0 and 1.5. Success means the behaviour appears unprompted while the text stays coherent; a neuron that only repeats the word ("beer beer beer") is a word writer, not the lever.
-4. **When a clean detector steers badly, steer its drivers.** At its peak, ablate its inputs (`mul 0` on candidate neurons, whole layers, heads) or run `attn_drive`, then steer the strongest upstream neurons. The tone often sits downstream and the idea upstream (see the motif below).
-5. **Stack two or three levers at lower doses** and confirm with `logprobs` on a fork ("Right now I'd love a ___" → `beer`) that the push is the intended one.
-6. **Report a recipe** as neuron, sign and dose (`L10 N7757 +1.3`), with one short example output per prompt.
+### Decision and stopping rule
+
+- Normally use two contrast rounds and the causal check, with at most three hypothesis-testing rounds total. Batch related measurements. This is an effort guide, not a quota: reuse existing evidence, stop sooner for a narrow follow-up, and explain tool failures instead of repeatedly retrying them. Do not use a shell script to evade this bound.
+- **Supported, scoped explanation:** the target/control distinction recurs in at least two fresh phrasings or frames, survives the strongest tested alternative, and any causal claim has intervention support. State it directly within the tested scope. A replicated contribution to a particular continuation can be a complete conclusion without establishing a general computational function.
+- **Separate effects:** if both poles replicate but their proposed connection fails the crossed tests, conclude that the evidence supports two context-dependent patterns without an established common function. Do not keep searching for a metaphor that connects them.
+- **Effect known, trigger unresolved:** if steering is coherent but natural activation/ablation does not support a trigger, explain the measured output bias and explicitly limit the trigger claim.
+- **Unresolved:** if the key controls fail, evidence conflicts, or two successive focused rounds do not change the interpretation, stop. Name the alternatives you could not distinguish and the concrete failed test. “No stable interpretation emerged from these tests” is a useful result. Do not present a speculative label as established or leave the user with an endless research agenda.
+- Confidence follows the particular claim, not the amount of work. High confidence in a narrow observed effect can coexist with no conclusion about a general function. Do not upgrade confidence just because the budget was used.
+
+## Discovering and comparing behavioral effects
+
+Use this workflow for benign behavior discovery and safety-focused assessment. Assess observed harmful effects and their limits without optimizing harmful behavior or providing stronger harmful steering recipes.
+
+1. **Define the question before interpreting a winner.** Distinguish observable output behavior, natural activation, and a proposed mechanism. Separate requested traits rather than treating them as interchangeable. For benign comparisons, choose a small, explicit criterion that also checks coherence, task relevance and repetition. A vivid example is not a comparative score.
+2. **Retrieve leads, not ranked answers.** `search_lens` searches cached associations across available layers; it is substring matching, not semantic retrieval or a behavior leaderboard. Inspect actual tokens for unrelated matches inside longer words. Its `total` counts neuron/pole entries, not distinct neurons; record returned/truncated counts and how many distinct candidates received live tests. Use cached or activation evidence as leads without equating either with behavior. Missing sweeps or truncated retrieval limit coverage.
+3. **Keep comparisons comparable.** On benign tasks, evaluate shortlisted candidates with the same prompts, generation length and intervention convention, baseline and opposite direction. Separate lexical change, task behavior and degeneration. Check finalists on the same fresh prompts before claiming one outperforms another; extra testing of one candidate alone supports replication, not comparative superiority. If budget only permits a screen, report a promising candidate or no clear winner.
+4. **Match the measurement to the claim.** Generation supports an induced output effect; raw-text activation tests natural responses in that format. `compare` defaults to raw text while `steer` uses chat, so state material format differences. For a natural causal claim, inspect relevant positions and use matched controls. A first-reply-token `logprobs` check only tests the opening distribution; it cannot establish presence or absence of a later response-level effect. KL reported as zero is rounded, not proof of exact equality. Do not add unrelated opening-token ablations merely to tick a causal-check box.
+5. **Bound the work and the headline.** State retrieval scope, candidates tested and validation scope compactly. A model-wide association search is not a model-wide intervention evaluation. Never claim a universal strongest neuron: comparisons are conditional on the specified criterion and tested contexts. Apply the bounded stopping rule above; no automatic escalation to higher doses, upstream searches or combined interventions. Stop when failure, degeneration or diminishing information prevents a useful conclusion.
+6. **Report claim-specific support.** Say separately what was observed, whether it generalized to fresh contexts, whether natural function is understood, and whether a comparison was established. The single report confidence field applies to the headline within its explicit scope; explain materially weaker claims in ordinary prose. Prefer a scoped conclusion to a strong headline repaired by a disclaimer. Optional next steps must not hide a missing test essential to the claim.
 
 ## Reading each source
 
@@ -37,7 +49,7 @@ A working method for explaining a single MLP neuron, built from hands-on investi
 - **Logit lens.** Most useful in late layers. Specific repeated tokens (`method` × 12, `egg` × 12) are reliable; mixed fragments are noise.
 - **Web summary.** Pooled steer-lens words over the cone. A token on both `fed_by` and `held_by` (e.g. `XSS`, `（`, `.`) often reflects pooling; treat shared topical words differently, see "Fed and held by the same topic" below.
 - **Weight links (`writes_into`, `reads_from`, cone).** Leads to check, never circuits. Verify any claimed path with activations under ablation; `L22 N3467 → L31 N1348` was a real, causal link whose removal changed nothing in the output.
-- **Activation range.** Raw values. Scores many times `act_max` (18× for cosine, 39× for line styles) mark a detector at its center.
+- **Activation range.** Raw values from a finite reference sample. Exceeding a reference extreme can identify an interesting probe, but does not establish specificity or a detector; matched controls and replication do that.
 
 ## Motifs seen in this model
 
@@ -64,7 +76,7 @@ A working method for explaining a single MLP neuron, built from hands-on investi
 - Distinguish where the neuron activates from what changing it causes. Explain measurements in context rather than listing scores alone.
 - Treat labels as hypotheses. Do not force a one-job/two-job verdict, infer a detector from steering alone, or present opposite poles as proven semantic opposites.
 - Separate what was observed, what it suggests, and what remains unknown. Explain the reason for uncertainty; confidence must track the scope and number of tests.
-- Propose a specific next test using ordinary wording, such as "Test risky versus sensible advice." Avoid jargon such as "break the label."
+- Finish with the conclusion reached, not a routine request for more testing. Keep the one material limitation visible; put measurement detail in Evidence. Optional next steps should extend the answer, not contain an unperformed test needed to support its headline. Use an empty next-step list when appropriate.
 
 ## Reference neurons
 

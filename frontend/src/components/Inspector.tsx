@@ -26,6 +26,20 @@ import { Textarea } from "./ui/textarea";
 import { ChoiceSelect } from "./choice-select";
 import { Field, FieldLabel } from "./ui/field";
 import { ConfirmDialog } from "./confirm-dialog";
+import { GenerationLoadingState } from "./loading-state";
+
+function OverviewLoading({ label }: { label: string }) {
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setVisible(true), 300);
+    return () => clearTimeout(timer);
+  }, []);
+  return (
+    <div className="min-h-8 py-2 text-sm text-muted-foreground">
+      {visible ? <span role="status">{label}</span> : null}
+    </div>
+  );
+}
 
 function ConnectionTable({ list = [] }: { list?: Connection[] }) {
   const [, a] = useExplorer([]);
@@ -189,10 +203,10 @@ export function Details() {
   ]);
   if (s.loading)
     return (
-      <Slot>
-        Loading {s.focus?.kind === "head" ? "attention head" : "neuron details"}
-        …
-      </Slot>
+      <OverviewLoading
+        key={s.focus ? refLabel(s.focus) : "selection"}
+        label={`Loading ${s.focus?.kind === "head" ? "attention head" : "neuron details"}…`}
+      />
     );
   if (s.loadError)
     return <Slot error>Could not load this selection: {s.loadError}</Slot>;
@@ -293,14 +307,14 @@ export function Details() {
       <div id="d-lens">
         {s.lens ? (
           <LensSummary lens={s.lens} />
-        ) : (
-          <Slot error={Boolean(s.lensError)}>
-            {s.lensError ||
-              (s.focus?.kind === "neuron"
-                ? "Loading token associations…"
-                : "—")}
-          </Slot>
-        )}
+        ) : s.lensError ? (
+          <Slot error>{s.lensError}</Slot>
+        ) : s.focus?.kind === "neuron" ? (
+          <OverviewLoading
+            key={refLabel(s.focus)}
+            label="Loading token associations…"
+          />
+        ) : null}
       </div>
       <h3 className="mt-6 mb-3 text-sm font-medium">Connections</h3>
       <div id="d-con-wrap">
@@ -319,12 +333,14 @@ export function Details() {
               <ConnectionTable list={s.con.up} />
             </div>
           </div>
-        ) : (
-          <Slot error={Boolean(s.conError)}>
-            {s.conError ||
-              (s.focus?.kind === "neuron" ? "Loading connections…" : "—")}
-          </Slot>
-        )}
+        ) : s.conError ? (
+          <Slot error>{s.conError}</Slot>
+        ) : s.focus?.kind === "neuron" ? (
+          <OverviewLoading
+            key={refLabel(s.focus)}
+            label="Loading connections…"
+          />
+        ) : null}
         <HeadConnections />
       </div>
       <ConnectionSummary />
@@ -370,17 +386,12 @@ function ExampleCell({
 }
 export function Examples() {
   const [s] = useExplorer(["unit", "loading", "loadError"]);
-  if (s.loading) return <Slot>Loading examples…</Slot>;
+  if (s.loading) return <GenerationLoadingState label="Loading examples…" />;
   if (s.loadError)
     return <Slot error>Could not load examples: {s.loadError}</Slot>;
   const u = s.unit;
   if (!u?.rollouts?.length)
-    return (
-      <Slot>
-        No saved steering examples for this neuron. Use Experiment to compare
-        its effects live.
-      </Slot>
-    );
+    return <Slot>No saved examples. Try a live experiment.</Slot>;
   const count: Record<number, number> = {};
   for (const r of u.rollouts) count[r.dose] = (count[r.dose] || 0) + 1;
   const shared = Object.keys(count)
@@ -521,8 +532,8 @@ export function LocalChat() {
     <div className="space-y-4">
       <p className="text-xs leading-relaxed text-muted-foreground">
         {reads
-          ? "Measure how this neuron activates on each token in your text. No intervention is applied."
-          : "Compare the local model at the requested dose, baseline and the opposite dose."}
+          ? "Token activations without steering."
+          : "Compare baseline, positive, and negative steering."}
       </p>
       <form
         id="c-form"
@@ -589,7 +600,6 @@ export function LocalChat() {
           <Textarea
             id="c-input"
             name="neuron-prompt"
-            rows={3}
             placeholder={reads ? "Paste text to measure…" : "Who are you?"}
             required={!c.running}
             value={c.prompt}
@@ -634,13 +644,7 @@ export function LocalChat() {
           {c.error}
         </div>
       ) : null}
-      {!hasContent ? (
-        <p className="rounded-lg border border-dashed p-4 text-xs text-muted-foreground">
-          {reads
-            ? "Token activations will appear here."
-            : "Comparison results will appear here."}
-        </p>
-      ) : null}
+
       {!reads ? (
         <div
           id="c-thread"
@@ -685,8 +689,7 @@ export function SelectionPanel() {
       <div className="space-y-3 p-6">
         <h3 className="text-sm font-medium">No unit selected</h3>
         <p className="text-sm leading-relaxed text-muted-foreground">
-          Select a neuron or attention head on the map, choose a search result,
-          or enter its ID in Go to unit.
+          Select a neuron or head on the map or in search.
         </p>
         <Button
           variant="outline"
@@ -717,14 +720,6 @@ export function SelectionPanel() {
                   : "Neuron"}
             </p>
           </div>
-          <Button
-            variant="ghost"
-            size="sm"
-            aria-label="Clear selection"
-            onClick={a.closeFocus}
-          >
-            Clear
-          </Button>
         </div>
         {s.focus.kind === "neuron" ? (
           <Field>

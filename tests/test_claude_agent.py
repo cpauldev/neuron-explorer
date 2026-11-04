@@ -7,7 +7,7 @@ from unittest.mock import patch
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'explorer'))
-from claude_agent import ClaudeClient, legacy_session, sdk_record
+from claude_agent import ClaudeClient, legacy_session, sdk_record, claude_error, browser_events
 from claude_agent_sdk import StreamEvent, ResultMessage, AssistantMessage, TextBlock, ToolUseBlock, ToolResultBlock, UserMessage
 from agent_common import AgentError
 
@@ -38,6 +38,48 @@ class FakeSDK:
 
 
 class ClaudeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_system_prompt_uses_sdk_file_option_and_is_cleaned_up(self):
+        client = ClaudeClient('.', asyncio.Queue())
+        instructions = 'Methodology. ' * 6000
+        await client.open_thread('.', str(uuid.uuid4()), 8791, instructions)
+        prompt = Path(client.options.system_prompt['path'])
+        self.assertEqual(client.options.system_prompt['type'], 'file')
+        self.assertEqual(prompt.read_text(encoding='utf-8'), instructions)
+        await client.close()
+        self.assertFalse(prompt.exists())
+
+    def test_launch_error_does_not_claim_existing_executable_is_missing(self):
+        with patch('claude_agent.Path.is_file', return_value=True):
+            message = claude_error(RuntimeError('Claude Code not found at: C:/tools/claude.exe'))
+        self.assertIn('although its executable exists', message)
+        self.assertNotIn('needs authentication', message)
+        with patch('claude_agent.Path.is_file', return_value=False):
+            self.assertIn('executable was not found', claude_error(RuntimeError('Claude Code not found at: missing')))
+
+    def test_structured_authentication_error_has_sign_in_guidance(self):
+        message = AssistantMessage(content=[TextBlock('Provider refused the request')],
+                                   model='test', error='authentication_failed')
+        events = list(browser_events(sdk_record(message)))
+        self.assertEqual(events[0]['t'], 'error')
+        self.assertIn('claude auth login', events[0]['error'])
+        self.assertIn('API key or cloud', events[0]['error'])
+        self.assertIn('needs authentication', claude_error('Not logged in · Please run /login'))
+        self.assertIn('needs authentication', claude_error('Failed to authenticate: OAuth session expired and could not be refreshed'))
+        self.assertNotIn('needs authentication', claude_error('Network connection failed'))
+
+    async def test_startup_preserves_cause_and_reports_actionable_launch_error(self):
+        failure = FileNotFoundError('Claude Code not found at: missing')
+        class UnavailableSDK(FakeSDK):
+            async def connect(self): raise failure
+        client = ClaudeClient('.', asyncio.Queue())
+        with patch('claude_agent.ClaudeSDKClient', UnavailableSDK), patch('claude_agent.logger.exception') as log:
+            await client.open_thread('.', str(uuid.uuid4()), 8791, 'research')
+            with self.assertRaisesRegex(AgentError, 'executable was not found') as caught:
+                await client.call('turn/start', {'input': []})
+            self.assertIs(caught.exception.__cause__, failure)
+            log.assert_called_once()
+            self.assertFalse(client.alive)
+
     async def test_real_sdk_parses_stream_and_cleans_up_its_transport(self):
         import json
         from dataclasses import asdict

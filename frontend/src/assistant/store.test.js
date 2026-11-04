@@ -18,6 +18,86 @@ afterEach(() => {
 });
 
 describe("provider-owned drafts, attachments and durable assistant streams", () => {
+  it("reconnects a running turn without resending it or duplicating tool events", async () => {
+    assistant.actions.dispose();
+    await explorer.actions.select(7, 1870);
+    localStorage.setItem("explorer.agent.provider", JSON.stringify("claude"));
+    localStorage.setItem(
+      "explorer.agent.claude",
+      JSON.stringify({ chat: "running-reload", draft: "Keep this draft" }),
+    );
+    const scene = vi.spyOn(explorer.actions, "setChatActivity");
+    assistant = createAssistant(explorer);
+    let stream;
+    const events = [
+      { t: "user", seq: 1, at: 100, text: "Research" },
+      {
+        t: "tool",
+        seq: 2,
+        at: 101,
+        id: "active",
+        name: "steer",
+        input: { layer: 16, n: 2311 },
+      },
+    ];
+    const fetcher = mockApi({
+      "/api/agent/history": () =>
+        json({ events, cursor: 2, running: true, approvals: [] }),
+      "/api/agent/events": () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              stream = controller;
+            },
+          }),
+        ),
+    });
+    assistant.actions.start();
+    await vi.waitFor(() =>
+      expect(scene).toHaveBeenCalledWith({
+        action: "Testing",
+        targets: [{ kind: "neuron", layer: 16, n: 2311 }],
+      }),
+    );
+    expect(assistant.getSnapshot().messages[1].metadata.custom.startedAt).toBe(
+      100000,
+    );
+    expect(assistant.getSnapshot().draft).toBe("Keep this draft");
+    const terminal = [
+      events[1],
+      { t: "tool_result", seq: 3, id: "active", output: "Result", at: 104 },
+      { t: "text_phase", seq: 4, id: "answer", phase: "final_answer", at: 105 },
+      { t: "text", seq: 5, id: "answer", text: "Conclusion", at: 106 },
+      { t: "done", seq: 6, status: "completed", at: 108 },
+    ];
+    stream.enqueue(
+      new TextEncoder().encode(
+        terminal.map((event) => JSON.stringify(event)).join("\n") + "\n",
+      ),
+    );
+    stream.close();
+    await vi.waitFor(() => expect(assistant.getSnapshot().busy).toBe(false));
+    const answer = assistant.getSnapshot().messages[1];
+    expect(
+      answer.content.filter((part) => part.type === "tool-call"),
+    ).toHaveLength(1);
+    expect(answer.status.type).toBe("complete");
+    expect(answer.metadata.custom.workEndedAt).toBe(105000);
+    expect(scene).toHaveBeenLastCalledWith(null);
+    expect(explorer.getSnapshot().focus).toEqual({
+      layer: 7,
+      n: 1870,
+      kind: "neuron",
+    });
+    expect(fetcher.mock.calls.some(([url]) => url === "/api/agent/send")).toBe(
+      false,
+    );
+    expect(
+      fetcher.mock.calls.some(
+        ([url]) => url === "/api/agent/events?chat=running-reload&after=2",
+      ),
+    ).toBe(true);
+  });
   it("does not overwrite a newer chat pointer when an untouched tab closes", () => {
     assistant.actions.start();
     localStorage.setItem(

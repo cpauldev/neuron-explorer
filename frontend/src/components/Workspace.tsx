@@ -74,7 +74,7 @@ export function Workspace({
         {assistant}
       </ResizablePanel>
       <ResizableHandle
-        aria-label="Resize assistant"
+        aria-label="Resize chat"
         withHandle
         disabled={!layout.assistant || layout.narrow}
         className={!layout.assistant || layout.narrow ? "hidden" : undefined}

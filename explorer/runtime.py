@@ -51,9 +51,10 @@ def _locked(f):
 
 
 class Runtime:
-    def __init__(self, stats_dir, *, model=MODEL, revision=REVISION, cache_dir=CACHE):
+    def __init__(self, stats_dir, *, model=MODEL, revision=REVISION, cache_dir=CACHE, checkpoint=None):
         self.stats_dir = stats_dir
         self.model_id, self.revision, self.cache = model, revision, str(cache_dir)
+        self.checkpoint = checkpoint
         os.makedirs(self.cache, exist_ok=True)
         self._db = sqlite3.connect(os.path.join(self.cache, "connections.sqlite"), check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS con (key TEXT PRIMARY KEY, val TEXT)")
@@ -98,12 +99,14 @@ class Runtime:
             try:
                 self.status = "loading"
                 dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-                config = AutoConfig.from_pretrained(self.model_id, revision=self.revision)
+                source = self.checkpoint or self.model_id
+                local = {'local_files_only': True} if self.checkpoint else {}
+                config = AutoConfig.from_pretrained(source, revision=self.revision, **local)
                 validate_config(config.to_dict())
-                self.tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
+                self.tok = AutoTokenizer.from_pretrained(source, revision=self.revision, **local)
                 text_only = config.model_type == "qwen3_5_text"
                 model_class = Qwen3_5ForCausalLM if text_only else Qwen3_5ForConditionalGeneration
-                m = model_class.from_pretrained(self.model_id, revision=self.revision, config=config,
+                m = model_class.from_pretrained(source, revision=self.revision, config=config, **local,
                                                 dtype=torch.bfloat16).to(dev).eval()
                 self.dev, self.model = dev, m
                 self.lm = m.model if text_only else m.model.language_model
@@ -124,12 +127,37 @@ class Runtime:
                     layer.post_attention_layernorm.register_forward_hook(self._mlp_in_hook(i))
                 self.status = "ready"
             except Exception:
+                m = None  # Do not retain partial weights through an exception traceback during rollback.
                 self.model = self.lm = None
                 self.status = "load failed"
                 if getattr(self, "_device_lease", None) is not None:
                     self._device_lease.__exit__(None, None, None)
                     self._device_lease = None
                 raise
+
+    def unload(self):
+        """Release captures, hooks and device memory before another checkpoint loads."""
+        import gc
+        with self.lock:
+            self.model = self.lm = self.tok = self.heads = None
+            self._capture_all = self._capture_full = self._capture_heads = None
+            self._hb = self._qkb = None
+            self._seen.clear()
+            self._con_cache.clear()
+            self._lens_cache.clear()
+            self.status = 'idle'
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            if getattr(self, '_device_lease', None) is not None:
+                self._device_lease.__exit__(None, None, None)
+                self._device_lease = None
+
+    def close(self):
+        self.unload()
+        self._db.close()
 
     def _hook(self, i):
         def hook(mod, inp):
@@ -932,7 +960,8 @@ class Runtime:
                 self._vocab = json.load(open(path))
             else:
                 if self.tok is None:
-                    self.tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
+                    self.tok = AutoTokenizer.from_pretrained(self.checkpoint or self.model_id, revision=self.revision,
+                                                             local_files_only=bool(self.checkpoint))
                 self._vocab = [self.tok.decode([i]) for i in range(len(self.tok))]
                 from cache_storage import atomic_json
                 atomic_json(path, self._vocab)
@@ -951,7 +980,8 @@ class Runtime:
                 broken = [i for i, text in enumerate(raw) if "\ufffd" in text]
                 if broken:
                     if self.tok is None:
-                        self.tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision)
+                        self.tok = AutoTokenizer.from_pretrained(self.checkpoint or self.model_id, revision=self.revision,
+                                                                 local_files_only=bool(self.checkpoint))
                     decoder = getattr(getattr(self.tok, "backend_tokenizer", None), "decoder", None)
                     byte_level = bool(decoder and json.loads(decoder.__getstate__()).get("type") == "ByteLevel")
                     for i in broken:

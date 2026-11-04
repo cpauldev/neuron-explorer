@@ -7,6 +7,7 @@ import { ChoiceSelect } from "./choice-select";
 import { Field, FieldLabel } from "./ui/field";
 import { Button } from "./ui/button";
 import { Progress } from "./ui/progress";
+import { useCoverageColors } from "../lib/coverage-colors";
 import {
   Collapsible,
   CollapsibleTrigger,
@@ -86,6 +87,7 @@ function stageProgress(item: Snapshot["stages"][number], snapshot: Snapshot) {
 }
 
 export function BuildPanel() {
+  const coverage = useCoverageColors();
   const [s, a] = useExplorer(["index", "arch", "layout", "mapReady", "webOn"]);
   const [jobs, setJobs] = useState<{ id: string; model: string }[]>([]);
   const [jobsLoading, setJobsLoading] = useState(true);
@@ -270,8 +272,8 @@ export function BuildPanel() {
           {s.index.model?.split("/").at(-1) || "Local model"}
         </h3>
         <p className="text-xs text-muted-foreground">
-          Loaded model · {s.arch.n_layers} layers ·{" "}
-          {s.arch.inter.toLocaleString()} neurons per layer
+          {s.arch.n_layers} layers · {s.arch.inter.toLocaleString()} neurons per
+          layer
         </p>
         <p className="text-xs text-muted-foreground">
           Saved steering examples: {Object.keys(s.index.layers).length} of{" "}
@@ -336,8 +338,8 @@ export function BuildPanel() {
         ) : null}
         {snapshot && !compatible ? (
           <Slot>
-            This build belongs to a different model or revision. Coverage cannot
-            be displayed on the loaded model.
+            This build is for another model or revision. Map coverage is
+            unavailable.
           </Slot>
         ) : null}
       </div>
@@ -431,8 +433,22 @@ export function BuildPanel() {
         <div className="wsum dim">
           {compatible ? (
             <p className="build-legend">
-              <span>■ saved</span>
-              <span>■ in progress</span>
+              <span className="inline-flex items-center gap-1.5">
+                <span
+                  aria-hidden="true"
+                  className="size-2.5 rounded-sm"
+                  style={{ backgroundColor: coverage.saved }}
+                />
+                Saved
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span
+                  aria-hidden="true"
+                  className="size-2.5 rounded-sm"
+                  style={{ backgroundColor: coverage.working }}
+                />
+                In progress
+              </span>
             </p>
           ) : null}
           <Collapsible>
@@ -441,7 +457,7 @@ export function BuildPanel() {
             </CollapsibleTrigger>
             <CollapsibleContent>
               <p>
-                Colours show saved analysis coverage, not neuron strength.
+                Colors show saved analysis coverage, not neuron strength.
                 Pending layouts use index order. Connection lines sample N0 in
                 each layer.
               </p>

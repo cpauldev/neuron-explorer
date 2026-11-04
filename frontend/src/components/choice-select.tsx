@@ -15,6 +15,7 @@ export function ChoiceSelect<T extends string | number>({
   options,
   disabled,
   name,
+  onOpenChange,
   ...trigger
 }: Omit<
   ComponentProps<typeof SelectTrigger>,
@@ -22,8 +23,9 @@ export function ChoiceSelect<T extends string | number>({
 > & {
   value: T;
   onValueChange: (value: T) => void;
-  options: readonly { value: T; label: string }[];
+  options: readonly { value: T; label: string; title?: string }[];
   name?: string;
+  onOpenChange?: (open: boolean) => void;
 }) {
   return (
     <Select
@@ -31,6 +33,7 @@ export function ChoiceSelect<T extends string | number>({
       items={options}
       name={name}
       disabled={disabled}
+      onOpenChange={onOpenChange}
       onValueChange={(next) => {
         if (next !== null) onValueChange(next as T);
       }}
@@ -45,7 +48,11 @@ export function ChoiceSelect<T extends string | number>({
       >
         <SelectGroup>
           {options.map((option) => (
-            <SelectItem key={option.value} value={option.value}>
+            <SelectItem
+              key={option.value}
+              value={option.value}
+              title={option.title}
+            >
               {option.label}
             </SelectItem>
           ))}

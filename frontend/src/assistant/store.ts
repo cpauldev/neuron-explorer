@@ -10,9 +10,16 @@ import type {
   Provider,
   SelectionContext,
 } from "../types";
-import { api, createStore, readStorage, writeStorage } from "../lib/store";
+import {
+  api,
+  modelFetch,
+  createStore,
+  readStorage,
+  writeStorage,
+} from "../lib/store";
 import { followAssistant } from "../../../explorer/static/assistant_stream.js";
 import { appendEvent, replayEvents } from "./journal";
+import { createSceneActivity } from "./scene-activity";
 
 export function createAssistant(explorer: ExplorerStore) {
   const savedProvider =
@@ -69,6 +76,10 @@ export function createAssistant(explorer: ExplorerStore) {
   });
   const get = store.getSnapshot,
     set = store.set;
+  const sceneActivity = createSceneActivity(
+    explorer.getSnapshot().arch,
+    explorer.actions.setChatActivity,
+  );
   let ctl: AbortController | null = null,
     finished = Promise.resolve(),
     starting: Promise<{ chat: string; cursor: number }> | null = null,
@@ -119,6 +130,7 @@ export function createAssistant(explorer: ExplorerStore) {
       });
   }
   function load() {
+    sceneActivity.clear();
     let old = readStorage<SavedDraft>(key());
     if (
       !old &&
@@ -144,6 +156,7 @@ export function createAssistant(explorer: ExplorerStore) {
   function apply(event: JournalEvent, controller?: AbortController) {
     if (controller && ctl !== controller) return;
     if (event.seq != null && event.seq <= get().cursor) return;
+    sceneActivity.apply(event);
     set((s) => ({
       messages: appendEvent(s.messages, event, s.chat || "new"),
       cursor: event.seq ?? s.cursor,
@@ -157,6 +170,7 @@ export function createAssistant(explorer: ExplorerStore) {
   }
   function fail(error: Error, controller: AbortController) {
     if (ctl !== controller || disposed || error.name === "AbortError") return;
+    sceneActivity.clear();
     set({
       error: error.message,
       messages: appendEvent(
@@ -178,7 +192,7 @@ export function createAssistant(explorer: ExplorerStore) {
       controller.signal,
       async (...args: Parameters<typeof fetch>) => {
         try {
-          return await fetch(...args);
+          return await modelFetch(...args);
         } catch (caught) {
           const error =
             caught instanceof Error ? caught : new Error(String(caught));
@@ -265,13 +279,17 @@ export function createAssistant(explorer: ExplorerStore) {
         connection: "",
         error: history.history_error || "",
       });
-      if (history.running) await follow(chat, history.cursor, controller);
+      if (history.running) {
+        sceneActivity.restore(history.events);
+        await follow(chat, history.cursor, controller);
+      }
     } catch (caught) {
       const error =
         caught instanceof Error ? caught : new Error(String(caught));
       fail(error, controller);
     } finally {
       if (ctl === controller) {
+        sceneActivity.clear();
         ctl = null;
         set((s) => ({
           busy: false,
@@ -294,6 +312,7 @@ export function createAssistant(explorer: ExplorerStore) {
     context?: SelectionContext,
   ) {
     if (ctl || disposed) return;
+    sceneActivity.clear();
     const controller = (ctl = new AbortController()),
       f = context;
     let finish!: () => void;
@@ -368,6 +387,7 @@ export function createAssistant(explorer: ExplorerStore) {
       fail(error, controller);
     } finally {
       if (ctl === controller) {
+        sceneActivity.clear();
         ctl = null;
         resumeAfter = null;
         set((s) => ({ busy: false, messages: settle(s.messages) }));
@@ -393,6 +413,7 @@ export function createAssistant(explorer: ExplorerStore) {
     if (ctl !== controller) return;
     try {
       if (get().chat) await api("/api/agent/interrupt", { chat: get().chat });
+      sceneActivity.clear();
       controller.abort();
       if (ctl === controller)
         set((s) => ({
@@ -579,7 +600,8 @@ export function createAssistant(explorer: ExplorerStore) {
     }
   }
   async function openHistory(chat: string, provider: Provider) {
-    if (get().busy || get().pending.some((a) => !a.id)) return;
+    if (get().busy || get().dictating || get().pending.some((a) => !a.id))
+      return;
     save();
     set({ provider });
     load();
@@ -637,7 +659,8 @@ export function createAssistant(explorer: ExplorerStore) {
       set((s) => ({ queue: s.queue.filter((q) => q.id !== id) }));
     },
     async switchProvider(provider: Provider) {
-      if (get().busy || get().pending.some((a) => !a.id)) return;
+      if (get().busy || get().dictating || get().pending.some((a) => !a.id))
+        return;
       save();
       set({ provider });
       const old = load();
@@ -645,7 +668,11 @@ export function createAssistant(explorer: ExplorerStore) {
       await resume(old);
     },
     model(model: string | null) {
-      if (!get().busy) {
+      if (
+        !get().busy &&
+        !get().dictating &&
+        !get().pending.some((p) => !p.id)
+      ) {
         set({ model });
         save();
       }
@@ -655,7 +682,11 @@ export function createAssistant(explorer: ExplorerStore) {
       writeStorage("explorer.agent.includeSelection", includeSelection);
     },
     access(access: AssistantState["access"]) {
-      if (!get().busy) {
+      if (
+        !get().busy &&
+        !get().dictating &&
+        !get().pending.some((p) => !p.id)
+      ) {
         set({ access });
         save();
       }
@@ -689,18 +720,14 @@ export function createAssistant(explorer: ExplorerStore) {
       send(
         f.kind === "head"
           ? `Explain attention head ${id}: report its q/k/v/o roles and verify its attention on contrasting texts.`
-          : `Explain ${id}: write the autointerp report.`,
-        `explain ${id}`,
-        [],
+          : `Explain neuron ${id}: investigate what it responds to and how changing it affects the model's output.`,
       );
     },
     explainWeb() {
       const f = explorer.getSnapshot().focus;
       if (f?.kind !== "neuron" || get().busy) return;
       send(
-        `Look at the cone of L${f.layer} N${f.n} (what it reads from and writes into, a few hops out) and tell me briefly what that circuit seems to do. Highlight the neurons you mention.`,
-        `what does the web of L${f.layer} N${f.n} do?`,
-        [],
+        `Investigate the connections of L${f.layer} N${f.n}: examine the neurons it reads from and writes to, explain their possible roles, and distinguish weight-based connections from tested causal effects. Highlight the neurons you mention.`,
       );
     },
     useName() {
@@ -722,6 +749,7 @@ export function createAssistant(explorer: ExplorerStore) {
       if (!ctl) safe(resume(resumeAfter));
     },
     dispose() {
+      sceneActivity.clear();
       disposed = true;
       clearTimeout(flushTimer);
       ctl?.abort();

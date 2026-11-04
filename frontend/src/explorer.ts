@@ -13,10 +13,15 @@ import type {
   NeuronName,
   UiEvent,
   Pick,
+  Connection,
+  SelectionContext,
 } from "./types";
+import type { SceneActivity } from "./assistant/scene-activity";
+import { mountSceneLabelIcon } from "./lib/scene-label-icon";
 import {
   createStore,
   api,
+  modelFetch,
   readStorage,
   writeStorage,
   readSSE,
@@ -30,10 +35,10 @@ import {
 import { visiblePanels, COMPACT_WORKSPACE } from "./lib/workspace-layout";
 
 export const ROLE_COL = {
-  q: "#73ff8c",
-  k: "#b399ff",
-  v: "#66d9ff",
-  o: "#66d9ff",
+  q: "var(--role-q)",
+  k: "var(--role-k)",
+  v: "var(--role-v)",
+  o: "var(--role-v)",
 };
 export const ROLE_LABEL = { q: "query", k: "key", v: "value", o: "output" };
 export const headRoleLinks = (h: HeadInfo) =>
@@ -97,6 +102,9 @@ export function createExplorer(index: ModelIndex) {
     assistantOpen?: boolean;
     toolsOpen?: boolean;
     activePanel?: ExplorerState["activePanel"];
+    workbenchTab?: ExplorerState["workbenchTab"];
+    selectionTab?: ExplorerState["selectionTab"];
+    analysisMode?: ExplorerState["analysisMode"];
   }>("explorer.panels");
   const store = createStore<ExplorerState>({
     index,
@@ -114,7 +122,13 @@ export function createExplorer(index: ModelIndex) {
     webSum: null,
     analysisMode: new URLSearchParams(location.search).has("build")
       ? "build"
-      : "net",
+      : panels?.workbenchTab === "cache"
+        ? "build"
+        : panels?.workbenchTab === "analyze" ||
+            (panels?.workbenchTab === "inspect" &&
+              panels.analysisMode === "run")
+          ? "run"
+          : "net",
     mapReady: false,
     assistantOpen:
       typeof panels?.assistantOpen === "boolean" ? panels.assistantOpen : true,
@@ -122,7 +136,7 @@ export function createExplorer(index: ModelIndex) {
       ? true
       : typeof panels?.toolsOpen === "boolean"
         ? panels.toolsOpen
-        : true,
+        : false,
     activePanel: new URLSearchParams(location.search).has("build")
       ? "tools"
       : panels &&
@@ -130,15 +144,21 @@ export function createExplorer(index: ModelIndex) {
             panels.activePanel === "assistant" ||
             panels.activePanel === "tools")
         ? panels.activePanel
-        : typeof matchMedia === "function" &&
-            matchMedia("(min-width: 768px)").matches
-          ? "assistant"
-          : null,
+        : "assistant",
     workbenchTab: new URLSearchParams(location.search).has("build")
       ? "cache"
-      : "search",
+      : panels?.workbenchTab &&
+          ["search", "analyze", "inspect", "cache"].includes(
+            panels.workbenchTab,
+          )
+        ? panels.workbenchTab
+        : "search",
     tab: "agent",
-    selectionTab: "details",
+    selectionTab:
+      panels?.selectionTab &&
+      ["details", "chat", "examples"].includes(panels.selectionTab)
+        ? panels.selectionTab
+        : "details",
     fresh: {},
     lensQuery: "",
     analysisText: "",
@@ -181,14 +201,27 @@ export function createExplorer(index: ModelIndex) {
   const get = store.getSnapshot,
     set = store.set,
     browserId = crypto.randomUUID();
-  let panelState = JSON.stringify({
-    assistantOpen: get().assistantOpen,
-    toolsOpen: get().toolsOpen,
-    activePanel: get().activePanel,
-  });
+  const panelPreferences = () => {
+    const {
+      assistantOpen,
+      toolsOpen,
+      activePanel,
+      workbenchTab,
+      selectionTab,
+      analysisMode,
+    } = get();
+    return {
+      assistantOpen,
+      toolsOpen,
+      activePanel,
+      workbenchTab,
+      selectionTab,
+      analysisMode,
+    };
+  };
+  let panelState = JSON.stringify(panelPreferences());
   const unsubscribePanels = store.subscribe(() => {
-    const { assistantOpen, toolsOpen, activePanel } = get();
-    const next = { assistantOpen, toolsOpen, activePanel };
+    const next = panelPreferences();
     const serialized = JSON.stringify(next);
     if (serialized !== panelState) {
       panelState = serialized;
@@ -230,6 +263,121 @@ export function createExplorer(index: ModelIndex) {
   let bridge: EventSource | undefined,
     observer: ResizeObserver | undefined,
     attachmentEpoch = 0;
+  let sceneActivity: SceneActivity | null = null;
+  let sceneActivityKey = "";
+  let sceneActivityEpoch = 0;
+  let sceneRequests = new AbortController();
+  const connectionCache = new Map<
+    string,
+    Promise<{ up: Connection[]; down: Connection[] }>
+  >();
+  const webCache = new Map<
+    string,
+    Promise<{ edges: Int16Array; total: string | null }>
+  >();
+  const sceneNetworkCache = new Map<
+    string,
+    Promise<{ target: SelectionContext; links: Connection[]; web?: Int16Array }>
+  >();
+  function cachedRequest<T>(
+    cache: Map<string, Promise<T>>,
+    key: string,
+    load: () => Promise<T>,
+  ) {
+    const existing = cache.get(key);
+    if (existing) return existing;
+    const promise = load().catch((error) => {
+      if (cache.get(key) === promise) cache.delete(key);
+      throw error;
+    });
+    cache.set(key, promise);
+    if (cache.size > 24) cache.delete(cache.keys().next().value!);
+    return promise;
+  }
+  const sceneConnections = (layer: number, n: number) =>
+    cachedRequest(connectionCache, `${layer}/${n}`, () =>
+      api<{ up: Connection[]; down: Connection[] }>(
+        `/api/connections?layer=${layer}&n=${n}&k=24`,
+        undefined,
+        { signal: sceneRequests.signal },
+      ),
+    );
+  function webArguments(layer: number, n: number) {
+    const params = new URLSearchParams(location.search);
+    const first = Math.max(
+      1,
+      Math.min(24, Math.round(Number(get().webZ) || 5)),
+    );
+    return `layer=${layer}&n=${n}&first=${first}&k=${Number(params.get("webk")) || 2}&hops=${Number(params.get("webhops")) || 0}`;
+  }
+  const sceneWeb = (args: string) =>
+    cachedRequest(webCache, args, async () => {
+      const response = await modelFetch(`/api/web?${args}`, {
+        signal: sceneRequests.signal,
+      });
+      if (!response.ok) throw new Error("Could not load connections");
+      return {
+        edges: new Int16Array(await response.arrayBuffer()),
+        total: response.headers.get("X-Web-Total"),
+      };
+    });
+  async function sceneNetwork(target: SelectionContext, web: boolean) {
+    const args = webArguments(target.layer, target.n);
+    const key = `${target.kind}/${target.layer}/${target.n}/${web ? args : "direct"}`;
+    return cachedRequest(sceneNetworkCache, key, async () => {
+      if (target.kind === "head") {
+        const info = await api<HeadInfo>(
+          `/api/head?layer=${target.layer}&head=${target.n}`,
+          undefined,
+          { signal: sceneRequests.signal },
+        );
+        return { target, links: headRoleLinks(info) };
+      }
+      const [con, edges] = await Promise.all([
+        sceneConnections(target.layer, target.n),
+        web
+          ? sceneWeb(args)
+              .then((data) => data.edges)
+              .catch(() => undefined)
+          : undefined,
+      ]);
+      return { target, links: [...con.up, ...con.down], web: edges };
+    });
+  }
+  function setChatActivity(activity: SceneActivity | null) {
+    sceneActivity = activity;
+    const key = activity
+      ? activity.targets
+          .map((target) => `${target.kind}/${target.layer}/${target.n}`)
+          .join("|") + `/${get().webOn}/${get().webZ}`
+      : "";
+    if (key === sceneActivityKey && activity) {
+      map?.setChatFocus({ ...activity, networks: currentSceneNetworks });
+      return;
+    }
+    sceneActivityKey = key;
+    const epoch = ++sceneActivityEpoch;
+    currentSceneNetworks = [];
+    map?.setChatFocus(activity ? { ...activity, networks: [] } : null);
+    if (!activity || disposed) return;
+    // Large comparisons show their actual subjects without drawing hundreds of overlapping networks.
+    if (activity.targets.length > 6) return;
+    void Promise.all(
+      activity.targets.map((target) =>
+        sceneNetwork(
+          target,
+          activity.targets.length === 1 && get().webOn,
+        ).catch(() => null),
+      ),
+    ).then((networks) => {
+      if (disposed || epoch !== sceneActivityEpoch || !sceneActivity) return;
+      currentSceneNetworks = networks.filter(
+        (value): value is NonNullable<typeof value> => !!value,
+      );
+      map?.setChatFocus({ ...sceneActivity, networks: currentSceneNetworks });
+    });
+  }
+  let currentSceneNetworks: Awaited<ReturnType<typeof sceneNetwork>>[] = [];
   const safe = (promise: unknown) =>
     Promise.resolve(promise).catch(
       (error) => !disposed && set({ status: error.message }),
@@ -377,24 +525,20 @@ export function createExplorer(index: ModelIndex) {
   }
   async function refreshWeb() {
     const s = get(),
-      f = s.focus,
-      first = Math.max(1, Math.min(24, Math.round(Number(s.webZ) || 5)));
-    const params = new URLSearchParams(location.search),
-      k = Number(params.get("webk")) || 2,
-      hops = Number(params.get("webhops")) || 0;
+      f = s.focus;
+    if (sceneActivity) setChatActivity(sceneActivity);
     if (!s.webOn || f?.kind !== "neuron") {
       webKey = null;
       set({ webSum: null });
       map?.setWeb(null);
       return;
     }
-    const key = `${f.layer}/${f.n}/${first}/${k}/${hops}`;
+    const args = webArguments(f.layer, f.n);
+    const key = args;
     if (key === webKey) return;
     webKey = key;
-    const args = `layer=${f.layer}&n=${f.n}&first=${first}&k=${k}&hops=${hops}`;
-    const response = await fetch(`/api/web?${args}`);
-    if (!response.ok || key !== webKey || disposed) return;
-    const links = new Int16Array(await response.arrayBuffer());
+    const response = await sceneWeb(args);
+    const links = response.edges;
     if (key !== webKey || disposed) return;
     map?.setWeb(links);
     const summary = await api(`/api/web/summary?${args}&top=24`);
@@ -404,7 +548,7 @@ export function createExplorer(index: ModelIndex) {
           ...summary,
           layer: f.layer,
           n: f.n,
-          links: response.headers.get("X-Web-Total"),
+          links: response.total,
         },
       });
   }
@@ -419,7 +563,7 @@ export function createExplorer(index: ModelIndex) {
           if (current(e, f)) set({ lensError: error.message });
         },
       ),
-      api(`/api/connections?${args}&k=24`).then(
+      sceneConnections(f.layer, f.n).then(
         (con) => {
           if (current(e, f)) {
             set({ con });
@@ -600,6 +744,7 @@ export function createExplorer(index: ModelIndex) {
   }
   async function saveName(p: NeuronName) {
     await api("/api/name", p);
+    connectionCache.clear();
     if (disposed) return;
     set((s) => ({
       units: {
@@ -732,7 +877,7 @@ export function createExplorer(index: ModelIndex) {
         let thread = [...c.thread, turn],
           ended = false;
         chatSet({ prompt: "", thread });
-        const response = await fetch("/api/steer", {
+        const response = await modelFetch("/api/steer", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: ctl.signal,
@@ -844,7 +989,9 @@ export function createExplorer(index: ModelIndex) {
         const result = await api("/api/infer", { text: query });
         if (request !== queryEpoch || disposed) return;
         if (!result.ready) {
-          set({ fireResults: { ready: false, fires: true } });
+          set({
+            fireResults: { ready: false, fires: true, message: result.message },
+          });
           return;
         }
         set({
@@ -962,7 +1109,7 @@ export function createExplorer(index: ModelIndex) {
       return refreshWeb();
     }
     if (get().analysisMode !== "run") return;
-    const response = await fetch(
+    const response = await modelFetch(
       `/api/infer/paths?pos=${pos}&min=${get().infFilters.min || 1}`,
     );
     if (!response.ok || (tokenHover ?? get().inf.pos) !== pos || disposed)
@@ -1060,6 +1207,7 @@ export function createExplorer(index: ModelIndex) {
         (e.neurons || []).map((x) => ({ ...x, sign: x.sign || "+", w: 1 })),
       );
     } else if (e.action === "rename") {
+      connectionCache.clear();
       set((s) => ({
         units: {
           ...s.units,
@@ -1172,6 +1320,15 @@ export function createExplorer(index: ModelIndex) {
     try {
       const s = await api("/api/status");
       if (disposed) return;
+      if (
+        s.generation &&
+        index.generation &&
+        s.generation !== index.generation
+      ) {
+        history.replaceState(null, "", location.pathname);
+        location.reload();
+        return;
+      }
       set({
         statusText: s.status,
         status: s.status === "ready" ? "" : s.status,
@@ -1182,6 +1339,7 @@ export function createExplorer(index: ModelIndex) {
         pending?.ready === false &&
         !pending.loading &&
         !pending.error &&
+        !pending.message &&
         get().lensQuery.trim().length >= 2
       )
         void runLensSearch(get().lensQuery.trim(), ++lensEpoch);
@@ -1283,6 +1441,7 @@ export function createExplorer(index: ModelIndex) {
     previewToken,
     filterInference,
     agentUi,
+    setChatActivity,
     clearAgentMarks,
     goToNeuron(layer: number, n: number, kind: SelectionKind = "neuron") {
       safe(select(layer, n, kind, { fly: false }));
@@ -1395,6 +1554,7 @@ export function createExplorer(index: ModelIndex) {
       rightPanel: HTMLElement;
     }) {
       disposed = false;
+      if (sceneRequests.signal.aborted) sceneRequests = new AbortController();
       const mounting = ++attachmentEpoch;
       const [{ createMap }, { createScatter }] = await Promise.all([
         import("../../explorer/static/map3d.js"),
@@ -1402,6 +1562,7 @@ export function createExplorer(index: ModelIndex) {
       ]);
       if (disposed || mounting !== attachmentEpoch) return;
       map = createMap(mapCanvas, labels, arch, {
+        createChatFocusIcon: mountSceneLabelIcon,
         onPick: (l: number, n: number) => {
           if (get().analysisMode === "build") {
             map?.select(l, n, false);
@@ -1419,6 +1580,8 @@ export function createExplorer(index: ModelIndex) {
         },
         onHover,
       });
+      sceneActivityKey = "";
+      setChatActivity(sceneActivity);
       scatter = createScatter(scatterCanvas, {
         onPick: (i: number) => {
           const d = scatter?.data;
@@ -1497,6 +1660,11 @@ export function createExplorer(index: ModelIndex) {
       if (!disposed && get().analysisMode !== "build") restoreFocus();
     },
     dispose() {
+      setChatActivity(null);
+      sceneRequests.abort();
+      connectionCache.clear();
+      webCache.clear();
+      sceneNetworkCache.clear();
       unsubscribePanels();
       disposed = true;
       ++attachmentEpoch;

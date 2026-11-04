@@ -5,16 +5,19 @@ function hashColor(n) {
   const h = (n * 2654435761) % 360;
   return `hsl(${h}, 55%, 60%)`;
 }
-function doseColor(d) {
-  if (d === 0) return "#ffffff";
+function doseColor(d, foreground = "#ffffff", light = false) {
+  if (d === 0) return foreground;
   const t = Math.min(1, Math.abs(d) / 1.0);
-  return d > 0 ? `rgba(255,181,71,${0.35 + 0.65 * t})` : `rgba(255,79,154,${0.35 + 0.65 * t})`;
+  return d > 0 ? `rgba(${light ? "150,89,0" : "255,181,71"},${0.35 + 0.65 * t})` : `rgba(${light ? "189,25,93" : "255,79,154"},${0.35 + 0.65 * t})`;
 }
 
 export function createScatter(canvas, cb) {
   const lifetime = new AbortController();
   const listen = (type, fn, options = {}) => canvas.addEventListener(type, fn, { ...options, signal: lifetime.signal });
   const ctx = canvas.getContext("2d");
+  let foreground = "#ffffff", background = "#000000", light = false;
+  const themeObserver = new MutationObserver(() => draw());
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
   let data = null, colorBy = "neuron", sel = null, hoverIdx = -1;
   let view = { x: 0, y: 0, k: 1 };
   let insets = { left: 404, right: 0 };
@@ -34,17 +37,21 @@ export function createScatter(canvas, cb) {
     return [(ox + data.x[i] * s) * view.k + view.x, (oy + (1 - data.y[i]) * s) * view.k + view.y];
   }
   function color(i) {
-    if (data.kind[i] === "baseline") return "#ffffff";
+    if (data.kind[i] === "baseline") return foreground;
     if (colorBy === "prompt") return PROMPT_COLORS[data.prompt[i]] || "#888";
-    if (colorBy === "dose") return doseColor(data.dose[i]);
-    if (colorBy === "kind") return KIND_COLORS[data.kind[i]];
+    if (colorBy === "dose") return doseColor(data.dose[i], foreground, light);
+    if (colorBy === "kind") return data.kind[i] === "neuron" ? (light ? "#595959" : "#9a9a9a") : (light ? "#087b98" : KIND_COLORS[data.kind[i]]);
     return data.kind[i] === "random" ? "#3a3a3a" : hashColor(data.neuron[i]);
   }
   function isSel(i) { return sel && sel.layer === data.layer && data.kind[i] === "neuron" && data.neuron[i] === sel.n; }
 
   function draw() {
+    const css = getComputedStyle(canvas);
+    light = !document.documentElement.classList.contains("dark");
+    foreground = css.getPropertyValue("--scene-foreground").trim() || (light ? "#171717" : "#ffffff");
+    background = css.getPropertyValue("--scene-background").trim() || (light ? "#ffffff" : "#000000");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+    ctx.fillStyle = background; ctx.fillRect(0, 0, canvas.clientWidth, canvas.clientHeight);
     if (!data || !data.x) return;
     const r = Math.max(1.6, Math.min(4, 2.2 * Math.sqrt(view.k)));
     const n = data.x.length;
@@ -59,13 +66,13 @@ export function createScatter(canvas, cb) {
       ctx.globalAlpha = 1;
       for (let i = 0; i < n; i++) if (isSel(i)) {
         const [x, y] = toScreen(i);
-        ctx.fillStyle = doseColor(data.dose[i]);
+        ctx.fillStyle = doseColor(data.dose[i], foreground, light);
         ctx.beginPath(); ctx.arc(x, y, r * 1.6, 0, 7); ctx.fill();
       }
     }
     if (hoverIdx >= 0) {
       const [x, y] = toScreen(hoverIdx);
-      ctx.globalAlpha = 1; ctx.strokeStyle = "#fff"; ctx.lineWidth = 1;
+      ctx.globalAlpha = 1; ctx.strokeStyle = foreground; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.arc(x, y, r * 2.2, 0, 7); ctx.stroke();
     }
     ctx.globalAlpha = 1;
@@ -120,6 +127,6 @@ export function createScatter(canvas, cb) {
     select(layer, n) { sel = n == null ? null : { layer, n }; draw(); },
     draw,
     get data() { return data; },
-    dispose() { lifetime.abort(); resizeObserver.disconnect(); data = null; },
+    dispose() { themeObserver.disconnect(); lifetime.abort(); resizeObserver.disconnect(); data = null; },
   };
 }

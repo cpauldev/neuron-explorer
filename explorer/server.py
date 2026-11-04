@@ -42,11 +42,13 @@ RUNS, STATS, NAMES = (str(_paths[key]) for key in ("runs", "stats", "names"))
 PORT = int(os.environ.get("PORT", 8791))
 _model_config = AutoConfig.from_pretrained(MODEL, revision=REVISION)
 validate_config(_model_config.to_dict())
-_cfg = _model_config.get_text_config()
-ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
+def architecture(config):
+    _cfg = config.get_text_config()
+    return {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter": _cfg.intermediate_size,
         "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
         "kv_heads": _cfg.num_key_value_heads, "linear_k_heads": _cfg.linear_num_key_heads,
         "linear_v_heads": _cfg.linear_num_value_heads}
+ARCH = architecture(_model_config)
 
 app = FastAPI()
 build_monitor = BuildMonitor(Path(ROOT) / "cache-jobs")
@@ -207,7 +209,7 @@ def names():
 @app.get("/api/index")
 def index():
     runs = layer_runs()
-    return {"model": MODEL, "revision": REVISION, "arch": ARCH,
+    return {"model": MODEL, "revision": REVISION, "arch": ARCH, "generation": models.generation,
             "cache_key": "" if MODEL == DEFAULT_MODEL and REVISION is None else model_key(MODEL, REVISION),
             "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
 
@@ -359,7 +361,8 @@ async def search(q: str, limit: int = 300):
     idx = lens_index()
     q = q.strip().lower()
     if idx is None or len(q) < 2:
-        return {"ready": idx is not None, "results": []}
+        return {"ready": idx is not None, "results": [],
+                "message": 'Token associations have not been built for this model.' if idx is None and not preload_pending.is_set() else None}
     vocab = await asyncio.to_thread(rt.vocab_strings)
     match = np.array([i for i, t in enumerate(vocab) if q in t.lower()], dtype=np.int32)
     if not len(match):
@@ -399,7 +402,7 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
     """Neurons that fire hardest on `text` relative to their typical range over web text (activation / typical max,
     and activation / typical min for the negative side)."""
     if not os.path.exists(ACT_SCALE):
-        return {"ready": False, "results": []}
+        return {"ready": False, "results": [], "message": 'Activation calibration has not been built for this model.'}
     sc = np.load(ACT_SCALE)
     ids = await asyncio.to_thread(rt.chat_ids if chat else (lambda t: rt.tok(t).input_ids), text)
     acts = await asyncio.to_thread(rt.all_activations, ids)
@@ -446,7 +449,7 @@ async def infer(req: Request):
     """Runs text through the model and keeps every neuron's activation at every token for /api/infer/view."""
     b = await req.json()
     if not os.path.exists(ACT_SCALE) or rt.tok is None:
-        return {"ready": False}
+        return {"ready": False, "message": 'Activation calibration has not been built for this model.' if not os.path.exists(ACT_SCALE) and not preload_pending.is_set() else None}
     ids, acts, score = await score_text(b["text"], b.get("chat", False), heads=True)
     units = rt.token_units(ids)
     unit_of = {i: k for k, (_, idx) in enumerate(units) for i in idx}
@@ -1879,7 +1882,75 @@ async def stop_agent_jobs():
 
 @app.get("/api/status")
 def status():
-    return {"status": rt.status}
+    return {"status": rt.status, "generation": models.generation, "switching": models.phase != 'idle'}
+
+
+async def switch_model(entry):
+    global MODEL, REVISION, ARCH, CACHE, RUNS, STATS, NAMES, rt, LENS_INDEX, ACT_SCALE, AGENT_DIR, UPLOADS
+    config = await asyncio.to_thread(AutoConfig.from_pretrained, entry['path'], local_files_only=True)
+    validate_config(config.to_dict())
+    paths = data_paths(entry['model'], entry['revision'])
+    old = rt
+    await agent_pool.close()
+    candidate = Runtime(str(paths['stats']), model=entry['model'], revision=entry['revision'],
+                        cache_dir=paths['cache'], checkpoint=entry['path'])
+    try:
+        await asyncio.to_thread(old.unload)
+        if not NO_MODEL:
+            await asyncio.to_thread(candidate.ensure_loaded)
+        else:
+            candidate.status = 'no model'
+    except Exception:
+        await asyncio.to_thread(candidate.close)
+        if not NO_MODEL:
+            try:
+                await asyncio.to_thread(old.ensure_loaded)
+            except Exception:
+                old.status = 'load failed'
+        raise
+    MODEL, REVISION, ARCH = entry['model'], entry['revision'], architecture(config)
+    CACHE = str(paths['cache'])
+    RUNS, STATS, NAMES = (str(paths[key]) for key in ('runs', 'stats', 'names'))
+    LENS_INDEX, ACT_SCALE = (os.path.join(CACHE, name) for name in ('lens_index.npz', 'act_scale.npz'))
+    AGENT_DIR = os.path.join(CACHE, 'agent')
+    UPLOADS = os.path.join(AGENT_DIR, 'uploads')
+    for cache in (_cache, _lens, _infer, _hprof, _idf, _act, _chats):
+        cache.clear()
+    rt = candidate
+    await asyncio.to_thread(old.close)
+
+
+def model_busy():
+    # The startup loader and synchronous inference share this lock.
+    acquired = rt.lock.acquire(blocking=False)
+    if acquired:
+        rt.lock.release()
+    return preload_pending.is_set() or not acquired or any(busy_chat(chat) for chat in _chats.values())
+
+
+from local_models import LocalModels, ModelGate
+models = LocalModels(lambda: (MODEL, REVISION), switch_model, model_busy)
+preload_pending = threading.Event()
+app.add_middleware(ModelGate, manager=models)
+
+
+@app.get('/api/models')
+def local_models(refresh: bool = False):
+    if refresh:
+        models.scanned = float('-inf')
+    return models.state()
+
+
+@app.post('/api/models')
+async def change_model(request: Request):
+    body = await request.json()
+    # Discovery is cached, and all disk work runs outside the event loop.
+    await asyncio.to_thread(models.catalog)
+    try:
+        await models.start(body.get('id'))
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return {'phase': models.phase}
 
 
 @app.get("/")
@@ -1898,6 +1969,11 @@ app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static")), 
 @app.on_event("startup")
 def preload():
     def go():
+        try:
+            load_initial()
+        finally:
+            preload_pending.clear()
+    def load_initial():
         if NO_MODEL:
             rt.status = "no model"
             rt.vocab_strings()
@@ -1910,6 +1986,7 @@ def preload():
         rt.vocab_strings()
         if legacy and not os.path.exists(ACT_SCALE):
             rt.build_act_scale(ACT_SCALE)
+    preload_pending.set()
     threading.Thread(target=go, daemon=True).start()
 
 

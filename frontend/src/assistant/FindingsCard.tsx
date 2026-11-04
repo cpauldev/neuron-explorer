@@ -4,18 +4,12 @@ import {
   CollapsibleTrigger,
   CollapsibleContent,
 } from "../components/ui/collapsible";
-import { readFindings, findingsMarkdown } from "./research";
+import { readFindings } from "./research";
 import { UnitLink } from "./SelectionContext";
 import { useExplorer } from "../context";
 import { Button } from "../components/ui/button";
-import { useCopyToClipboard } from "../hooks/use-copy-to-clipboard";
-import {
-  CopyIcon,
-  CheckIcon,
-  FocusIcon,
-  DownloadIcon,
-  ChevronDownIcon,
-} from "lucide-react";
+
+import { FocusIcon, ChevronDownIcon } from "lucide-react";
 import { ToolFallback } from "../components/tool-fallback.aui";
 import Markdown from "react-markdown";
 
@@ -36,7 +30,7 @@ function ReportText({ text }: { text: string }) {
 export const FindingsCard: ToolCallMessagePartComponent = (props) => {
   const report = readFindings(props.result);
   const [, a] = useExplorer([]);
-  const { isCopied, copyToClipboard } = useCopyToClipboard();
+
   if (!report) return <ToolFallback {...props} />;
   const references = report.references.filter((unit) =>
     unit.kind === "head"
@@ -94,33 +88,6 @@ export const FindingsCard: ToolCallMessagePartComponent = (props) => {
         </CollapsibleContent>
       </Collapsible>
       <div className="flex flex-wrap gap-2">
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => copyToClipboard(findingsMarkdown(report))}
-        >
-          {isCopied ? <CheckIcon /> : <CopyIcon />}
-          {isCopied ? "Copied" : "Copy findings"}
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => {
-            const url = URL.createObjectURL(
-              new Blob([findingsMarkdown(report)], { type: "text/markdown" }),
-            );
-            const link = document.createElement("a");
-            link.href = url;
-            link.download = "neuron-findings.md";
-            document.body.append(link);
-            link.click();
-            link.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 1000);
-          }}
-        >
-          <DownloadIcon />
-          Save report
-        </Button>
         {highlightNeurons.length ? (
           <Button
             variant="ghost"

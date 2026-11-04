@@ -37,6 +37,14 @@ export function mockApi(overrides = {}) {
     if (overrides[path]) return overrides[path](parsed, options);
     const defaults = {
       "/api/index": indexFixture,
+      "/api/models": {
+        models: [{ id: "current", model: "Qwen/Qwen3.5-4B", revision: null }],
+        current: "current",
+        generation: "test",
+        phase: "idle",
+        error: null,
+        target: null,
+      },
       "/api/status": { status: "ready" },
       "/api/layout": { available: false },
       "/api/unit": { name: "", rollouts: [] },

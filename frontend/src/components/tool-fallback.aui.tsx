@@ -1,5 +1,7 @@
 "use client";
 
+import { toolLabel } from "../lib/tool-labels";
+
 import {
   forwardRef,
   memo,
@@ -191,7 +193,7 @@ function ToolFallbackTrigger({
           isRunning && "shimmer motion-reduce:animate-none",
         )}
       >
-        {label}: <b>{toolName}</b>
+        {label}: <b>{toolLabel(toolName)}</b>
       </span>
       <ToolFallbackDuration />
       <ChevronDownIcon
@@ -1198,7 +1200,8 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
   toolName,
   argsText,
   result,
-  status,
+  status: partStatus,
+  isError,
   responseDeliveryStatus,
   addResult,
   resume,
@@ -1206,6 +1209,9 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
   approval,
   respondToApproval,
 }) => {
+  const status = isError
+    ? ({ type: "incomplete", reason: "error", error: result } as const)
+    : partStatus;
   const isCancelled =
     status?.type === "incomplete" && status.reason === "cancelled";
   const isRequiresAction = status?.type === "requires-action";
@@ -1254,6 +1260,7 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
         responseDeliveryStatus={responseDeliveryStatus}
       />
       <ToolFallbackContent>
+        <ToolFallbackIdentity toolName={toolName} />
         <ToolFallbackError status={status} />
         <ToolFallbackArgs
           argsText={argsText}
@@ -1328,3 +1335,11 @@ export {
   ToolFallbackError,
   ToolFallbackApproval,
 };
+
+export function ToolFallbackIdentity({ toolName }: { toolName: string }) {
+  return (
+    <p className="text-muted-foreground text-xs">
+      Tool: <code className="break-all">{toolName}</code>
+    </p>
+  );
+}

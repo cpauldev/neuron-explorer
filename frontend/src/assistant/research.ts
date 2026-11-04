@@ -75,6 +75,33 @@ export function latestFindings(messages: AssistantMessage[]) {
   );
 }
 
+// Return null for ordinary replies so assistant-ui retains its standard actions.
+export function findingsMessageMarkdown(
+  parts: readonly {
+    type: string;
+    text?: string;
+    toolName?: string;
+    result?: unknown;
+    isError?: boolean;
+  }[],
+) {
+  let hasFindings = false;
+  const sections = parts.flatMap((part) => {
+    if (part.type === "text") return part.text ? [part.text] : [];
+    if (
+      part.type !== "tool-call" ||
+      part.toolName?.split("__").at(-1) !== "present_findings" ||
+      part.isError
+    )
+      return [];
+    const report = readFindings(part.result);
+    if (!report) return [];
+    hasFindings = true;
+    return [findingsMarkdown(report)];
+  });
+  return hasFindings ? sections.join("\n\n") : null;
+}
+
 export function findingsMarkdown(report: Findings) {
   return [
     `# ${report.title}`,

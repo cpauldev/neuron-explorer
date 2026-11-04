@@ -51,11 +51,6 @@ export function RunActivity({
   children,
   className,
 }: RunActivityProps) {
-  const latestActivity =
-    status === "running"
-      ? entries.findLast((entry) => entry.label.trim())?.label
-      : undefined;
-
   const summary = (
     <span className="text-start tabular-nums">
       {statusLabel}
@@ -90,12 +85,6 @@ export function RunActivity({
               ))}
             </ol>
           </CollapsibleContent>
-          {!open && latestActivity && (
-            // The panel stays mounted during its exit transition.
-            <p className="text-muted-foreground ps-5 text-sm wrap-anywhere peer-[:not([hidden])]:hidden">
-              {latestActivity}
-            </p>
-          )}
         </Collapsible>
       ) : (
         <p className="text-muted-foreground py-1 text-sm">{summary}</p>

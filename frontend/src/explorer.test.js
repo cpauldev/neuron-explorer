@@ -16,6 +16,46 @@ afterEach(() => {
 });
 
 describe("React explorer actions and the acknowledged UI controller", () => {
+  it("keeps chat scene focus separate from selection and reuses selected connection requests", async () => {
+    const fetcher = mockApi();
+    await explorer.actions.select(16, 2311);
+    const before = explorer.getSnapshot();
+    const activity = {
+      action: "Testing",
+      targets: [{ kind: "neuron", layer: 16, n: 2311 }],
+    };
+    explorer.actions.setChatActivity(activity);
+    await vi.waitFor(() =>
+      expect(
+        fetcher.mock.calls.filter(([url]) =>
+          url.startsWith("/api/connections?"),
+        ),
+      ).toHaveLength(1),
+    );
+    explorer.actions.setChatActivity({ ...activity, action: "Reviewing" });
+    explorer.actions.setChatActivity(null);
+    expect(explorer.getSnapshot().focus).toBe(before.focus);
+    expect(explorer.getSnapshot().selectionTab).toBe(before.selectionTab);
+    expect(explorer.getSnapshot().con).toBe(before.con);
+    expect(location.hash).toBe("#L16/N2311");
+    expect(
+      fetcher.mock.calls.filter(([url]) => url.startsWith("/api/connections?")),
+    ).toHaveLength(1);
+  });
+  it("does not load a separate network for every member of a large comparison", async () => {
+    const fetcher = mockApi();
+    explorer.actions.setChatActivity({
+      action: "Comparing",
+      targets: Array.from({ length: 30 }, (_, n) => ({
+        kind: "neuron",
+        layer: 16,
+        n,
+      })),
+    });
+    await Promise.resolve();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(explorer.getSnapshot().focus).toBeNull();
+  });
   it("preserves manual controls, selection, negative/zero dose and neuron-specific history", async () => {
     const a = explorer.actions,
       command = (action, args = {}) =>
@@ -233,6 +273,20 @@ describe("React explorer actions and the acknowledged UI controller", () => {
   });
 });
 
+it("starts with Chat open and opens Inspect when a neuron is selected", async () => {
+  expect(explorer.getSnapshot()).toMatchObject({
+    assistantOpen: true,
+    toolsOpen: false,
+    activePanel: "assistant",
+  });
+  await explorer.actions.select(7, 1870);
+  expect(explorer.getSnapshot()).toMatchObject({
+    toolsOpen: true,
+    activePanel: "tools",
+    workbenchTab: "inspect",
+  });
+});
+
 it("restores collapsed panels and keeps focus restoration from opening Workbench", async () => {
   explorer.actions.togglePanel("assistant", true);
   explorer.actions.togglePanel("tools", true);
@@ -256,6 +310,40 @@ it("restores collapsed panels and keeps focus restoration from opening Workbench
     expect(restored.getSnapshot()).toMatchObject({
       toolsOpen: true,
       activePanel: "tools",
+    });
+  } finally {
+    restored.actions.dispose();
+  }
+});
+
+it("restores the chosen Workbench and Inspect tabs on reload", async () => {
+  await explorer.actions.select(7, 1870);
+  explorer.actions.setTab("examples");
+  const restored = createExplorer(indexFixture);
+  try {
+    await restored.actions.select(7, 1870, "neuron", {
+      push: false,
+      preservePanels: true,
+    });
+    expect(restored.getSnapshot()).toMatchObject({
+      workbenchTab: "inspect",
+      selectionTab: "examples",
+      toolsOpen: true,
+    });
+  } finally {
+    restored.actions.dispose();
+  }
+});
+it.each([
+  ["analyze", "run"],
+  ["cache", "build"],
+])("restores %s with its matching scene mode", (tab, analysisMode) => {
+  explorer.actions.openTool(tab);
+  const restored = createExplorer(indexFixture);
+  try {
+    expect(restored.getSnapshot()).toMatchObject({
+      workbenchTab: tab,
+      analysisMode,
     });
   } finally {
     restored.actions.dispose();

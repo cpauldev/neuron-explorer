@@ -12,6 +12,10 @@ import { BuildPanel } from "./BuildPanel";
 import { ExplorerContext } from "../context";
 import { createExplorer } from "../explorer";
 import { architecture } from "../test-helpers";
+import {
+  setSceneColor,
+  resetSceneColors,
+} from "../../../explorer/static/scene-colors.js";
 
 const snapshot = {
   id: "test",
@@ -78,6 +82,35 @@ function setup(model = snapshot.model, revision = "pin", data = snapshot) {
   );
   return { fetcher, explorer, view, paint, layout };
 }
+
+it("keeps the coverage legend in sync with theme and customized activity colors", async () => {
+  const wasDark = document.documentElement.classList.contains("dark");
+  document.documentElement.classList.remove("dark");
+  resetSceneColors("light");
+  resetSceneColors("dark");
+  try {
+    setup();
+    const saved = (await screen.findByText("Saved")).querySelector(
+      "[aria-hidden]",
+    );
+    const working = screen
+      .getByText("In progress")
+      .querySelector("[aria-hidden]");
+    expect(saved.style.backgroundColor).toBe("rgb(21, 128, 61)");
+    act(() => {
+      document.documentElement.classList.add("dark");
+      setSceneColor("dark", "hi", "#e91e8f");
+    });
+    await waitFor(() =>
+      expect(saved.style.backgroundColor).toBe("rgb(74, 222, 128)"),
+    );
+    expect(working.style.backgroundColor).toBe("rgb(233, 30, 143)");
+  } finally {
+    document.documentElement.classList.toggle("dark", wasDark);
+    resetSceneColors("light");
+    resetSceneColors("dark");
+  }
+});
 
 it("replays existing checkpoints when the asynchronous renderer becomes ready", async () => {
   const { explorer, paint, layout } = setup();
@@ -159,7 +192,7 @@ it.each([
       );
     }
     act(() => explorer.set({ mapReady: true }));
-    await screen.findByText(/belongs to a different model/);
+    await screen.findByText(/for another model or revision/);
     expect(layout).toHaveBeenLastCalledWith(null);
     expect(paint).toHaveBeenLastCalledWith([], null);
   },

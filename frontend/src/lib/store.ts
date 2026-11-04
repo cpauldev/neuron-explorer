@@ -25,12 +25,22 @@ export function createStore<T>(initial: T): Store<T> {
 
 // Endpoints with a fixed response pass their response type; scientific endpoints
 // are narrowed to domain records at their callers.
+let modelGeneration: string | undefined;
+export function setModelGeneration(value?: string) {
+  modelGeneration = value;
+}
+export const modelFetch: typeof fetch = (input, init = {}) => {
+  const headers = new Headers(init.headers);
+  if (modelGeneration) headers.set("X-Explorer-Generation", modelGeneration);
+  return fetch(input, { ...init, headers });
+};
+
 export async function api<T = any>(
   path: string,
   body?: unknown,
   options: RequestInit = {},
 ): Promise<T> {
-  const response = await fetch(path, {
+  const response = await modelFetch(path, {
     ...(body !== undefined
       ? {
           method: "POST",
@@ -40,10 +50,20 @@ export async function api<T = any>(
       : {}),
     ...options,
   });
-  if (!response.ok)
+  if (!response.ok) {
+    const text = await response.text();
+    let message: unknown;
+    try {
+      const body = JSON.parse(text);
+      message = body.error || body.detail;
+    } catch {
+      /* Non-JSON responses retain their HTTP context below. */
+    }
+    if (typeof message === "string") throw new Error(message);
     throw new Error(
-      `${path.split("?")[0]} ${response.status}: ${(await response.text()).slice(0, 160)}`,
+      `${path.split("?")[0]} ${response.status}: ${text.slice(0, 160)}`,
     );
+  }
   const data = await response.json();
   if (data.error) throw new Error(String(data.error));
   return data;

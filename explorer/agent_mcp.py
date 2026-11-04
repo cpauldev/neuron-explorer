@@ -66,7 +66,9 @@ TOOLS = [
                                                        "k": {"type": "integer", "default": 2}},
                      "required": ["layer", "n"]}},
     {"name": "search_lens", "description": "Neurons whose logit lens or steer lens (top 12, either pole) contains a token "
-     "matching the query (case-insensitive substring). Best matches first.",
+     "matching the query (case-insensitive substring, so unrelated longer words may match). Ranked by token-list "
+     "position and match count, not behavioral strength. total counts matching neuron/pole entries before limit; "
+     "results can be truncated. Inspect returned tokens before treating hits as candidates.",
      "inputSchema": {"type": "object", "properties": {"query": {"type": "string"},
                                                        "limit": {"type": "integer", "default": 40}},
                      "required": ["query"]}},

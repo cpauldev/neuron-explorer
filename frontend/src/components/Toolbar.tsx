@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { BrainCircuitIcon, SearchIcon } from "lucide-react";
+import { SearchIcon } from "lucide-react";
 import { useExplorer } from "../context";
 import {
   InputGroup,
@@ -9,28 +9,30 @@ import {
 } from "./ui/input-group";
 import { Button } from "./ui/button";
 import { useAssistantActivity } from "../assistant/activity";
+import { SettingsDialog } from "./SettingsDialog";
+import { Separator } from "./ui/separator";
+import { ModelSelector } from "./ModelSelector";
 
 export function Toolbar() {
-  const [s, a] = useExplorer(["index", "arch"]);
+  const [s, a] = useExplorer(["arch"]);
   const [unit, setUnit] = useState("");
   const [error, setError] = useState("");
   return (
     <header className="app-toolbar">
       <div className="app-identity">
-        <BrainCircuitIcon
-          className="size-5 shrink-0 text-muted-foreground"
-          aria-hidden="true"
-        />
-        <div>
-          <h1 className="text-sm font-semibold">Neuron Explorer</h1>
-          <p
-            className="max-w-56 truncate text-xs text-muted-foreground"
-            title={s.index.model}
-          >
-            {s.index.model?.split("/").at(-1) || "Local model"}
-          </p>
+        <div className="app-identity-labels">
+          <h1 className="whitespace-nowrap text-sm font-medium tracking-tight">
+            Neuron Explorer
+          </h1>
+          <Separator
+            orientation="vertical"
+            aria-hidden="true"
+            className="identity-divider my-0.5"
+          />
+          <ModelSelector />
         </div>
       </div>
+      <SettingsDialog />
       <form
         className="unit-navigation"
         aria-label="Go to unit"

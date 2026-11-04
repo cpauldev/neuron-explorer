@@ -4,6 +4,8 @@ import { createPortal } from "react-dom";
 import { useExplorer } from "../context";
 import { fmtDose } from "../lib/store";
 import { TabsContent } from "./ui/tabs";
+import { Button } from "./ui/button";
+import { LoadingState } from "./loading-state";
 
 export function Viewport({
   mapRef,
@@ -14,7 +16,13 @@ export function Viewport({
   labelsRef: Ref<HTMLDivElement>;
   scatterRef: Ref<HTMLCanvasElement>;
 }) {
-  const [s] = useExplorer(["view", "embedLoading", "embedAvailable", "layer"]);
+  const [s, a] = useExplorer([
+    "view",
+    "embedLoading",
+    "embedAvailable",
+    "layer",
+    "index",
+  ]);
   return (
     <>
       <TabsContent
@@ -37,13 +45,32 @@ export function Viewport({
           ref={scatterRef}
           aria-label="Interactive rollout embeddings"
         />
-        <div id="embed-empty" className="slot">
-          {s.embedLoading
-            ? "Loading embeddings…"
-            : s.embedAvailable
-              ? ""
-              : `No saved embeddings for L${s.layer}. Choose a layer with saved examples.`}
-        </div>
+        {!s.embedAvailable && (
+          <div
+            id="embed-empty"
+            className="slot flex flex-col items-center gap-3 text-center"
+            role="status"
+          >
+            {s.embedLoading ? (
+              <LoadingState label="Loading embeddings…" />
+            ) : (
+              <p>
+                {Object.keys(s.index.layers).length
+                  ? `No saved embeddings for L${s.layer}. Choose a layer with saved examples.`
+                  : "No saved rollout embeddings for this model."}
+              </p>
+            )}
+            {!s.embedLoading && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => a.setView("map")}
+              >
+                Back to map
+              </Button>
+            )}
+          </div>
+        )}
       </TabsContent>
     </>
   );

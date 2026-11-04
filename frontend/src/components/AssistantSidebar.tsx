@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useState, type Ref } from "react";
 import { useExplorer } from "../context";
 import { useWorkspaceLayout } from "../lib/workspace";
-import { Slot } from "./explorer-ui";
+import { GenerationLoadingState } from "./loading-state";
 
 const AssistantPanel = lazy(() =>
   import("../assistant/AssistantPanel").then((module) => ({
@@ -24,13 +24,13 @@ export function AssistantSidebar({
     <aside
       id="assistant-sidebar"
       ref={panelRef}
-      aria-label="Assistant"
+      aria-label="Chat"
       hidden={!layout.assistant}
       className="workspace-sidebar"
       onFocusCapture={() => a.set({ activePanel: "assistant" })}
     >
       {visited || layout.assistant ? (
-        <Suspense fallback={<Slot>Loading assistant…</Slot>}>
+        <Suspense fallback={<GenerationLoadingState label="Loading chat…" />}>
           <AssistantPanel active={layout.assistant} />
         </Suspense>
       ) : null}

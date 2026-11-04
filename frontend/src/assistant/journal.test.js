@@ -2,6 +2,90 @@ import { describe, expect, it } from "vitest";
 import { appendEvent, replayEvents } from "./journal";
 
 describe("assistant journal → assistant-ui messages", () => {
+  it("freezes work on successful findings but not a rejected report", () => {
+    const report = {
+      title: "Findings",
+      summary: "Scoped conclusion",
+      confidence: "low",
+      evidence: [{ kind: "observation", source: "test", text: "Evidence" }],
+      caveats: [],
+      references: [],
+      next_steps: [],
+    };
+    let messages = replayEvents(
+      [
+        { t: "user", seq: 1, text: "question", at: 100 },
+        {
+          t: "tool",
+          seq: 2,
+          id: "bad",
+          name: "present_findings",
+          input: {},
+          at: 101,
+        },
+        {
+          t: "tool_result",
+          seq: 3,
+          id: "bad",
+          output: "Invalid findings",
+          error: true,
+          at: 102,
+        },
+      ],
+      "reports",
+    );
+    expect(messages[1].metadata.custom.workEndedAt).toBeUndefined();
+    messages = appendEvent(
+      messages,
+      {
+        t: "tool",
+        seq: 4,
+        id: "good",
+        name: "present_findings",
+        input: report,
+        at: 103,
+      },
+      "reports",
+    );
+    messages = appendEvent(
+      messages,
+      {
+        t: "tool_result",
+        seq: 5,
+        id: "good",
+        output: JSON.stringify(report),
+        at: 104,
+      },
+      "reports",
+    );
+    expect(messages[1].metadata.custom.workEndedAt).toBe(104000);
+  });
+  it("persists the work boundary at final-answer start, independent of answer streaming", () => {
+    const messages = replayEvents(
+      [
+        { t: "user", seq: 1, text: "question", at: 100 },
+        { t: "text", seq: 2, text: "Checking evidence", id: "update", at: 101 },
+        { t: "tool", seq: 3, id: "tool", name: "overview", at: 102 },
+        { t: "tool_result", seq: 4, id: "tool", output: "ready", at: 103 },
+        {
+          t: "text_phase",
+          seq: 5,
+          id: "answer",
+          phase: "final_answer",
+          at: 104,
+        },
+        { t: "text", seq: 6, id: "answer", text: "Result", at: 105 },
+        { t: "done", seq: 7, at: 110 },
+      ],
+      "timing",
+    );
+    expect(messages[1].metadata.custom).toMatchObject({
+      startedAt: 100000,
+      workEndedAt: 104000,
+      endedAt: 110000,
+      textPhases: { update: "commentary", answer: "final_answer" },
+    });
+  });
   it("preserves approval receipts after completion and history replay", () => {
     const messages = replayEvents(
       [
@@ -52,7 +136,7 @@ describe("assistant journal → assistant-ui messages", () => {
     ]);
     expect(messages[1].metadata.custom).toMatchObject({
       textPhases: { progress: "commentary", answer: "final_answer" },
-      startedAt: 101000,
+      startedAt: 100000,
       endedAt: 105000,
     });
     expect(replayEvents(source, "phases")).toEqual(messages);

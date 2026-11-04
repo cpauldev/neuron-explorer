@@ -4,16 +4,39 @@ See the [README](../README.md#explorer) for installation and the main explorer v
 
 ## Working in the explorer
 
-The Assistant is a dedicated left panel. The model canvas is in the center, and **Workbench** opens one scientific panel on the right:
+The model selector beside **Neuron Explorer** lists complete, supported Qwen3.5 checkpoints
+already in the local Hugging Face cache. The list refreshes when you open the selector or return to the app;
+closely spaced checks are combined to avoid repeated disk scans.
+Switching never downloads weights. Finish an active chat or analysis first; the server releases
+the previous weights before loading the selected checkpoint. The workspace reloads with the new
+architecture and model-specific caches and conversations. Other open tabs refresh when they detect
+the change. If loading fails, the previous model stays selected and is reloaded when possible.
+
+Open **Settings → Appearance** in the top toolbar to choose **Light**, **Dark**, or **System**.
+Dark is the initial default; your choice is saved in this browser. System follows
+your operating system's appearance, including changes while the app is open.
+
+In **Settings → Visualization → Scene colors**, use the color picker or edit the hex value directly
+for each scene role. Light and dark palettes are saved separately. Exact duplicate colors
+are blocked within each palette. **Reset colors** restores the palette you are editing.
+
+**Chat** is a dedicated left panel. The model canvas is in the center, and **Workbench** opens one scientific panel on the right:
 
 - **Search** finds neurons from token associations across all layers, or browses saved examples for a layer.
 - **Analyze** measures a passage after you press **Analyze text**. Select a resulting token to focus its activity; advanced filters live under **Filter activations**.
 - **Inspect** shows the selected neuron or head. **Overview** contains associations and connections; **Experiment** compares generated outputs or measures the selected neuron's activations; **Saved examples** contains cached steering runs.
 - **Cache** identifies the loaded model and monitors existing analysis jobs with explicit pause/resume controls. It selects a matching job when available; jobs for other models cannot color the loaded model’s map.
 
-The global **Go to unit** field accepts IDs such as `L7 N1870` and `L7 h3`. Map/Embeddings, layer selection, camera reset and **Display** options belong to the canvas toolbar. Display settings do not change the active scientific tool. The map layer selector reflects All layers or the focused layer; Reset restores the original overview angle and fits the current canvas.
+The global **Go to unit** field accepts IDs such as `L7 N1870` and `L7 h3`. Map/Embeddings, layer selection and camera reset belong to the canvas toolbar. Open **Settings → Visualization** for map arrangement, connections, and embedding colors. Display settings do not change the active scientific tool. The map layer selector reflects All layers or the focused layer; Reset restores the original overview angle and fits the current canvas.
 
-Use the floating **Assistant** and **Workbench** buttons below the canvas toolbar to open closed panels, and the collapse control in each panel header to close them. Panel visibility is remembered across refreshes. On wide screens both can stay open and their dividers can be resized. Compact screens show one sidebar at a time; on phones it fills the work area. Closing it returns to the map. Conversations and tool drafts survive switching between these areas.
+While chat reads or tests neurons, the map temporarily shows its subjects and connections with a nearby
+action label. Your selected network becomes muted when chat reviews a different unit; Inspect, the selected ID, and the camera stay under
+your control. Your network returns to full color when the turn finishes or stops. Comparisons show the
+tested group together. Large batches show their markers without adding an unreadable web for every unit.
+Refreshing reconnects to a running chat and restores its current activity; it does not submit the request again.
+Your Workbench and Inspect tabs are remembered.
+
+Use the floating **Chat** and **Workbench** buttons below the canvas toolbar to open closed panels, and the collapse control in each panel header to close them. Panel visibility is remembered across refreshes. On wide screens both can stay open and their dividers can be resized. Compact screens show one sidebar at a time; on phones it fills the work area. Closing it returns to the map. Conversations and tool drafts survive switching between these areas.
 
 The Assistant toggle indicates background work. A **Review command approval** action appears only when an actual pending approval exists; opening it does not grant permission.
 
@@ -23,7 +46,7 @@ Byte fragment badges represent tokens containing incomplete character bytes. Hov
 
 ## Assistant configuration
 
-Install dependencies with `uv sync`, then choose a provider in **Assistant settings** (the gear button).
+Install dependencies with `uv sync`, then choose a provider in **Settings → Chat**.
 The official SDKs use their bundled runtimes by default: `openai-codex==0.163.0`,
 `claude-agent-sdk==0.2.176`, and `mcp==2.3.0`. Restart the explorer after dependency changes.
 Codex uses its existing authentication (for example, `codex login`). For Claude, use the

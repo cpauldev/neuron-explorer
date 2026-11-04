@@ -3,7 +3,7 @@ import type { ExplorerStore, AssistantStore, ModelIndex } from "./types";
 import { ExplorerContext, AssistantContext, useExplorer } from "./context";
 import { createExplorer } from "./explorer";
 import { createAssistant } from "./assistant/store";
-import { api } from "./lib/store";
+import { api, setModelGeneration } from "./lib/store";
 import {
   Toolbar,
   WorkspaceNotice,
@@ -120,6 +120,7 @@ export default function App() {
     }).then(
       (index) => {
         if (controller.signal.aborted) return;
+        setModelGeneration(index.generation);
         const explorer = createExplorer(index),
           assistant = createAssistant(explorer);
         setLoaded({ explorer, assistant });

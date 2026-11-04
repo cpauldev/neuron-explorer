@@ -9,7 +9,10 @@ import {
 import type { ToolCallMessagePartComponent } from "@assistant-ui/react";
 import { useExplorer } from "../context";
 import { Tokens } from "../components/explorer-ui";
-import { ToolFallback } from "../components/tool-fallback.aui";
+import {
+  ToolFallback,
+  ToolFallbackIdentity,
+} from "../components/tool-fallback.aui";
 import { TerminalBlock } from "../components/terminal-block";
 import { UnitLink } from "./SelectionContext";
 import { isRecord, unpack } from "./research";
@@ -219,7 +222,7 @@ function ProbabilityChange({ data }: { data: Record<string, unknown> }) {
 }
 
 // Render actual backend results; tool execution stays in Python. Raw details
-// remain available through the official fallback rather than a second viewer.
+// use the official fallback's argument/result renderers inside one Details disclosure.
 export const ResearchToolResult: ToolCallMessagePartComponent = (props) => {
   const { toolName, args, result, isError, status } = props;
   const [, a] = useExplorer([]),
@@ -389,7 +392,20 @@ export const ResearchToolResult: ToolCallMessagePartComponent = (props) => {
   return (
     <div className="research-tool">
       {rich}
-      <ToolFallback {...props} />
+      {rich && status.type === "complete" ? (
+        <details className="mt-2 text-sm">
+          <summary className="text-muted-foreground cursor-pointer rounded py-1 focus-visible:outline-ring">
+            Details
+          </summary>
+          <div className="space-y-2 pt-2">
+            <ToolFallbackIdentity toolName={toolName} />
+            <ToolFallback.Args argsText={props.argsText} />
+            <ToolFallback.Result result={result} />
+          </div>
+        </details>
+      ) : (
+        <ToolFallback {...props} />
+      )}
     </div>
   );
 };

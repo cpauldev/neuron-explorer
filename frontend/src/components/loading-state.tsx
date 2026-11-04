@@ -1,8 +1,70 @@
 "use client";
 
 import type { ComponentProps } from "react";
+import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 import { ShimmerLabel } from "./surfaces";
+import { Loader2Icon } from "lucide-react";
+
+/** Standalone clock for the assistant-ui loader; runs only while mounted. */
+export function GenerationLoadingState({
+  label,
+  className,
+  ...props
+}: Omit<GenerationLoaderProps, "tick">) {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const motion = matchMedia("(prefers-reduced-motion: reduce)");
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const update = () => {
+      clearInterval(timer);
+      if (!motion.matches)
+        timer = setInterval(() => setTick((value) => value + 1), 120);
+    };
+    update();
+    motion.addEventListener("change", update);
+    return () => {
+      clearInterval(timer);
+      motion.removeEventListener("change", update);
+    };
+  }, []);
+  return (
+    <GenerationLoader
+      label={label}
+      tick={tick}
+      role="status"
+      aria-live="polite"
+      className={cn("min-h-0 flex-1 justify-center py-8", className)}
+      {...props}
+    />
+  );
+}
+
+/** Compact feedback for small inline waits. */
+export function LoadingState({
+  label,
+  className,
+}: {
+  label: string;
+  className?: string;
+}) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+      className={cn("space-y-4 p-4", className)}
+    >
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <Loader2Icon
+          aria-hidden="true"
+          className="size-4 shrink-0 animate-spin motion-reduce:animate-none"
+        />
+        <span>{label}</span>
+      </div>
+    </div>
+  );
+}
 
 export type GenerationLoaderVariant = "dots" | "squares" | "rounded";
 
@@ -34,7 +96,6 @@ export function GenerationLoader({
     <div
       data-slot="generation-loader"
       className={cn("flex flex-col items-center gap-4", className)}
-
       {...props}
     >
       <div aria-hidden className="grid grid-cols-3 gap-1">

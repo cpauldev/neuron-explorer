@@ -21,6 +21,7 @@ export interface Architecture {
   linear_v_heads: number;
 }
 export interface ModelIndex {
+  generation?: string;
   arch: Architecture;
   layers: Record<number, string>;
   model?: string;
@@ -135,6 +136,7 @@ export interface ResultRow {
   swept?: boolean;
 }
 export interface SearchResults {
+  message?: string;
   ready: boolean;
   loading?: boolean;
   fires?: boolean;
@@ -306,6 +308,7 @@ export interface MessageMetadata extends Record<string, unknown> {
   textPhases?: Record<string, "commentary" | "final_answer">;
   startedAt?: number;
   endedAt?: number;
+  workEndedAt?: number;
 }
 export type MessagePart = Exclude<ThreadMessageLike["content"], string>[number];
 export interface AssistantMessage extends Omit<
@@ -393,6 +396,7 @@ export interface PastChat {
   running?: boolean;
 }
 export interface AssistantState {
+  dictating?: boolean;
   provider: Provider;
   model: string | null;
   includeSelection: boolean;

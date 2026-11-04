@@ -29,7 +29,7 @@ See the [usage guide](docs/usage.md#working-in-the-explorer) for navigation and 
 
 ## Assistant
 
-Choose Codex or Claude in **Assistant settings**. Dependencies include their official SDKs and bundled runtimes.
+Choose Codex or Claude in **Settings → Chat** from the top bar. Dependencies include their official SDKs and bundled runtimes.
 
 - **Codex:** sign in with `codex login` if needed.
 - **Claude:** configure [supported Agent SDK authentication](docs/usage.md#assistant-configuration), such as `ANTHROPIC_API_KEY`.
