@@ -1,4 +1,4 @@
-# neuron explorer
+# Neuron Explorer
 
 Explore Qwen3.5-4B through token associations, attention links, activations and steering experiments.
 Inspect local-model behavior on a 3D map alongside a research assistant.
